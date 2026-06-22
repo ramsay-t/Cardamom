@@ -25,6 +25,7 @@ defmodule Cardamom.ChainSync.Client do
   require Logger
 
   alias Cardamom.Protocol.ChainSync.Codec, as: ChainSync
+  alias Cardamom.Mux.Reassembler
 
   @chain_sync 2
 
@@ -45,7 +46,9 @@ defmodule Cardamom.ChainSync.Client do
 
     :ok = Cardamom.Connection.register(conn, @chain_sync)
 
-    state = %{conn: conn, peer: peer, headers_seen: 0, ledger: ledger}
+    # `reasm` carries the partial tail of a message split across SDU boundaries (a ~1KB
+    # header), via the generic Cardamom.Mux.Reassembler. Empty between whole messages.
+    state = %{conn: conn, peer: peer, headers_seen: 0, ledger: ledger, reasm: Reassembler.new()}
 
     # RESUME (reverse direction): before demanding from genesis, ask ChainStore where
     # we left off. If we have a durable tip, FindIntersect from it — the peer rolls us
@@ -70,23 +73,23 @@ defmodule Cardamom.ChainSync.Client do
     # the bytes that ARRIVED; whatever decode does next, the truth is captured.
     Logger.debug(fn -> "chain_sync raw payload: " <> Base.encode16(payload, case: :lower) end)
 
-    # Drain ALL messages from the SDU payload (loop on the decoder's `rest`). A relay
-    # MAY pack more than one protocol message into a single SDU; decoding only the
-    # first and dropping `rest` is a CDDL-framing bug (it bit block-fetch with a
-    # BatchDone glued onto the last block). Don't assume one-message-per-SDU.
-    {:noreply, drain(payload, state)}
+    # Reassemble via the generic Reassembler: carries a message split across SDUs (a
+    # ~1KB header) AND drains many-messages-per-SDU (a relay may pack >1 message in one
+    # SDU — decoding only the first is the CDDL-framing bug). Fold each whole message
+    # through handle_msg.
+    {:noreply, reassemble(payload, state)}
   end
 
   def handle_info({:EXIT, _from, reason}, state), do: {:stop, reason, state}
 
-  defp drain(<<>>, state), do: state
+  defp reassemble(payload, %{reasm: reasm} = state) do
+    case Reassembler.feed(reasm, payload, &ChainSync.decode/1) do
+      {msgs, reasm} ->
+        Enum.reduce(msgs, %{state | reasm: reasm}, &handle_msg/2)
 
-  defp drain(bytes, state) do
-    case ChainSync.decode(bytes) do
-      {:ok, msg, rest} -> drain(rest, handle_msg(msg, state))
-      {:error, reason} ->
+      {:error, msgs, {:error, reason}} ->
         Logger.warning("chain_sync decode error: #{inspect(reason)}")
-        state
+        Enum.reduce(msgs, %{state | reasm: Reassembler.new()}, &handle_msg/2)
     end
   end
 

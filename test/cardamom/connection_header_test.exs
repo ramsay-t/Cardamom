@@ -107,4 +107,33 @@ defmodule Cardamom.ConnectionHeaderTest do
     assert_receive {:event, m2}, 1000
     assert m1.header_hash == m2.header_hash
   end
+
+  # MC/DC for unwrap_header/1 (per the pattern-matching paper): the transport envelope
+  # is a DECISION with several clauses — [era, tag24(bytes)] (real Preview, covered
+  # above), and these alternate shapes from SimPeer/older relays. Each clause must be
+  # selected independently; a clause never taken is an untested branch even at 100%
+  # line coverage. They must all decode to the SAME header.
+  describe "unwrap_header/1 — alternate envelope shapes each decode" do
+    test "[era, tag(:bytes)] (no wrapCBORinCBOR) decodes", %{peer_end: pe} do
+      hdr = HeaderBuilder.build(block_number: 7, slot: 70)
+      env = [4, %CBOR.Tag{tag: :bytes, value: hdr.raw}]
+      tip = [[hdr.slot, %CBOR.Tag{tag: :bytes, value: hdr.hash}], hdr.block_number]
+      :ok = Frame.send_msg(pe, @chain_sync, CS.encode({:roll_forward, env, tip}))
+
+      assert_receive {:event, meta}, 1000
+      assert meta.header_hash == Base.encode16(hdr.hash, case: :lower)
+      refute Map.has_key?(meta, :header_raw_term), "must decode via this clause, not fall back"
+    end
+
+    test "bare tag(:bytes) (no era wrapper) decodes", %{peer_end: pe} do
+      hdr = HeaderBuilder.build(block_number: 8, slot: 80)
+      env = %CBOR.Tag{tag: :bytes, value: hdr.raw}
+      tip = [[hdr.slot, %CBOR.Tag{tag: :bytes, value: hdr.hash}], hdr.block_number]
+      :ok = Frame.send_msg(pe, @chain_sync, CS.encode({:roll_forward, env, tip}))
+
+      assert_receive {:event, meta}, 1000
+      assert meta.header_hash == Base.encode16(hdr.hash, case: :lower)
+      refute Map.has_key?(meta, :header_raw_term)
+    end
+  end
 end

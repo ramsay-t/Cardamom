@@ -100,6 +100,42 @@ defmodule Cardamom.Protocol.ChainSync.CodecTest do
     end
   end
 
+  # A header can be ~1KB and span SDU boundaries (the same class as block-fetch's
+  # block-split bug). The codec must signal :incomplete for a valid-but-truncated
+  # prefix so the client carries the tail forward, not treat it as corruption.
+  describe "incomplete (truncated) messages — carry-over support" do
+    # A roll_forward with a chunky opaque header — the element big enough to span SDUs.
+    defp big_roll_forward do
+      Codec.encode({:roll_forward, :crypto.strong_rand_bytes(1000), [100, <<0xCC, 0xCC>>]})
+    end
+
+    test "a roll_forward truncated mid-header is :incomplete, not an error" do
+      full = big_roll_forward()
+      assert :incomplete = Codec.decode(binary_part(full, 0, div(byte_size(full), 2)))
+    end
+
+    test "a roll_forward truncated at many lengths is consistently :incomplete" do
+      full = big_roll_forward()
+
+      for n <- [2, 5, 50, 200, 500, byte_size(full) - 1] do
+        assert :incomplete = Codec.decode(binary_part(full, 0, n)),
+               "truncation at #{n} bytes must be :incomplete (a valid prefix)"
+      end
+    end
+
+    test "the whole roll_forward decodes (boundary: not incomplete)" do
+      assert {:ok, {:roll_forward, _, _}, ""} = Codec.decode(big_roll_forward())
+    end
+
+    test "a whole message + a truncated next: first decodes, rest is the partial tail" do
+      whole = Codec.encode(:request_next)
+      partial = binary_part(big_roll_forward(), 0, 40)
+      assert {:ok, :request_next, rest} = Codec.decode(whole <> partial)
+      assert rest == partial
+      assert :incomplete = Codec.decode(rest)
+    end
+  end
+
   describe "decode STRICT" do
     test "rejects an unknown tag" do
       assert {:error, _} = Codec.decode(CBOR.encode([99]))
@@ -108,7 +144,9 @@ defmodule Cardamom.Protocol.ChainSync.CodecTest do
     test "never raises on arbitrary bytes" do
       for _ <- 1..200 do
         bytes = :crypto.strong_rand_bytes(:rand.uniform(16))
-        assert match?({:ok, _, _}, Codec.decode(bytes)) or match?({:error, _}, Codec.decode(bytes))
+        result = Codec.decode(bytes)
+
+        assert match?({:ok, _, _}, result) or match?({:error, _}, result) or result == :incomplete
       end
     end
   end

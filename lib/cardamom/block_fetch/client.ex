@@ -29,6 +29,7 @@ defmodule Cardamom.BlockFetch.Client do
   require Logger
 
   alias Cardamom.Protocol.BlockFetch.Codec
+  alias Cardamom.Mux.Reassembler
 
   @block_fetch 3
   # Idle timeout: max silence (no block-fetch bytes) before we give up on the peer.
@@ -60,11 +61,19 @@ defmodule Cardamom.BlockFetch.Client do
     Process.link(conn)
     Process.flag(:trap_exit, true)
     :ok = Cardamom.Connection.register(conn, @block_fetch)
-    # `buffer` carries the partial tail of a mini-protocol message that was split
-    # across SDU boundaries — prepended to the next SDU's bytes. Empty whenever the
-    # protocol is between whole messages (idle); non-empty means a message is in
-    # flight across SDUs. (The 1962 mux invariant: reassemble across time slots.)
-    {:ok, %{conn: conn, peer: Keyword.get(opts, :peer, "loopback"), req: nil, buffer: <<>>}}
+    # `reasm` carries the partial tail of a message split across SDU boundaries (and
+    # drains many-messages-per-SDU). The reassembly algorithm is generic — see
+    # Cardamom.Mux.Reassembler — parameterised here by the block-fetch codec.
+    {:ok,
+     %{
+       conn: conn,
+       peer: Keyword.get(opts, :peer, "loopback"),
+       req: nil,
+       reasm: Reassembler.new(),
+       # Idle timeout is configurable (default @idle_timeout_ms) — tests drive the
+       # stall path without a 90s wait; production uses the default.
+       idle_timeout_ms: Keyword.get(opts, :idle_timeout_ms, @idle_timeout_ms)
+     }}
   end
 
   @impl true
@@ -92,13 +101,10 @@ defmodule Cardamom.BlockFetch.Client do
     # scale). The COMPLETE raw bytes are preserved verbatim in the durable store
     # (blocks.raw, hash-verified) — that IS the forensic record. (Contrast chain-sync
     # headers, which fit under 8192 and are logged whole.)
-    # Prepend any carried-over partial tail, then drain ALL whole messages. A relay
-    # packs e.g. last Block + BatchDone in one SDU (drain loops), AND a single block
-    # can be split across SDUs (the leftover tail is held in `buffer` for next time).
-    # Reset the idle timer — we got bytes, the peer is alive.
+    # Reassemble (carry-over across SDUs + drain many-per-SDU), then fold each whole
+    # message through on_msg. Reset the idle timer — we got bytes, the peer is alive.
     state = arm_idle(state)
-    {state, rest} = drain(state.buffer <> payload, state)
-    {:noreply, %{state | buffer: rest}}
+    {:noreply, reassemble(payload, state)}
   end
 
   # A spawned block handler finished (decoded + stored). Decrement in-flight; if the
@@ -153,24 +159,19 @@ defmodule Cardamom.BlockFetch.Client do
 
   # ---- message handling ----
 
-  # Consume every WHOLE message in `bytes`; return {state, leftover}. `leftover` is the
-  # tail of a message that isn't fully present yet (`:incomplete`) — held in `buffer`
-  # and concatenated with the next SDU. A genuine decode error (corruption, not a short
-  # read) is logged and the rest discarded (we can't realign mid-stream anyway).
-  defp drain(<<>>, state), do: {state, <<>>}
+  # Reassemble across SDU boundaries (and drain many-per-SDU) via the generic
+  # Reassembler, then fold each whole message through on_msg. The Reassembler holds the
+  # partial tail; a genuine decode error (corruption, not a short read) is logged and
+  # the rest discarded — we can't realign mid-stream anyway.
+  defp reassemble(payload, %{reasm: reasm} = state) do
+    case Reassembler.feed(reasm, payload, &Codec.decode/1) do
+      {msgs, reasm} ->
+        Enum.reduce(msgs, %{state | reasm: reasm}, &on_msg/2)
 
-  defp drain(bytes, state) do
-    case Codec.decode(bytes) do
-      {:ok, msg, rest} ->
-        drain(rest, on_msg(msg, state))
-
-      :incomplete ->
-        # A message is split across the SDU boundary — keep the prefix for next time.
-        {state, bytes}
-
-      {:error, reason} ->
+      {:error, msgs, {:error, reason}} ->
         Logger.warning("block_fetch decode error: #{inspect(reason)}")
-        {state, <<>>}
+        # Apply the whole messages that DID decode before the corruption; drop the rest.
+        Enum.reduce(msgs, %{state | reasm: Reassembler.new()}, &on_msg/2)
     end
   end
 
@@ -238,7 +239,7 @@ defmodule Cardamom.BlockFetch.Client do
 
   defp arm_idle(%{req: req} = state) do
     token = make_ref()
-    Process.send_after(self(), {:idle_timeout, token}, @idle_timeout_ms)
+    Process.send_after(self(), {:idle_timeout, token}, state.idle_timeout_ms)
     %{state | req: Map.put(req, :idle_token, token)}
   end
 

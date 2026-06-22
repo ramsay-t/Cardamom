@@ -62,11 +62,18 @@ defmodule Cardamom.Protocol.ChainSync.Codec do
 
   # ---- decode (strict; never raises) ----
 
-  @spec decode(binary()) :: {:ok, message(), binary()} | {:error, term()}
+  @spec decode(binary()) :: {:ok, message(), binary()} | :incomplete | {:error, term()}
   def decode(bytes) when is_binary(bytes) do
     case CBOR.decode(bytes) do
-      {:ok, term, rest} -> with {:ok, msg} <- from_term(term), do: {:ok, msg, rest}
-      {:error, e} -> {:error, {:cbor, e}}
+      {:ok, term, rest} ->
+        with {:ok, msg} <- from_term(term), do: {:ok, msg, rest}
+
+      {:error, e} ->
+        # A message (a ~1KB header in roll_forward) can be split across SDU boundaries.
+        # Distinguish a valid-but-short prefix (:incomplete — the client carries the
+        # tail forward) from genuine corruption, STRUCTURALLY via the shared CBOR-prefix
+        # detector rather than by sniffing CBOR error atoms.
+        if Cardamom.Mux.Cbor.complete?(bytes), do: {:error, {:cbor, e}}, else: :incomplete
     end
   rescue
     e -> {:error, {:exception, e}}

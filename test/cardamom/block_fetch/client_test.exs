@@ -89,6 +89,198 @@ defmodule Cardamom.BlockFetch.ClientTest do
     assert_received :handler_finished, "completion must wait for the handler"
   end
 
+  # ── MC/DC-style coverage (per Ramsay's pattern-matching paper) ────────────────────
+  # Each clause of a multi-clause head is a branch of a DECISION that must be selected
+  # independently; each guard is a CONDITION that must be shown both true (matches) and
+  # false (falls through). Line coverage misses the clause never taken — the "lines that
+  # aren't there but should be". The cases below drive the unselected clauses.
+
+  describe "unwrap/1 — every clause selected independently (the block-envelope decision)" do
+    # Clause 1 (tag 24) is covered by the happy-path tests. Here: the other three.
+    setup do
+      {bf, peer_end} = scripted()
+      me = self()
+      task = Task.async(fn -> BlockFetch.Client.fetch_range(bf, [1, <<1>>], [9, <<9>>], collecting_sink(me)) end)
+      {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+      %{peer_end: peer_end, task: task, me: me}
+    end
+
+    test "clause 2: a bare tag(:bytes) block (no wrapCBORinCBOR) still unwraps", %{peer_end: pe, task: task} do
+      send_bf(pe, :start_batch)
+      # {:block, %CBOR.Tag{tag: :bytes, value: raw}} — the second unwrap clause.
+      send_bf(pe, {:block, %CBOR.Tag{tag: :bytes, value: <<7, 8, 9>>}})
+      send_bf(pe, :batch_done)
+
+      assert :ok = Task.await(task, 2_000)
+      assert [<<7, 8, 9>>] = collect_sunk()
+    end
+
+    test "clause 3: a raw-binary block payload unwraps", %{peer_end: pe, task: task} do
+      send_bf(pe, :start_batch)
+      send_bf(pe, {:block, <<10, 11, 12>>})
+      send_bf(pe, :batch_done)
+
+      assert :ok = Task.await(task, 2_000)
+      assert [<<10, 11, 12>>] = collect_sunk()
+    end
+
+    test "clause 4 (:error): a non-bytes block envelope is skipped, not stored, not crashed",
+         %{peer_end: pe, task: task} do
+      send_bf(pe, :start_batch)
+      # A block whose payload is neither a tag-24 nor bytes nor a binary → unwrap/1 :error
+      # → on_msg's :error arm ('undecodable block envelope; skipping'). in_flight is NOT
+      # incremented, so BatchDone completes immediately.
+      send_bf(pe, {:block, [:not, "a", "block"]})
+      send_bf(pe, :batch_done)
+
+      assert :ok = Task.await(task, 2_000)
+      assert [] = collect_sunk(), "an undecodable envelope must be skipped, not sunk"
+    end
+  end
+
+  test "a late handler_done with no in-flight request is ignored (race guard)" do
+    {bf, _peer_end} = scripted()
+    # No request in flight (req == nil). A stray {:handler_done} — e.g. a handler that
+    # finished after the request already completed — hits the second clause and is a
+    # no-op, not a crash.
+    send(bf, {:handler_done, make_ref()})
+    Process.sleep(30)
+    assert Process.alive?(bf)
+  end
+
+  test "on_msg catch-all: a server message with no in-flight request is ignored" do
+    {bf, peer_end} = scripted()
+    # No fetch_range in flight (req == nil). A stray BatchDone must be ignored, not crash.
+    send_bf(peer_end, :batch_done)
+    Process.sleep(50)
+    assert Process.alive?(bf), "a server message with no request must be a no-op"
+  end
+
+  # A client with a SHORT configurable idle timeout (the :idle_timeout_ms seam), so the
+  # stall path runs in test time, not 90s.
+  defp scripted_idle(ms) do
+    {client_end, peer_end} = Channel.Test.pair()
+    {:ok, conn} = Connection.start_link(channel: client_end, peer: "bf")
+    {:ok, bf} = BlockFetch.Client.start_link(conn: conn, peer: "bf", idle_timeout_ms: ms)
+    {bf, peer_end}
+  end
+
+  test "a STALE idle-timeout token is a no-op (doesn't tear the request down)" do
+    {bf, peer_end} = scripted_idle(10_000)
+    me = self()
+    task = Task.async(fn -> BlockFetch.Client.fetch_range(bf, [1, <<1>>], [9, <<9>>], collecting_sink(me)) end)
+    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+
+    # A forged/stale token doesn't match the armed idle_token → second idle_timeout
+    # clause → ignored. The request must still be live (not replied).
+    send(bf, {:idle_timeout, make_ref()})
+    Process.sleep(30)
+    assert Process.alive?(bf)
+    refute_received _, "a stale idle token must not complete the request"
+
+    # Clean it up: a real BatchDone completes it.
+    send_bf(peer_end, :no_blocks)
+    assert :ok = Task.await(task, 2_000)
+  end
+
+  test "idle timeout WITH a handler still in flight: waits for the handler, then {:error,_}" do
+    # Short idle timeout; a sink that parks until released, so a handler is genuinely
+    # in flight when the idle fires — exercising the 'draining N handler(s)' branch and
+    # maybe_complete WAITING for in_flight to reach 0 before replying :error.
+    {bf, peer_end} = scripted_idle(80)
+    me = self()
+    blk = BlockBuilder.build(block_number: 1, slot: 10, tx_count: 0)
+
+    # The sink sends US its own pid so we can release it, then parks on :release.
+    parking_sink = fn _raw ->
+      send(me, {:handler_pid, self()})
+
+      receive do
+        :release -> :ok
+      after
+        2_000 -> :ok
+      end
+    end
+
+    task = Task.async(fn -> BlockFetch.Client.fetch_range(bf, [10, blk.header_hash], [10, blk.header_hash], parking_sink) end)
+    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+    send_bf(peer_end, :start_batch)
+    send_bf(peer_end, {:block, blk.envelope})
+
+    # Handler parked (in_flight == 1). Send NOTHING more → the 80ms idle fires while the
+    # handler is still running → terminating := {:error,_} but the reply is withheld.
+    assert_receive {:handler_pid, handler}, 1_000
+    refute match?({:ok, _}, Task.yield(task, 200)), "must not reply while a handler is in flight"
+
+    # Release the handler → in_flight hits 0 → maybe_complete now replies the idle error.
+    send(handler, :release)
+    assert {:error, :idle_timeout} = Task.await(task, 2_000)
+  end
+
+  describe "clean?/1 — terminate decision, each branch" do
+    test "a {:shutdown, reason} stop is CLEAN → MsgClientDone is sent" do
+      Process.flag(:trap_exit, true)
+      {bf, peer_end} = scripted()
+      Process.sleep(30)
+
+      :ok = GenServer.stop(bf, {:shutdown, :done}, 1_000)
+
+      assert {:ok, payload, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+      assert {:ok, :client_done, ""} = BF.decode(payload)
+    end
+
+    test "an ABNORMAL stop is NOT clean → NO MsgClientDone (no rude goodbye on a crash)" do
+      Process.flag(:trap_exit, true)
+      {bf, peer_end} = scripted()
+      Process.sleep(30)
+
+      # An abnormal exit reason → clean?/1 falls through to false → terminate sends
+      # nothing. (We just drop; the peer sees a normal dropped connection.)
+      Process.exit(bf, :kill)
+      Process.sleep(30)
+
+      assert {:error, :timeout} = Frame.recv_msg(peer_end, <<>>, 200),
+             "an abnormal death must NOT emit MsgClientDone"
+    end
+  end
+
+  test "a sink that RAISES is caught (handler crash logged), completion still proceeds" do
+    {bf, peer_end} = scripted()
+    blk = BlockBuilder.build(block_number: 1, slot: 10, tx_count: 0)
+    boom = fn _raw -> raise "sink boom" end
+
+    task = Task.async(fn -> BlockFetch.Client.fetch_range(bf, [10, blk.header_hash], [10, blk.header_hash], boom) end)
+    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+    send_bf(peer_end, :start_batch)
+    send_bf(peer_end, {:block, blk.envelope})
+    send_bf(peer_end, :batch_done)
+
+    # The handler's rescue arm fires (logged), and it STILL sends {:handler_done}, so
+    # the batch completes :ok rather than hanging on a crashed handler.
+    assert :ok = Task.await(task, 2_000)
+    assert Process.alive?(bf)
+  end
+
+  test "genuine corruption mid-stream: whole prior messages apply, the rest is dropped" do
+    {bf, peer_end} = scripted()
+    me = self()
+    blk = BlockBuilder.build(block_number: 1, slot: 10, tx_count: 0)
+
+    task = Task.async(fn -> BlockFetch.Client.fetch_range(bf, [10, blk.header_hash], [10, blk.header_hash], collecting_sink(me)) end)
+    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+
+    # StartBatch + a whole block, then GENUINELY malformed bytes (not a short read) in
+    # the SAME SDU → reassemble's {:error, msgs, _} branch: the block applies, the
+    # corruption is logged and the tail dropped. A 0xFF break alone is malformed here.
+    packed = BF.encode(:start_batch) <> BF.encode({:block, blk.envelope}) <> <<0xFF>>
+    :ok = Frame.send_msg(peer_end, @block_fetch, packed)
+    send_bf(peer_end, :batch_done)
+
+    assert :ok = Task.await(task, 2_000)
+    assert [raw] = collect_sunk(), "the whole block before the corruption must still be sunk"
+    assert raw == blk.raw
+  end
+
   test "a busy client (request mid-batch) returns {:error, :busy}" do
     {bf, peer_end} = scripted()
     me = self()

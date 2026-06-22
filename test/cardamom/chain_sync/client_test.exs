@@ -113,6 +113,33 @@ defmodule Cardamom.ChainSync.ClientTest do
     assert Process.alive?(cs)
   end
 
+  # THE 1962 MUX INVARIANT for chain-sync (the same class as the block-fetch block-split
+  # bug, 2026-06-22): a ~1KB header in a RollForward can be split across SDU boundaries.
+  # The client must carry the partial tail and reassemble it, not lose sync.
+  test "a RollForward SPLIT across two SDUs is reassembled, not dropped" do
+    capture_events("cs-split")
+    {_conn, cs, peer_end} = start_stack()
+    assert_receive {:telemetry, [:cardamom, :peer, :connected], _, %{peer: "scripted"}}, 1_000
+    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+
+    # A big opaque header so the message is well over a trivial size; encode the whole
+    # RollForward, then cut its bytes in half across two SDU deliveries.
+    header = :crypto.strong_rand_bytes(1200)
+    msg_bytes = CSCodec.encode({:roll_forward, header, [123, <<0::256>>]})
+    cut = div(byte_size(msg_bytes), 2)
+    <<head::binary-size(cut), tail::binary>> = msg_bytes
+
+    :ok = Frame.send_msg(peer_end, @chain_sync, head)
+    :ok = Frame.send_msg(peer_end, @chain_sync, tail)
+
+    # The reassembled RollForward must produce exactly one protocol event (and the
+    # client must then ask for the next — proving it processed the whole message).
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollForward", header_bytes: 1200}}, 1_000
+    assert {:ok, payload, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+    assert {:ok, :request_next, ""} = CSCodec.decode(payload)
+    assert Process.alive?(cs)
+  end
+
   test "tolerates an undecodable chain-sync payload without crashing" do
     capture_events("cs-baddecode")
     {_conn, cs, peer_end} = start_stack()
