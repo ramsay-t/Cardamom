@@ -62,4 +62,58 @@ defmodule Cardamom.Protocol.BlockFetch.CodecTest do
       assert {:ok, :batch_done, ""} = Codec.decode(rest)
     end
   end
+
+  # The 1962 mux invariant: a mini-protocol message (a ~1KB block) may be split
+  # across SDU boundaries. The codec MUST distinguish "valid CBOR prefix, just
+  # truncated — wait for more bytes" (:incomplete) from "genuinely malformed"
+  # ({:error, _}). Without this distinction the client can't carry the partial tail
+  # forward, treats the split as a frame error, and loses sync for the rest of the
+  # stream (the live block-fetch bug: 12 of ~55 blocks stored, 2026-06-22).
+  describe "incomplete (truncated) messages — carry-over support" do
+    # A real-shaped block: [4, #6.24(bytes)] with a ~1KB byte string, the only
+    # block-fetch message large enough to span an SDU.
+    defp big_block do
+      wrapped = %CBOR.Tag{tag: 24, value: %CBOR.Tag{tag: :bytes, value: :crypto.strong_rand_bytes(1000)}}
+      Codec.encode({:block, wrapped})
+    end
+
+    test "a block truncated mid-byte-string is :incomplete, NOT an error" do
+      full = big_block()
+      # Cut it well inside the byte string (head present, payload short).
+      partial = binary_part(full, 0, div(byte_size(full), 2))
+      assert :incomplete = Codec.decode(partial)
+    end
+
+    test "a block truncated at many lengths is consistently :incomplete" do
+      full = big_block()
+
+      for n <- [3, 5, 10, 50, 200, 500, byte_size(full) - 1] do
+        assert :incomplete = Codec.decode(binary_part(full, 0, n)),
+               "truncation at #{n} bytes must be :incomplete (a valid prefix), not an error"
+      end
+    end
+
+    test "the exact-length buffer decodes (boundary: not incomplete)" do
+      full = big_block()
+      assert {:ok, {:block, _}, ""} = Codec.decode(full)
+    end
+
+    test "a complete message + a truncated next message: first decodes, rest is the partial tail" do
+      # This is the live case: an SDU ends with a whole BatchDone-or-block followed
+      # by the START of the next block. drain must consume the whole one and hand
+      # back the partial tail to carry forward.
+      whole = Codec.encode(:start_batch)
+      partial = binary_part(big_block(), 0, 40)
+      assert {:ok, :start_batch, rest} = Codec.decode(whole <> partial)
+      assert rest == partial
+      # And the partial tail on its own is :incomplete (wait for the next SDU).
+      assert :incomplete = Codec.decode(rest)
+    end
+
+    test "genuinely malformed bytes are still {:error, _}, NOT :incomplete" do
+      # A lone CBOR break / nonsense is corruption, not a short read — must stay an
+      # error so a real protocol violation isn't mistaken for "wait for more".
+      assert {:error, _} = Codec.decode(<<0xFF>>)
+    end
+  end
 end

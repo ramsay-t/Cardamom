@@ -26,16 +26,30 @@ defmodule Cardamom.Forest.Server do
 
   # ---- API ----
 
-  @doc "Feed a header given as its hash and parent hash."
+  @doc """
+  Feed a header given as its hash and parent hash.
+
+  SYNCHRONOUS (a `call`, not a `cast`) by deliberate design: this is the
+  backpressure that bounds the mailbox under fan-out. The chain-sync pull loop
+  feeds the forest BEFORE requesting the next header, so a synchronous add makes
+  "stop pulling until we've handled the last one" literally true end-to-end — each
+  peer rendezvouses with the forest before pulling again, capping in-flight writes
+  at one per peer. A wedged forest correctly stalls ingest rather than letting the
+  request loop race unboundedly ahead. (See ForestBackpressureTest.)
+  """
   def add_header(server \\ __MODULE__, hash, parent_hash) do
-    GenServer.cast(server, {:add, hash, parent_hash})
+    GenServer.call(server, {:add, hash, parent_hash})
   end
 
   @doc "Current tip hash."
   def tip(server \\ __MODULE__), do: GenServer.call(server, :tip)
 
-  @doc "Move the tip back to `point` (rollback)."
-  def rollback(server \\ __MODULE__, point), do: GenServer.cast(server, {:rollback, point})
+  @doc """
+  Move the tip back to `point` (rollback). Synchronous for the same reason as
+  `add_header/3`: the chain-sync loop must handle the roll-backward before pulling
+  the next message.
+  """
+  def rollback(server \\ __MODULE__, point), do: GenServer.call(server, {:rollback, point})
 
   @doc "A snapshot: tip, its height, node count."
   def status(server \\ __MODULE__), do: GenServer.call(server, :status)
@@ -85,7 +99,7 @@ defmodule Cardamom.Forest.Server do
   end
 
   @impl true
-  def handle_cast({:add, hash, parent}, %{forest: f} = state) do
+  def handle_call({:add, hash, parent}, _from, %{forest: f} = state) do
     f = Forest.add(f, %{hash: hash, parent_hash: parent})
     tip = Forest.tip(f)
 
@@ -100,14 +114,14 @@ defmodule Cardamom.Forest.Server do
     # resume anchor (NOT the raw chain-sync stream's latest, which may be a fork the
     # forest doesn't believe). Only on CHANGE (the tip moves every header; we don't
     # hammer the store with no-op writes). Best-effort; absent in bare unit tests.
-    {:noreply, %{state | forest: f} |> maybe_persist_tip(tip)}
+    {:reply, :ok, %{state | forest: f} |> maybe_persist_tip(tip)}
   end
 
-  def handle_cast({:rollback, point}, %{forest: f} = state) do
+  def handle_call({:rollback, point}, _from, %{forest: f} = state) do
     f = Forest.rollback(f, point)
     tip = Forest.tip(f)
     :telemetry.execute([:cardamom, :forest, :rollback], %{}, %{point: point, tip: tip})
-    {:noreply, %{state | forest: f} |> maybe_persist_tip(tip)}
+    {:reply, :ok, %{state | forest: f} |> maybe_persist_tip(tip)}
   end
 
   @impl true

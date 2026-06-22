@@ -27,6 +27,17 @@ defmodule Cardamom.Channel do
   @doc "Close the channel."
   @callback close(t()) :: :ok
 
+  @doc """
+  Half-close: send our FIN (stop writing) but keep the read side open so we can drain
+  the peer's in-flight bytes and see ITS FIN. Calling `close/1` while the peer's bytes
+  are still unread in our receive buffer makes the kernel emit a RST instead of a FIN
+  (POSIX), which a peer reads as "the client choked". The graceful sequence is:
+  send our protocol Dones → `shutdown_write/1` → drain until the peer closes → `close/1`.
+  Optional: transports that can't half-close fall back to a plain close.
+  """
+  @callback shutdown_write(t()) :: :ok | {:error, term()}
+  @optional_callbacks shutdown_write: 1
+
   # Convenience dispatch: a channel is `{module, ref}`.
   @spec send({module(), t()}, iodata()) :: :ok | {:error, term()}
   def send({mod, ref}, bytes), do: mod.send(ref, bytes)
@@ -36,4 +47,10 @@ defmodule Cardamom.Channel do
 
   @spec close({module(), t()}) :: :ok
   def close({mod, ref}), do: mod.close(ref)
+
+  # Half-close if the transport supports it; otherwise a no-op (caller then close/1s).
+  @spec shutdown_write({module(), t()}) :: :ok | {:error, term()}
+  def shutdown_write({mod, ref}) do
+    if function_exported?(mod, :shutdown_write, 1), do: mod.shutdown_write(ref), else: :ok
+  end
 end

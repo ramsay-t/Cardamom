@@ -180,12 +180,32 @@ defmodule Cardamom.Connection do
   @impl true
   def terminate(reason, state) do
     Logger.info("bearer peer=#{state.peer}: releasing socket (reason=#{inspect(reason)})")
-    safe_close(state)
+    graceful_close(reason, state)
     :ok
   end
 
-  defp safe_close(state) do
-    Channel.close(state.channel)
+  # A clean teardown closes POLITELY to avoid a RST on the wire (which a peer reads as
+  # "the client choked" — Marcin 2026-06-22). By now the protocol processes have sent
+  # their Dones (they're ordered before the bearer). We then:
+  #   1. shutdown_write — send our FIN ("we're done writing"), keep the read side open;
+  #   2. briefly let the Reader keep draining the peer's in-flight bytes (it's looping on
+  #      recv) so nothing is left UNREAD when we close — close-with-unread-data is what
+  #      forces the kernel to send RST instead of FIN;
+  #   3. close.
+  # On a channel-closed teardown (the peer already FIN'd — the {:channel_closed} path)
+  # there's nothing in flight, so a plain close is already a clean FIN/FIN.
+  defp graceful_close(reason, state) when reason in [:normal, :shutdown] do
+    safe(fn -> Channel.shutdown_write(state.channel) end)
+    # Bounded window for the Reader to drain the peer's remaining bytes + see its FIN.
+    # Short — we're closing, not waiting on the peer indefinitely.
+    Process.sleep(100)
+    safe(fn -> Channel.close(state.channel) end)
+  end
+
+  defp graceful_close(_abnormal, state), do: safe(fn -> Channel.close(state.channel) end)
+
+  defp safe(fun) do
+    fun.()
     :ok
   rescue
     _ -> :ok

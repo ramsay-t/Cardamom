@@ -42,7 +42,15 @@ defmodule Cardamom.Node do
           case Channel.Tcp.connect(host, port) do
             {:ok, channel} ->
               report(:report_connected, host, port)
-              Session.start_link(channel: channel, peer: label, magic: cfg.network)
+
+              # Pass through an optional :protocols list (default: all, decided in
+              # Session). A block-fetch-only diagnostic run sets protocols:
+              # [:block_fetch, :keep_alive] so the captured traffic is unambiguous.
+              session_opts =
+                [channel: channel, peer: label, magic: cfg.network]
+                |> maybe_put(:protocols, Keyword.get(opts, :protocols))
+
+              Session.start_link(session_opts)
 
             {:error, reason} ->
               report(:report_failed, host, port)
@@ -51,6 +59,9 @@ defmodule Cardamom.Node do
       end
     end
   end
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp connect_gate(host, port) do
     if Process.whereis(Cardamom.Control), do: Cardamom.Control.request_connect(host, port), else: :ok

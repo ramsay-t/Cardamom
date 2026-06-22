@@ -31,7 +31,7 @@ defmodule Cardamom.Integration.NodeStartTest do
     {:ok, acceptor} =
       Task.start_link(fn ->
         {:ok, chan} = Channel.Tcp.accept(lsock, 5_000)
-        {:ok, _} = SimPeer.start_link(channel: chan, protocols: [:handshake, :chain_sync, :keep_alive], magic: 2)
+        {:ok, _} = SimPeer.start_link(channel: chan, protocols: [:handshake, :chain_sync, :keep_alive, :block_fetch], magic: 2)
         Process.sleep(:infinity)
       end)
 

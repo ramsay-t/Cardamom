@@ -66,7 +66,7 @@ defmodule Cardamom.Integration.FullLoopTest do
 
     port =
       start_sim_listener(
-        protocols: [:handshake, :chain_sync, :keep_alive],
+        protocols: [:handshake, :chain_sync, :keep_alive, :block_fetch],
         accept_version: 14,
         magic: @magic
       )
@@ -84,7 +84,7 @@ defmodule Cardamom.Integration.FullLoopTest do
     capture("fullloop-stream")
 
     port =
-      start_sim_listener(protocols: [:handshake, :chain_sync, :keep_alive], accept_version: 14, magic: @magic)
+      start_sim_listener(protocols: [:handshake, :chain_sync, :keep_alive, :block_fetch], accept_version: 14, magic: @magic)
 
     {:ok, chan} = Channel.Tcp.connect("localhost", port, 2_000)
     {:ok, _session} = Session.start_link(channel: chan, peer: "stream-sim", magic: @magic)

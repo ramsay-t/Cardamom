@@ -60,7 +60,11 @@ defmodule Cardamom.BlockFetch.Client do
     Process.link(conn)
     Process.flag(:trap_exit, true)
     :ok = Cardamom.Connection.register(conn, @block_fetch)
-    {:ok, %{conn: conn, peer: Keyword.get(opts, :peer, "loopback"), req: nil}}
+    # `buffer` carries the partial tail of a mini-protocol message that was split
+    # across SDU boundaries — prepended to the next SDU's bytes. Empty whenever the
+    # protocol is between whole messages (idle); non-empty means a message is in
+    # flight across SDUs. (The 1962 mux invariant: reassemble across time slots.)
+    {:ok, %{conn: conn, peer: Keyword.get(opts, :peer, "loopback"), req: nil, buffer: <<>>}}
   end
 
   @impl true
@@ -88,9 +92,13 @@ defmodule Cardamom.BlockFetch.Client do
     # scale). The COMPLETE raw bytes are preserved verbatim in the durable store
     # (blocks.raw, hash-verified) — that IS the forensic record. (Contrast chain-sync
     # headers, which fit under 8192 and are logged whole.)
-    # Drain ALL messages in the SDU (a relay packs e.g. last Block + BatchDone together).
+    # Prepend any carried-over partial tail, then drain ALL whole messages. A relay
+    # packs e.g. last Block + BatchDone in one SDU (drain loops), AND a single block
+    # can be split across SDUs (the leftover tail is held in `buffer` for next time).
     # Reset the idle timer — we got bytes, the peer is alive.
-    {:noreply, payload |> drain(arm_idle(state))}
+    state = arm_idle(state)
+    {state, rest} = drain(state.buffer <> payload, state)
+    {:noreply, %{state | buffer: rest}}
   end
 
   # A spawned block handler finished (decoded + stored). Decrement in-flight; if the
@@ -117,16 +125,52 @@ defmodule Cardamom.BlockFetch.Client do
 
   def handle_info({:EXIT, _from, reason}, state), do: {:stop, reason, state}
 
+  # Polite goodbye: on a clean shutdown send MsgClientDone ([1]) so the relay's proto-3
+  # state machine reaches StDone, mirroring chain-sync's MsgDone. Block-fetch holds
+  # agency at StIdle (between/after batches), so MsgClientDone is the legal close.
+  # SYNCHRONOUS send — it must reach the socket before the bearer (ordered after us in
+  # the session) releases it; a cast would race the link-death close and lose. Abnormal
+  # death just drops (the relay sees a normal dropped connection). (Marcin 2026-06-22:
+  # a dangling proto / RST reads as a client fault — leave cleanly so it can't.)
+  @impl true
+  def terminate(reason, state) do
+    if clean?(reason) and Process.alive?(state.conn) do
+      Logger.info("block_fetch peer=#{state.peer}: sending MsgClientDone (clean close)")
+      _ = Cardamom.Connection.send_frame_sync(state.conn, @block_fetch, Codec.encode(:client_done))
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp clean?(:normal), do: true
+  defp clean?(:shutdown), do: true
+  defp clean?({:shutdown, _}), do: true
+  defp clean?(_), do: false
+
   # ---- message handling ----
 
-  defp drain(<<>>, state), do: state
+  # Consume every WHOLE message in `bytes`; return {state, leftover}. `leftover` is the
+  # tail of a message that isn't fully present yet (`:incomplete`) — held in `buffer`
+  # and concatenated with the next SDU. A genuine decode error (corruption, not a short
+  # read) is logged and the rest discarded (we can't realign mid-stream anyway).
+  defp drain(<<>>, state), do: {state, <<>>}
 
   defp drain(bytes, state) do
     case Codec.decode(bytes) do
-      {:ok, msg, rest} -> drain(rest, on_msg(msg, state))
+      {:ok, msg, rest} ->
+        drain(rest, on_msg(msg, state))
+
+      :incomplete ->
+        # A message is split across the SDU boundary — keep the prefix for next time.
+        {state, bytes}
+
       {:error, reason} ->
         Logger.warning("block_fetch decode error: #{inspect(reason)}")
-        state
+        {state, <<>>}
     end
   end
 

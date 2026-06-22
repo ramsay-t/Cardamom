@@ -34,7 +34,7 @@ defmodule Cardamom.Integration.CleanShutdownTest do
         {:ok, _peer} =
           SimPeer.start_link(
             channel: server_chan,
-            protocols: [:handshake, :chain_sync, :keep_alive],
+            protocols: [:handshake, :chain_sync, :keep_alive, :block_fetch],
             accept_version: 14,
             magic: @magic,
             report_to: test_pid

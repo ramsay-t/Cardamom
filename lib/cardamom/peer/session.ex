@@ -35,6 +35,11 @@ defmodule Cardamom.Peer.Session do
     versions = Keyword.get(opts, :versions, [14])
     ledger = Keyword.get(opts, :ledger, {Cardamom.Ledger.Stub, nil})
     keepalive_ms = Keyword.get(opts, :keepalive_ms, 10_000)
+    # Which mini-protocols to run. Default: all. A block-fetch-only diagnostic run
+    # passes protocols: [:block_fetch] (+ :keep_alive to avoid the 97s reap) so the
+    # captured traffic is unambiguously block-fetch — no chain-sync interleaved on the
+    # mux. Block-fetch has no dependency on chain-sync; they're independent processes.
+    protocols = Keyword.get(opts, :protocols, [:chain_sync, :keep_alive, :block_fetch])
 
     Process.flag(:trap_exit, true)
 
@@ -48,18 +53,28 @@ defmodule Cardamom.Peer.Session do
         {:ok, conn} =
           Cardamom.Connection.start_link(channel: channel, peer: peer, version: agreed.version)
 
-        {:ok, chain_sync} =
-          Cardamom.ChainSync.Client.start_link(conn: conn, peer: peer, ledger: ledger)
+        # Start only the requested mini-protocols (default: all). Each is independent;
+        # an omitted one simply means no traffic for that proto# on the mux.
+        chain_sync =
+          if :chain_sync in protocols do
+            {:ok, cs} = Cardamom.ChainSync.Client.start_link(conn: conn, peer: peer, ledger: ledger)
+            cs
+          end
 
-        {:ok, keep_alive} =
-          Cardamom.KeepAlive.Client.start_link(conn: conn, interval_ms: keepalive_ms)
+        keep_alive =
+          if :keep_alive in protocols do
+            {:ok, ka} = Cardamom.KeepAlive.Client.start_link(conn: conn, interval_ms: keepalive_ms)
+            ka
+          end
 
-        {:ok, block_fetch} =
-          Cardamom.BlockFetch.Client.start_link(conn: conn, peer: peer)
-
-        # Register this peer's block-fetch client into ChainStore's round-robin, so
-        # ChainStore.get_blocks can fetch from it. Best-effort (absent in bare tests).
-        if Process.whereis(Cardamom.ChainStore), do: Cardamom.ChainStore.register_peer(block_fetch)
+        block_fetch =
+          if :block_fetch in protocols do
+            {:ok, bf} = Cardamom.BlockFetch.Client.start_link(conn: conn, peer: peer)
+            # Register this peer's block-fetch client into ChainStore's round-robin, so
+            # ChainStore.get_blocks can fetch from it. Best-effort (absent in bare tests).
+            if Process.whereis(Cardamom.ChainStore), do: Cardamom.ChainStore.register_peer(bf)
+            bf
+          end
 
         {:ok,
          %{

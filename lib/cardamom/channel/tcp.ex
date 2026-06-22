@@ -69,4 +69,10 @@ defmodule Cardamom.Channel.Tcp do
 
   @impl Cardamom.Channel
   def close(%__MODULE__{socket: socket}), do: :gen_tcp.close(socket)
+
+  # Half-close: send our FIN but keep reading, so we can drain the peer's in-flight
+  # bytes (and see its FIN) before the full close — avoiding the RST that close/1 emits
+  # when the receive buffer still holds unread data.
+  @impl Cardamom.Channel
+  def shutdown_write(%__MODULE__{socket: socket}), do: :gen_tcp.shutdown(socket, :write)
 end

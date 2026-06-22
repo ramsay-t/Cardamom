@@ -1,8 +1,9 @@
 defmodule Cardamom.Protocol.DecodeRobustnessPropertyTest do
   @moduledoc """
   The decoders sit on the Harvard boundary: they consume UNTRUSTED network bytes, so
-  they must NEVER crash on arbitrary or truncated input — only return {:error, _} (or
-  {:ok, _}). A decoder that raises on malformed bytes is a remote DoS. These
+  they must NEVER crash on arbitrary or truncated input — only return {:error, _},
+  {:ok, _}, or :incomplete (block-fetch: a valid-but-truncated prefix awaiting more
+  bytes). A decoder that raises on malformed bytes is a remote DoS. These
   properties hammer each decoder with random bytes and with truncations of valid
   messages — the input space coverage % can't reach.
   """
@@ -19,6 +20,8 @@ defmodule Cardamom.Protocol.DecodeRobustnessPropertyTest do
       {:ok, _, _} -> true
       {:ok, _} -> true
       {:error, _} -> true
+      # block-fetch signals a valid-but-truncated prefix (carry-over across SDUs).
+      :incomplete -> true
       _ -> false
     end
   end
@@ -57,6 +60,23 @@ defmodule Cardamom.Protocol.DecodeRobustnessPropertyTest do
 
     check all n <- integer(0..byte_size(msg)) do
       assert ok_or_error(BF.decode(binary_part(msg, 0, n)))
+    end
+  end
+
+  # STRONGER: a truncation of a real MsgBlock is a valid PREFIX, so it must be
+  # :incomplete (short read — carry over) or {:ok,...} (a full message, when n is the
+  # whole length) — NEVER {:error, _}. An {:error, _} here is the live bug: the client
+  # would treat the boundary split as corruption and lose stream sync. (n=0 is the
+  # empty buffer → :incomplete.)
+  property "a truncated real MsgBlock is :incomplete or :ok, never an error" do
+    blk = BlockBuilder.build(block_number: 1, slot: 10, tx_count: 1)
+    msg = BF.encode({:block, blk.envelope})
+
+    check all n <- integer(0..byte_size(msg)) do
+      result = BF.decode(binary_part(msg, 0, n))
+
+      assert result == :incomplete or match?({:ok, _, _}, result),
+             "truncation at #{n}/#{byte_size(msg)} was #{inspect(result)} — a prefix must never be {:error, _}"
     end
   end
 end
