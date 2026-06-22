@@ -1,20 +1,19 @@
-# Cardamom — Wire protocol notes (milestone 1: talk to a Preview relay)
+# Cardamom — Wire protocol notes
 
-The networking layer is *under-specified in prose* and is itself an open spec
-project Ramsay cares about (he owns this area). Building Cardamom against a real
-Preview relay is partly a way to *generate findings* for the network spec. So:
-record where the spec speaks clearly, where it's silent, and every byte-level
-ambiguity we hit.
+The networking layer is *under-specified in prose*, and improving that
+specification is a deliberate aim of this project. Building Cardamom against a real
+relay is partly a way to *generate findings* for the network spec. So: record where
+the spec speaks clearly, where it's silent, and every byte-level ambiguity we hit.
 
-## EPISTEMICS: the CSP is a HYPOTHESIS, not ground truth (Ramsay, 2026-06-08)
+## Epistemics: the CSP is a HYPOTHESIS, not ground truth
 
 The CSP model is the **most formal artifact available, but it may or may not match
-the real (woefully under-documented) network behaviour.** Same stance as the Agda
-ledger spec — own the formal artifact, treat the running implementation as
-de-facto truth, treat discrepancies as FINDINGS — but WORSE here: the ledger has a
-conformance bridge to the node; the network has this abstract model on one side
-and the under-documented Haskell `ouroboros-network` on the other with **no
-established conformance bridge.** The model/reality gap is UNMEASURED.
+the real network behaviour, which is not fully captured in prose.** Same stance as
+the Agda ledger spec — own the formal artifact, treat the running implementation as
+de-facto truth, treat discrepancies as FINDINGS — but the situation differs: the
+ledger has a conformance bridge to the node, whereas the network has this abstract
+model on one side and the Haskell `ouroboros-network` implementation on the other,
+with **no established conformance bridge.** The model/reality gap is UNMEASURED.
 
 So Cardamom is a **third triangulation point**: an independent implementation
 built from the model, meeting the real wire, reporting where model / prose /
@@ -28,20 +27,20 @@ it.
 
 An unproven from-scratch impl WILL send malformed SDUs / mis-sequenced messages /
 bad handshakes while we get it right. Against mainnet that is: impolite (eating
-real infra's connection slots + CPU with garbage), potentially destabilising (our
-malformed message meeting a fragile Haskell parser error-path — exactly the
-failure Ramsay suspects), and suspicious-unknown-peer behaviour on production.
+real infra's connection slots + CPU with garbage), potentially destabilising (a
+malformed message meeting a parser error-path), and suspicious-unknown-peer
+behaviour on production.
 Against **Preview** it's consequence-free — disposable test net that exists for
 this; tripping an error path there is a useful finding, not harm. **Preview is the
 RESPONSIBLE default for ALL wire testing, not just M1.** Mainnet, if ever, =
 observe-only, post-Preview-proven, ideally against our own relay.
 
-Bonus: on Preview, Ramsay/team can stand up a **known controlled peer** (a real
+Bonus: on Preview, one can stand up a **known controlled peer** (a real
 Haskell node we configure) → when Cardamom and the CSP disagree, compare against a
-controlled real implementation rather than guessing. Turns "model vs. mystery"
+controlled real implementation rather than guessing. Turns "model vs. unknown"
 into "model vs. controlled-real".
 
-## DIRECTIVE: parse the CDDL and ENFORCE it — STRICT, never coerce (Ramsay, 2026-06-08)
+## DIRECTIVE: parse the CDDL and ENFORCE it — STRICT, never coerce
 
 **Default instinct (Postel's law, "be liberal in what you accept") is WRONG and
 DANGEROUS here.** Real history: a network split was caused by two node versions
@@ -94,7 +93,7 @@ M1-relevant grammar (the strict targets):
 - `header_body = [block_number, slot, prev_hash : hash32/nil, issuer_vkey,
   vrf_vkey, vrf_result, block_body_size : uint.size 4, block_body_hash : hash32,
   operational_cert, protocol_version]` (10 fields).
-- `hash32 = bytes .size 32` ← **the exact field type from Ramsay's network-split
+- `hash32 = bytes .size 32` ← **the exact field type from the network-split
   anecdote.** First concrete strict-enforce target: exactly 32 bytes, reject 33.
 - `kes_signature = bytes .size 448`.
 
@@ -105,11 +104,11 @@ NOT a re-encoding — if we re-serialize and bytes differ from what arrived, the
 hash won't match. Canonical-encoding strictness bites exactly here. (header also
 carries block_body_hash → body; body fetch is M2.)
 
-## FINDINGS from the CDDL (raise w/ Ramsay)
+## FINDINGS from the CDDL
 
 - **(epistemics)** `conway.cddl` line 1: "auto-generated using generate-cddl, do
   not modify directly". It's RENDERED from `HuddleSpec.hs` (Huddle DSL). Huddle
-  is upstream truth; `.cddl` is derived. The "big debate" Ramsay mentioned may
+  is upstream truth; `.cddl` is derived. Any such debate may
   live in Huddle source/history, not the rendered `.cddl`.
 - **(gap)** CDDL is necessary but NOT sufficient to validate a block: some
   constraints are PROSE COMMENTS the grammar can't express (e.g. lines 3–7:
@@ -118,10 +117,10 @@ carries block_body_hash → body; body fetch is M2.)
   ledger rules / Huddle / comments. Worth flagging: a from-scratch implementer
   enforcing only the CDDL would MISS these.
 
-## CSP STRUCTURAL FIDELITY — house rules (Ramsay, 2026-06-08)
+## CSP STRUCTURAL FIDELITY — house rules
 
 The Elixir must respect the CSP **structurally**, not just semantically — code
-branch structure mirrors the process-algebra structure (Ramsay taught
+branch structure mirrors the process-algebra structure (a deliberate intent, from CSP/CCS practice)
 Erlang+CCS in parallel). Mini-protocol FSMs are `:gen_statem`; CSP process names
 → state names; CSP line ranges cited per state.
 
@@ -141,8 +140,8 @@ matter" gap. State shape: `do local work; (≤1) encode_and_send; {:next_state,
 :st_next, data}` where :st_next starts by receiving.
 
 **RULE 2 — every FSM is ALL external choice (receive-first); apparent internal
-choice means a missing DRIVER process to factor out.** Refined by Ramsay
-(2026-06-08), this is how he taught CSP/CCS:
+choice means a missing DRIVER process to factor out.** This follows the standard
+CSP/CCS treatment:
 
 Internal choice `|~|` is just external choice `[]` with the deciding
 communication HIDDEN. So when an FSM state looks like it "decides" (the `StIdle`
@@ -239,7 +238,7 @@ them is the open work (and a likely source of spec findings):
 - **Blocks/Points/Headers toy** (Block = b1|b2): no real hashes/structure.
 - Model's own ToDos: lines ~583, ~740, ~808 — author flags underspecified points.
 
-## SPEC FINDINGS / FLAGS to raise with Ramsay (per his "raise lots" instruction)
+## SPEC FINDINGS / FLAGS to raise upstream (a deliberate intent: raise spec questions liberally)
 
 - **(gap)** Handshake — the first & most failure-prone exchange — has no formal
   model here. Is there a separate handshake model, or genuinely unmodelled?
@@ -319,7 +318,7 @@ this section is that spec, written down.
 **Encode/decode:** `putWord32be ts; putWord16be (num|dir); putWord16be len; <blob>`.
 Decode reverses; `mhNum = a .&. 0x7fff`, dir from `a .&. 0x8000`.
 
-### FINDING — direction bit: CODE CONTRADICTS ITS OWN COMMENT (raise w/ Ramsay)
+### FINDING — direction bit: CODE CONTRADICTS ITS OWN COMMENT
 `Codec.hs` prose comment (lines 29-32) says: "d: 1 = initiator, 0 = responder."
 The CODE says the OPPOSITE: `putNumAndMode n InitiatorDir = n` (bit=0);
 `ResponderDir = n .|. 0x8000` (bit=1); and `getDir`: `0x8000==0 -> InitiatorDir`.
@@ -389,7 +388,7 @@ a size cap; and optionally a (short, test-scaled) timeout to exercise our
 client's liveness. Reproduces the real close/blacklist triggers so passing the
 sim means we won't get dropped by Preview for a protocol-correctness reason.
 
-## Preview network magic = 2 (verified 2026-06-11)
+## Preview network magic = 2
 
 `networkMagic = 2` for Preview testnet (mainnet 764824073, preprod 1). Goes in
 the handshake `nodeToNodeVersionData = [networkMagic, ...]` as a word32. WRONG

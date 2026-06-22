@@ -2,14 +2,14 @@
 
 *A Cardano node reimplemented on the BEAM (Erlang VM) in Elixir.*
 
-Status: design, pre-implementation. Last updated 2026-06-08.
+Status: in development. Chain-sync (resumable), keep-alive, block-fetch, and the durable store are built; ledger/script validation is not yet performed.
 
-## Project targets (Ramsay's north stars, 2026-06-11)
+## Project goals
 
 Three stated goals, each a different shape of system; every scope decision should
 serve these:
 
-**(a) Network layer + BEAM interop.** Learn the (under-documented) network layer
+**(a) Network layer + BEAM interop.** Learn the network layer (which is not fully specified in prose)
 and demonstrate interoperability with a BEAM-native multiprocess implementation.
 The deliverable is partly the working connection but largely the *evidence* about
 how the network layer maps onto the BEAM's process model — so the CSP-fidelity,
@@ -38,7 +38,7 @@ The observational/forensic goal, and the one the forensic-store design was FOR:
 - Both are the SAME lifecycle shape feeding the SAME forensic/telemetry spine.
   Spine is built; needs the real event sources (esp. tx-submission) wired in.
 
-**Roadmap serving all three:** chain-sync (done) → block-fetch (b) →
+**Roadmap serving all three:** chain-sync (built; resumable) → block-fetch (b) →
 tx-submission (c) → ledger UTxO+datum tracking (b) → SQL analytical store (b).
 (a) served throughout by keeping the BEAM-vs-Haskell comparison explicit.
 
@@ -388,8 +388,8 @@ is*; exact about *what each hypothesis means* and *what has settled below `k`*.*
 Eventual consistency on *selection + completeness*; strict determinism on
 *interpretation + settlement*.
 
-**There is NO concurrency hazard here at all** (final position, after Ramsay
-dissolved a series of phantom hazards I introduced, 2026-06-08):
+**There is NO concurrency hazard here at all** (the settled position, after a
+series of apparent hazards turned out to be phantom):
 
 - **Intra-chain ordering cannot be raced.** A block references its parent by
   hash; it is *unapplicable* until the parent's state exists. "Apply B then A"
@@ -644,13 +644,13 @@ Design consequences:
   negotiate. Avoid "Consensus.Coordinator" implying negotiation — prefer
   `ChainSelection` / a ChainDB-side arbiter. (To finalise with the tree.)
 
-SPEC CHECK (Ramsay's domain — verify, don't assert from memory): the precise
+SPEC CHECK (verify against the formal spec, do not assert from memory): the precise
 density/length rule, and **Praos longest-chain vs. Genesis density-window rule**
 (Genesis resists a long adversarial chain shown to a fresh/eclipsed node — which
 rule is normative for which sync situation?); and the exact same-slot tie-break
 (believed VRF-lowest). Cite the formal spec.
 
-## Supervision tree (sketch — to be finalised)
+## Supervision tree
 
 ```
 Cardamom.Application
@@ -672,7 +672,7 @@ ChainStore; the SqlWriter restarting must not drop live ledger state.
 
 ## Open questions
 
-- Final supervision tree shape (above is a sketch).
+- Final supervision tree shape.
 - Module/namespace layout.
 - Exact simplified-ledger rules for the chosen era.
 - Where the future codec seam sits precisely.

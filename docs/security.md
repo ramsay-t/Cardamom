@@ -55,8 +55,7 @@ from network input, that is arbitrary remote code execution.
    # apply(received_module, ...)      # RCE
    ```
 
-   (Ramsay: "I might shudder slightly but I will get the static and secure
-   nature." Yes — the verbosity IS the safety.)
+   The verbosity is the safety: a static, closed mapping is worth the extra lines.
 
 This is consistent with our existing codec style (strict pattern-match received
 bytes into a fixed set of OUR atoms, reject everything else — strict-CDDL). The
@@ -81,7 +80,7 @@ directives. This unifies with the other rules:
 
 ## Two distinct boundaries: Harvard (code) vs trust (who you talk to)
 
-Don't conflate these (Ramsay flagged 2026-06-11):
+These must not be conflated:
 
 - **Harvard boundary** stops network input becoming *code* (modules, dispatch,
   callables). A **dial target (IP:port) from the network is INERT DATA** — a host
@@ -117,7 +116,8 @@ eclipse-resistance (source caps, forced diversity) lives in the PeerStore.
 
 ## Possible enforcement (to decide later, not built yet)
 
-Given Ramsay's coverage-tool instincts (mechanise what discipline misses):
+A deliberate design intent: mechanise what discipline would otherwise have to
+catch by hand.
 - A lint/grep CI check banning `binary_to_term`, `to_atom`/`binary_to_atom`, and
   non-literal-module `apply`/`mod.f` in `lib/` (allowlist exceptions explicitly).
 - Possibly a typed "inert term" boundary so codecs are *typed* to return only
