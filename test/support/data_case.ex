@@ -30,6 +30,10 @@ defmodule Cardamom.DataCase do
     Repo.delete_all(Header)
     Repo.delete_all(Kv)
     Repo.delete_all(Cardamom.Store.Block)
+    Repo.delete_all(Cardamom.Store.Txo)
+    Repo.delete_all(Cardamom.Store.MempoolTxo)
+    Repo.delete_all(Cardamom.Store.MempoolGraveyard)
+    Repo.delete_all(Cardamom.Store.Peer)
     Cache.delete_all()
     # Clear the block-fetch peer rotation so a prior test's (now-dead) peer pids
     # don't linger in ChainStore's round-robin.

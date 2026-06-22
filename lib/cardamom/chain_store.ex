@@ -325,6 +325,159 @@ defmodule Cardamom.ChainStore do
   end
 
   # ---- read-through: cache, on miss run fetch_fn, refill, return ----
+  # ---- TXOs: transaction outputs (the entity that gets spent) ----
+
+  alias Cardamom.Store.Txo
+  alias Cardamom.Ledger.Conway.Tx
+
+  @doc """
+  Process a block's raw bytes into the TXO store: for each tx, INSERT its outputs as
+  TXOs (spent_by null = unspent), and SET spent_by on the TXOs its inputs consume.
+
+  Verdict-free and order-tolerant (like the forest): an input whose source output isn't
+  in our index yet (its block not processed) simply finds no row to mark — no error. So
+  spent_by reflects only what we've seen; for an observer answering "current state",
+  that's correct and converges as more blocks are processed.
+  """
+  def process_block(raw) when is_binary(raw) do
+    with {:ok, txs} <- Tx.txs_in(raw) do
+      for tx <- txs do
+        # New TXOs: this tx's outputs, unspent.
+        tx.outputs
+        |> Enum.with_index()
+        |> Enum.each(fn {out, ix} -> insert_txo(tx.txid, ix, out) end)
+
+        # Spend: mark each input's referenced TXO as spent by this tx.
+        Enum.each(tx.inputs, fn {src_txid, src_ix} -> mark_spent(src_txid, src_ix, tx.txid) end)
+      end
+
+      :ok
+    end
+  end
+
+  @doc "Resolve a TXO by its (txid, ix) reference: cache → SQLite read-through, or nil."
+  def txo(txid, ix) when is_binary(txid) and is_integer(ix) do
+    read_through({:txo, txid, ix}, fn -> Repo.get_by(Txo, txid: txid, ix: ix) end)
+  end
+
+  @doc "The current UTXO set — all unspent TXOs (spent_by IS NULL)."
+  def unspent_txos do
+    import Ecto.Query
+    Repo.all(from t in Txo, where: is_nil(t.spent_by))
+  end
+
+  defp insert_txo(txid, ix, out) do
+    {:ok, row} =
+      %Txo{}
+      |> Txo.changeset(%{
+        txid: txid,
+        ix: ix,
+        address: out.address,
+        value: out.value,
+        datum_hash: out.datum_hash,
+        datum: encode_datum(out.datum),
+        raw: out.raw,
+        created_txid: txid,
+        spent_by: nil
+      })
+      |> Repo.insert(on_conflict: :replace_all, conflict_target: [:txid, :ix])
+
+    Cache.put({:txo, txid, ix}, row)
+    {:ok, row}
+  end
+
+  # Set spent_by on the referenced TXO if we have it. If not (source block unseen),
+  # it's a no-op — verdict-free. Invalidate the cache entry so the spent state is read.
+  defp mark_spent(src_txid, src_ix, spender_txid) do
+    import Ecto.Query
+
+    Repo.update_all(
+      from(t in Txo, where: t.txid == ^src_txid and t.ix == ^src_ix),
+      set: [spent_by: spender_txid]
+    )
+
+    Cache.delete({:txo, src_txid, src_ix})
+    :ok
+  end
+
+  # Datums are arbitrary CBOR terms; persist as bytes (re-encode the decoded term). nil
+  # stays nil (no inline datum / hash-only output).
+  defp encode_datum(nil), do: nil
+  defp encode_datum(term), do: CBOR.encode(term)
+
+  # ---- Mempool TXOs: PENDING outputs (separate table, identical schema) ----
+
+  alias Cardamom.Store.{MempoolTxo, MempoolGraveyard}
+
+  @doc """
+  Add a PENDING tx's outputs to the mempool TXO table (speculative — NOT on chain). The
+  table is the verdict: this never touches the confirmed `txos` table. Add/replace; the
+  live mempool supports delete (unlike confirmed TXOs, which are block-only + UPSERT).
+  """
+  def put_mempool_tx(%{txid: txid, outputs: outputs}) do
+    outputs
+    |> Enum.with_index()
+    |> Enum.each(fn {out, ix} ->
+      %MempoolTxo{}
+      |> MempoolTxo.changeset(%{
+        txid: txid,
+        ix: ix,
+        address: out.address,
+        value: out.value,
+        datum_hash: out.datum_hash,
+        datum: encode_datum(out.datum),
+        raw: out.raw,
+        created_txid: txid,
+        spent_by: nil
+      })
+      |> Repo.insert(on_conflict: :replace_all, conflict_target: [:txid, :ix])
+    end)
+
+    :ok
+  end
+
+  @doc "Resolve a PENDING TXO by (txid, ix) from the mempool table, or nil."
+  def mempool_txo(txid, ix) when is_binary(txid) and is_integer(ix) do
+    Repo.get_by(MempoolTxo, txid: txid, ix: ix)
+  end
+
+  @doc """
+  Remove a pending tx's outputs from the live mempool (it confirmed / was replaced /
+  expired), copying each to the graveyard with the reason. `reason` is an atom.
+  """
+  def drop_mempool_tx(txid, reason) when is_binary(txid) and is_atom(reason) do
+    import Ecto.Query
+    now = System.system_time(:second)
+    rows = Repo.all(from m in MempoolTxo, where: m.txid == ^txid)
+
+    for m <- rows do
+      %MempoolGraveyard{}
+      |> MempoolGraveyard.changeset(%{
+        txid: m.txid,
+        ix: m.ix,
+        address: m.address,
+        value: m.value,
+        datum_hash: m.datum_hash,
+        datum: m.datum,
+        raw: m.raw,
+        created_txid: m.created_txid,
+        spent_by: m.spent_by,
+        reason: Atom.to_string(reason),
+        buried_at: now
+      })
+      |> Repo.insert()
+    end
+
+    Repo.delete_all(from m in MempoolTxo, where: m.txid == ^txid)
+    :ok
+  end
+
+  @doc "Forensic graveyard rows for a (former) mempool txid."
+  def mempool_graveyard(txid) when is_binary(txid) do
+    import Ecto.Query
+    Repo.all(from g in MempoolGraveyard, where: g.txid == ^txid)
+  end
+
   # nil results are NOT cached (a genuine absence shouldn't pin a negative entry —
   # the next write should be visible immediately).
   defp read_through(key, fetch_fn) do
