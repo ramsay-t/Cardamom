@@ -1,0 +1,7 @@
+{
+  "_comment": "Cardamom config for LOCAL testing — point at a SimPeer or your own node on localhost. Run with Cardamom.Node.start(config_file: \"config/testing.json\", first_peer: %{host: \"localhost\", port: <PORT>}). Set the port to wherever your local peer is listening (it changes per run for an OS-assigned SimPeer port, so usually override first_peer.port in opts). Same code path as preview.json — only the params differ.",
+
+  "network": 2,
+  "first_peer": { "host": "localhost", "port": 3001 },
+  "db": "cardamom-testing.db"
+}

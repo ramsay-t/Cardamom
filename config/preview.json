@@ -1,0 +1,7 @@
+{
+  "_comment": "Cardamom config for the Cardano PREVIEW testnet. Run with Cardamom.Node.start(config_file: \"config/preview.json\"). These values are also the built-in defaults, so Node.start([]) dials the same. Mainnet magic (764824073) is refused structurally.",
+
+  "network": 2,
+  "first_peer": { "host": "preview-node.play.dev.cardano.org", "port": 3001 },
+  "db": "cardamom-preview.db"
+}

@@ -1,0 +1,40 @@
+# The directory Mix will write compiled artifacts to.
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads your dependencies sources to.
+/deps/
+
+# Where third-party dependencies like ExDoc output generated docs.
+/doc/
+
+# Temporary files, for example, from tests.
+/tmp/
+
+# If the VM crashes, it generates a dump, let's ignore it too.
+erl_crash.dump
+
+# Also ignore archive artifacts (built via "mix archive.build").
+*.ez
+
+# Ignore package tarball (built via "mix hex.build").
+cardamom-*.tar
+
+# PRIVATE working notes — candid internal commentary (opinions on the Haskell
+# node, operational/personal context, decision reasoning). NEVER commit. The
+# public-facing guidance lives in docs/CLAUDE.md.
+docs/CLAUDE_NOTES.private.md
+docs/*.private.md
+
+
+# Runtime logs
+/log/
+
+# Durable forensic store DB files (per-network forest-<magic>.db + WAL/SHM sidecars).
+# These are runtime chain data, NEVER source — must not be committed.
+/data/
+*.db
+*.db-wal
+*.db-shm
