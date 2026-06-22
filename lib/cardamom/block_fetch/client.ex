@@ -72,25 +72,25 @@ defmodule Cardamom.BlockFetch.Client do
        reasm: Reassembler.new(),
        # Idle timeout is configurable (default @idle_timeout_ms) — tests drive the
        # stall path without a 90s wait; production uses the default.
-       idle_timeout_ms: Keyword.get(opts, :idle_timeout_ms, @idle_timeout_ms)
+       idle_timeout_ms: Keyword.get(opts, :idle_timeout_ms, @idle_timeout_ms),
+       # FIFO of fetch_range requests waiting behind the in-flight one. One channel can
+       # only carry one StStreaming batch at a time, so concurrent callers that land on
+       # this client (after round-robin comes back round) QUEUE rather than getting
+       # :busy. Each entry: {from, to, sink, from_caller}.
+       queue: :queue.new()
      }}
   end
 
   @impl true
   def handle_call({:fetch_range, from, to, sink}, from_caller, %{req: nil} = state) do
-    Cardamom.Connection.send_frame(state.conn, @block_fetch, Codec.encode({:request_range, from, to}))
-
-    # req tracks the in-flight request: who's waiting, the per-block sink, how many
-    # block handlers are still running, and whether the batch has terminated.
-    # terminating: nil while the batch is still streaming; set to :ok (BatchDone /
-    # NoBlocks) or {:error, _} (idle stall) once the relay is done. The reply fires —
-    # with that outcome — only when terminating != nil AND in_flight == 0.
-    req = %{reply_to: from_caller, sink: sink, in_flight: 0, terminating: nil}
-    {:noreply, %{state | req: req} |> arm_idle()}
+    {:noreply, start_request(from, to, sink, from_caller, state)}
   end
 
-  def handle_call({:fetch_range, _, _, _}, _from, state) do
-    {:reply, {:error, :busy}, state}
+  # A request arrives while one is in flight: QUEUE it (FIFO), don't reject. It starts
+  # when the current request completes (see maybe_complete → dequeue). No :busy.
+  def handle_call({:fetch_range, from, to, sink}, from_caller, state) do
+    queue = :queue.in({from, to, sink, from_caller}, state.queue)
+    {:noreply, %{state | queue: queue}}
   end
 
   @impl true
@@ -223,16 +223,39 @@ defmodule Cardamom.BlockFetch.Client do
     end)
   end
 
+  # Begin a request: send the RequestRange, set req, arm the idle timer. req tracks the
+  # in-flight request: who's waiting, the per-block sink, how many handlers are still
+  # running, and whether the batch has terminated (nil while streaming; :ok on
+  # BatchDone/NoBlocks; {:error,_} on idle stall). The reply fires only when
+  # terminating != nil AND in_flight == 0.
+  defp start_request(from, to, sink, from_caller, state) do
+    Cardamom.Connection.send_frame(state.conn, @block_fetch, Codec.encode({:request_range, from, to}))
+    req = %{reply_to: from_caller, sink: sink, in_flight: 0, terminating: nil}
+    arm_idle(%{state | req: req})
+  end
+
   # Reply ONCE the request is terminating (batch done OR idle-stalled) AND every block
   # handler has finished — whether the outcome is :ok or :error, we always wait for the
   # blocks that DID arrive to finish storing, so the caller never reads the store early.
+  # Then start the next QUEUED request, if any (a caller that collided on this client).
   defp maybe_complete(%{req: %{terminating: outcome, in_flight: 0, reply_to: rt}} = state)
        when outcome != nil do
     GenServer.reply(rt, outcome)
-    %{state | req: nil}
+    dequeue(%{state | req: nil})
   end
 
   defp maybe_complete(state), do: state
+
+  # Start the next queued request (FIFO), or go idle (req stays nil) if the queue empty.
+  defp dequeue(%{queue: queue} = state) do
+    case :queue.out(queue) do
+      {{:value, {from, to, sink, from_caller}}, rest} ->
+        start_request(from, to, sink, from_caller, %{state | queue: rest})
+
+      {:empty, _} ->
+        state
+    end
+  end
 
   # (Re)arm the idle timer; a fresh token invalidates any prior pending timeout.
   defp arm_idle(%{req: nil} = state), do: state

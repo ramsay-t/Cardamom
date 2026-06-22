@@ -35,10 +35,24 @@ defmodule Cardamom.Channel.Test do
   def recv(%__MODULE__{pid: pid, side: side}, timeout) do
     GenServer.call(pid, {:recv, side}, timeout)
   catch
-    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, {:timeout, _} ->
+      # The caller gave up, but the server may still have us PARKED in waiting[side].
+      # Cancel it, else the next delivered bytes get replied to this abandoned caller
+      # and are LOST (a real test-double bug that swallowed queued requests). Best-
+      # effort: if the channel is gone, that's just a closed channel.
+      catch_exit(fn -> GenServer.call(pid, {:cancel_recv, side}) end)
+      {:error, :timeout}
+
     # The far end / channel process is gone — a closed channel, like a real
     # socket returning {:error, :closed}. Surface it, don't propagate the exit.
-    :exit, _ -> {:error, :closed}
+    :exit, _ ->
+      {:error, :closed}
+  end
+
+  defp catch_exit(fun) do
+    fun.()
+  catch
+    :exit, _ -> :ok
   end
 
   @impl Cardamom.Channel
@@ -82,6 +96,13 @@ defmodule Cardamom.Channel.Test do
         # deliver buffered bytes first (even if closed — drain before reporting closed)
         {:reply, {:ok, bytes}, put_in(state.buf[side], <<>>)}
     end
+  end
+
+  # A timed-out reader cancels its park so a later delivery isn't replied into the void
+  # (and lost). Only clears if a reader is still parked; if bytes were already delivered
+  # to it (a deliver/timeout race), waiting is already nil and this is a no-op.
+  def handle_call({:cancel_recv, side}, _from, state) do
+    {:reply, :ok, put_in(state.waiting[side], nil)}
   end
 
   # Graceful close: set the flag; wake any parked readers that have no buffered

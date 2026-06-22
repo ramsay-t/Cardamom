@@ -281,14 +281,50 @@ defmodule Cardamom.BlockFetch.ClientTest do
     assert raw == blk.raw
   end
 
-  test "a busy client (request mid-batch) returns {:error, :busy}" do
+  test "a second fetch_range while one is in flight is QUEUED, not rejected, and runs after" do
+    # Round-robin spreads ranges across clients; a collision (coming back round to a
+    # busy client) must QUEUE behind the in-flight range, not fail with :busy. One
+    # channel = one StStreaming at a time, so serial-by-queue is protocol-correct.
     {bf, peer_end} = scripted()
     me = self()
+    b1 = BlockBuilder.build(block_number: 1, slot: 10, tx_count: 0)
+    b2 = BlockBuilder.build(block_number: 2, slot: 20, tx_count: 0)
 
-    spawn(fn -> BlockFetch.Client.fetch_range(bf, [1, <<1>>], [2, <<2>>], collecting_sink(me)) end)
-    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+    # Caller 1 starts a range (and holds it open — we haven't sent BatchDone yet).
+    # NB: thread Frame.recv_msg's leftover buffer (4th elem) into the next call — the
+    # channel may coalesce writes into one read, and a fresh <<>> would drop the rest.
+    t1 = Task.async(fn -> BlockFetch.Client.fetch_range(bf, [10, b1.header_hash], [10, b1.header_hash], collecting_sink(me)) end)
+    {:ok, req1, _, buf} = Frame.recv_msg(peer_end, <<>>, 1_000)
+    assert {:ok, {:request_range, _, _}, ""} = BF.decode(req1)
 
-    assert {:error, :busy} = BlockFetch.Client.fetch_range(bf, [3, <<3>>], [4, <<4>>], collecting_sink(me), 1_000)
+    # Caller 2 fires WHILE caller 1 is in flight. It must NOT get :busy — it queues.
+    t2 = Task.async(fn -> BlockFetch.Client.fetch_range(bf, [20, b2.header_hash], [20, b2.header_hash], collecting_sink(me)) end)
+
+    # The client must NOT have sent caller 2's RequestRange yet (it's queued behind #1).
+    assert {:error, :timeout} = Frame.recv_msg(peer_end, buf, 200),
+           "the queued request must not hit the wire until the first completes"
+
+    # Complete caller 1's batch → it replies, then the queued caller 2 starts. The
+    # dequeue→send of req2 happens in the client when caller 1's handler finishes, which
+    # is concurrent with t1's reply; wait for t1, then read req2 with a generous timeout
+    # (threading the leftover buffer, since the channel may coalesce reads).
+    send_bf(peer_end, :start_batch)
+    send_bf(peer_end, {:block, b1.envelope})
+    send_bf(peer_end, :batch_done)
+    assert :ok = Task.await(t1, 2_000)
+
+    # NOW caller 2's RequestRange goes out (possibly a moment after t1's reply).
+    assert {:ok, req2, _, _} = Frame.recv_msg(peer_end, buf, 2_000)
+    assert {:ok, {:request_range, _, _}, ""} = BF.decode(req2)
+    send_bf(peer_end, :start_batch)
+    send_bf(peer_end, {:block, b2.envelope})
+    send_bf(peer_end, :batch_done)
+    assert :ok = Task.await(t2, 2_000)
+
+    # Both blocks were sunk (both ranges served, in order).
+    assert [r1, r2] = collect_sunk()
+    assert r1 == b1.raw
+    assert r2 == b2.raw
   end
 
   test "StartBatch + Block + BatchDone packed in ONE SDU drains + streams correctly" do

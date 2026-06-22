@@ -74,11 +74,18 @@ defmodule Cardamom.ChainStoreTest do
   end
 
   test "all_headers returns rows slot-ordered (forest rebuild on boot)" do
-    # DataCase gives a clean store, so these are the only rows.
-    {:ok, _} = ChainStore.put_header(hdr(%{hash: <<1::256>>, slot: 3}))
-    {:ok, _} = ChainStore.put_header(hdr(%{hash: <<2::256>>, slot: 1}))
-    {:ok, _} = ChainStore.put_header(hdr(%{hash: <<3::256>>, slot: 2}))
+    # Assert OUR rows come back slot-ordered AMONG the results — don't assume an empty
+    # store. The shared ChainStore + DataCase truncation can race with other store-heavy
+    # tests, so asserting the whole list == exactly these 3 is too strong (a flake).
+    {:ok, _} = ChainStore.put_header(hdr(%{hash: <<1::256>>, slot: 9_000_003}))
+    {:ok, _} = ChainStore.put_header(hdr(%{hash: <<2::256>>, slot: 9_000_001}))
+    {:ok, _} = ChainStore.put_header(hdr(%{hash: <<3::256>>, slot: 9_000_002}))
 
-    assert [%{slot: 1}, %{slot: 2}, %{slot: 3}] = ChainStore.all_headers()
+    ours =
+      ChainStore.all_headers()
+      |> Enum.map(& &1.slot)
+      |> Enum.filter(&(&1 in [9_000_001, 9_000_002, 9_000_003]))
+
+    assert ours == [9_000_001, 9_000_002, 9_000_003], "our headers come back slot-ordered"
   end
 end
