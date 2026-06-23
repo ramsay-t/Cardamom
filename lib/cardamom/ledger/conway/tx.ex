@@ -33,12 +33,24 @@ defmodule Cardamom.Ledger.Conway.Tx do
         }
   @type tx :: %{txid: binary(), inputs: [input()], outputs: [output()]}
 
-  @doc "Decode all transactions in a block's raw bytes."
+  @doc """
+  Decode all transactions in a block's raw bytes. Each tx is tagged `valid: true|false`
+  from the block body's `invalid_transactions` list (5th segment = indices of txs that
+  FAILED PHASE-2 script validation). An invalid tx must NOT have its normal inputs/outputs
+  applied — its COLLATERAL is consumed instead; callers branch on `valid`.
+  """
   @spec txs_in(binary()) :: {:ok, [tx()]} | {:error, term()}
   def txs_in(raw) when is_binary(raw) do
-    with {:ok, bodies_bytes} <- tx_bodies_bytes(raw),
+    with {:ok, bodies_bytes, invalid_bytes} <- bodies_and_invalid(raw),
          {:ok, body_spans} <- split_array(bodies_bytes) do
-      {:ok, Enum.map(body_spans, &decode_body/1)}
+      invalid_set = invalid_indices(invalid_bytes)
+
+      txs =
+        body_spans
+        |> Enum.with_index()
+        |> Enum.map(fn {span, ix} -> decode_body(span, not MapSet.member?(invalid_set, ix)) end)
+
+      {:ok, txs}
     end
   rescue
     e -> {:error, {:exception, e}}
@@ -46,16 +58,53 @@ defmodule Cardamom.Ledger.Conway.Tx do
 
   def txs_in(_), do: {:error, :not_binary}
 
+  # The invalid_transactions segment is a CBOR array of uint indices into tx_bodies.
+  defp invalid_indices(invalid_bytes) do
+    case CBOR.decode(invalid_bytes) do
+      {:ok, ixs, _} when is_list(ixs) -> MapSet.new(ixs)
+      _ -> MapSet.new()
+    end
+  end
+
+  @doc """
+  Decode a STANDALONE tx body's bytes (as delivered by TxSubmission MsgReplyTxs — a tx
+  not wrapped in a block) into the same tx map as txs_in/1. The txid is the byte-exact
+  blake2b-256 of these bytes.
+  """
+  @spec decode_tx(binary()) :: {:ok, tx()} | {:error, term()}
+  def decode_tx(body_bytes) when is_binary(body_bytes) do
+    # A standalone tx (e.g. from the mempool) carries no block-level validity verdict —
+    # treat as valid; the chain decides validity only when it lands in a block.
+    {:ok, decode_body(body_bytes, true)}
+  rescue
+    e -> {:error, {:exception, e}}
+  end
+
+  def decode_tx(_), do: {:error, :not_binary}
+
   # ---- one tx body (byte span) → tx map ----
 
-  defp decode_body(body_bytes) do
+  # tx_body keys: 0 inputs, 1 outputs, 13 collateral inputs, 16 collateral return output.
+  defp decode_body(body_bytes, valid?) do
     {:ok, body, _} = CBOR.decode(body_bytes)
+
     %{
       txid: Crypto.blake2b_256(body_bytes),
+      valid: valid?,
       inputs: decode_inputs(Map.get(body, 0)),
-      outputs: decode_outputs(Map.get(body, 1))
+      outputs: decode_outputs(Map.get(body, 1)),
+      # reference_inputs (key 18): Ξ — read-only, NOT consumed (Agda: refInputs ⊆ dom utxo
+      # but absent from the state update). Must be unspent; a spend of one elsewhere
+      # invalidates this reader.
+      reference_inputs: decode_inputs(Map.get(body, 18)),
+      # Phase-2 (invalid-tx) consumption: collateral inputs spent, collateral-return made.
+      collateral_inputs: decode_inputs(Map.get(body, 13)),
+      collateral_return: decode_collateral_return(Map.get(body, 16))
     }
   end
+
+  defp decode_collateral_return(nil), do: nil
+  defp decode_collateral_return(out), do: decode_output(out)
 
   # inputs (key 0): a set/array of [tx_hash(bytes), index].
   defp decode_inputs(nil), do: []
@@ -115,12 +164,17 @@ defmodule Cardamom.Ledger.Conway.Tx do
 
   # ---- get the tx_bodies array bytes out of the block (byte-exact) ----
 
-  defp tx_bodies_bytes(raw) do
+  # Block body = [header, tx_bodies, witnesses, aux, invalid_transactions]. Return the
+  # byte-exact tx_bodies segment AND the invalid_transactions segment (5th).
+  defp bodies_and_invalid(raw) do
     with {:ok, inner} <- unwrap_era(raw),
          <<0x85, rest0::binary>> <- inner,
          {_hdr, rest1} <- take(rest0),
-         {bodies, _rest2} <- take(rest1) do
-      {:ok, bodies}
+         {bodies, rest2} <- take(rest1),
+         {_wits, rest3} <- take(rest2),
+         {_aux, rest4} <- take(rest3),
+         {invalid, _rest5} <- take(rest4) do
+      {:ok, bodies, invalid}
     else
       _ -> {:error, :bad_block_structure}
     end

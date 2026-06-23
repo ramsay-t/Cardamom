@@ -22,9 +22,11 @@ defmodule Cardamom.Store.Txo do
     field :raw, :binary
     field :created_txid, :binary
     field :spent_by, :binary
+    # How it was consumed: "tx_input" (normal) | "collateral" (phase-2 penalty). null = unspent.
+    field :spent_how, :string
   end
 
-  @fields [:txid, :ix, :address, :value, :datum_hash, :datum, :raw, :created_txid, :spent_by]
+  @fields [:txid, :ix, :address, :value, :datum_hash, :datum, :raw, :created_txid, :spent_by, :spent_how]
   @required [:txid, :ix]
 
   def changeset(txo, attrs) do

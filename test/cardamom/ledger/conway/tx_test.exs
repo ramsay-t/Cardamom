@@ -138,9 +138,93 @@ defmodule Cardamom.Ledger.Conway.TxTest do
     end
   end
 
+  # invalid_transactions (5th block segment) + collateral (tx body key 13) + collateral
+  # return (key 16) — the phase-2-fail path. Per the Agda spec (Utxo.lagda.md): a tx
+  # listed as invalid consumes its COLLATERAL, not its txIns/txOuts.
+  describe "valid/invalid tagging + collateral (phase-2 fail)" do
+    # Build a block from several tx-body terms and a list of invalid indices.
+    defp block_with(tx_body_terms, invalid_ixs) do
+      bodies = CBOR.encode(tx_body_terms)
+      hdr = CBOR.encode(%{})
+      empty = CBOR.encode([])
+      invalid = CBOR.encode(invalid_ixs)
+      inner = <<0x85>> <> hdr <> bodies <> empty <> empty <> invalid
+      <<0x82>> <> CBOR.encode(4) <> inner
+    end
+
+    defp bytes2(b), do: %CBOR.Tag{tag: :bytes, value: b}
+
+    test "txs are tagged valid/invalid from the invalid_transactions list" do
+      tx0 = %{0 => [[bytes2(<<1::256>>), 0]], 1 => [[bytes2(<<0xAA>>), 100]]}
+      tx1 = %{0 => [[bytes2(<<2::256>>), 0]], 1 => [[bytes2(<<0xBB>>), 200]]}
+      # tx at index 1 is invalid (phase-2 failed).
+      {:ok, [t0, t1]} = Tx.txs_in(block_with([tx0, tx1], [1]))
+      assert t0.valid == true
+      assert t1.valid == false
+    end
+
+    test "an invalid tx exposes its collateral inputs (key 13) and collateral return (key 16)" do
+      tx = %{
+        0 => [[bytes2(<<1::256>>), 0]],
+        1 => [[bytes2(<<0xAA>>), 100]],
+        13 => [[bytes2(<<9::256>>), 0]],
+        16 => [bytes2(<<0xCC>>), 50]
+      }
+
+      {:ok, [t]} = Tx.txs_in(block_with([tx], [0]))
+      assert t.valid == false
+      assert [{<<9::256>>, 0}] = t.collateral_inputs
+      assert %{value: 50} = t.collateral_return
+    end
+  end
+
+  describe "reference inputs (Ξ) + the txIns ∩ refInputs disjointness invariant" do
+    defp bytes3(b), do: %CBOR.Tag{tag: :bytes, value: b}
+
+    test "reference_inputs (key 18) are decoded as Ξ (read-only), separate from inputs" do
+      tx = %{
+        0 => [[bytes3(<<1::256>>), 0]],
+        1 => [[bytes3(<<0xAA>>), 1]],
+        18 => [[bytes3(<<7::256>>), 0], [bytes3(<<8::256>>), 1]]
+      }
+
+      {:ok, [t]} = Tx.txs_in(block_with([tx], []))
+      assert t.inputs == [{<<1::256>>, 0}]
+      assert t.reference_inputs == [{<<7::256>>, 0}, {<<8::256>>, 1}]
+    end
+
+    test "a tx with no reference_inputs has an empty Ξ" do
+      {:ok, [t]} = Tx.txs_in(block_with([%{0 => [[bytes3(<<1::256>>), 0]], 1 => []}], []))
+      assert t.reference_inputs == []
+    end
+  end
+
+  describe "block envelope + array-size shapes" do
+    test "a BARE array(5) block (no era wrapper, 0x85) decodes" do
+      # Some shapes arrive un-era-wrapped: just the [hdr, bodies, wits, aux, invalid].
+      tx = %{0 => [[bytes3(<<1::256>>), 0]], 1 => [[bytes3(<<0xAA>>), 5]]}
+      bare = <<0x85>> <> CBOR.encode(%{}) <> CBOR.encode([tx]) <> CBOR.encode([]) <> CBOR.encode([]) <> CBOR.encode([])
+      assert {:ok, [t]} = Tx.txs_in(bare)
+      assert t.outputs != []
+    end
+
+    test "a block with >23 txs uses the 0x98 array-count header and still splits per-tx" do
+      # 24 txs forces CBOR's 1-byte-count array header (0x98 0x18) — the split_array path
+      # that small blocks never exercise.
+      txs = for i <- 0..23, do: %{0 => [[bytes3(<<i::256>>), 0]], 1 => [[bytes3(<<i>>), 1]]}
+      {:ok, decoded} = Tx.txs_in(block_with(txs, []))
+      assert length(decoded) == 24, "all 24 txs split out individually"
+      assert Enum.all?(decoded, &(&1.txid != nil))
+    end
+  end
+
   describe "strictness / malformed input" do
     test "non-binary input is a clean error" do
       assert {:error, :not_binary} = Tx.txs_in(:not_bytes)
+    end
+
+    test "decode_tx/1 rejects a non-binary cleanly" do
+      assert {:error, :not_binary} = Tx.decode_tx(:nope)
     end
 
     test "bytes that aren't a block envelope are a clean error, not a raise" do
