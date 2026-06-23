@@ -27,6 +27,15 @@ defmodule Cardamom.Store.TxoTest do
     tx.txid
   end
 
+  # Build a synthetic block from tx-body terms + invalid-tx indices (era-wrapped, the
+  # [era, [hdr, bodies, wits, aux, invalid]] shape txs_in walks).
+  defp block_with(tx_body_terms, invalid_ixs) do
+    bodies = CBOR.encode(tx_body_terms)
+    empty = CBOR.encode([])
+    inner = <<0x85>> <> CBOR.encode(%{}) <> bodies <> empty <> empty <> CBOR.encode(invalid_ixs)
+    <<0x82>> <> CBOR.encode(4) <> inner
+  end
+
   test "processing a block stores its outputs as unspent TXOs, resolvable by (txid, ix)" do
     :ok = ChainStore.process_block(fixture(3))
 
@@ -51,6 +60,61 @@ defmodule Cardamom.Store.TxoTest do
     # Block 16's own 4 outputs landed UNSPENT (new UTXOs).
     for ix <- 0..3, do: assert %{spent_by: nil} = ChainStore.txo(t16, ix)
     assert ChainStore.txo(t16, 4) == nil, "block 16 created exactly 4 outputs"
+  end
+
+  test "a valid spend records spent_how :tx_input" do
+    :ok = ChainStore.process_block(fixture(3))
+    :ok = ChainStore.process_block(fixture(16))
+    assert %{spent_how: "tx_input"} = ChainStore.txo(txid(3), 0)
+  end
+
+  # The phase-2-fail path (Agda Utxo.lagda.md ~503): an INVALID tx consumes its COLLATERAL,
+  # NOT its normal inputs/outputs. Synthetic block — seed a collateral UTXO + a normal-
+  # input UTXO, then an invalid tx that would spend the normal input and create an output,
+  # but (being invalid) actually only burns its collateral.
+  test "an invalid (phase-2-fail) tx consumes collateral, not its normal inputs/outputs" do
+    bytes = fn b -> %CBOR.Tag{tag: :bytes, value: b} end
+
+    # Pre-existing UTXOs the tx will name: a normal input and a collateral input.
+    normal_in = <<1::256>>
+    collat_in = <<2::256>>
+    {:ok, _} = Cardamom.Store.Repo.insert(%Cardamom.Store.Txo{txid: normal_in, ix: 0, value: 5_000_000})
+    {:ok, _} = Cardamom.Store.Repo.insert(%Cardamom.Store.Txo{txid: collat_in, ix: 0, value: 2_000_000})
+
+    # An INVALID tx: normal input = normal_in#0, an output, collateral = collat_in#0.
+    invalid_tx = %{
+      0 => [[bytes.(normal_in), 0]],
+      1 => [[bytes.(<<0xBB>>), 4_000_000]],
+      13 => [[bytes.(collat_in), 0]]
+    }
+
+    block = block_with([invalid_tx], [0])
+    {:ok, [decoded]} = Tx.txs_in(block)
+    spender = decoded.txid
+    :ok = ChainStore.process_block(block)
+
+    # Collateral WAS consumed, spent_how :collateral.
+    assert %{spent_by: ^spender, spent_how: "collateral"} = ChainStore.txo(collat_in, 0)
+    # The normal input was NOT spent (invalid txs don't spend their normal inputs).
+    assert %{spent_by: nil} = ChainStore.txo(normal_in, 0)
+    # The normal output was NOT created.
+    assert ChainStore.txo(spender, 0) == nil
+  end
+
+  test "an output with an INLINE DATUM is stored with the datum encoded" do
+    bytes = fn b -> %CBOR.Tag{tag: :bytes, value: b} end
+    inline = [1, 2, 3]
+    # Map output {0: addr, 1: value, 2: [1, inline_datum]}.
+    tx = %{0 => [[bytes.(<<1::256>>), 0]], 1 => [%{0 => bytes.(<<9>>), 1 => 42, 2 => [1, inline]}]}
+    block = block_with([tx], [])
+    {:ok, [decoded]} = Tx.txs_in(block)
+    :ok = ChainStore.process_block(block)
+
+    row = ChainStore.txo(decoded.txid, 0)
+    assert row != nil
+    assert row.datum != nil, "an inline datum is persisted (encode_datum path)"
+    # And it round-trips back to the original term.
+    assert {:ok, ^inline, ""} = CBOR.decode(row.datum)
   end
 
   test "the UTXO set (unspent only) excludes spent outputs" do

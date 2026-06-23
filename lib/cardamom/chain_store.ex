@@ -37,6 +37,8 @@ defmodule Cardamom.ChainStore do
   use GenServer
 
   alias Cardamom.Store.{Cache, Header, Kv, Repo}
+  alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput}
+  alias Cardamom.Ledger.Conway.Tx
 
   # ---- fetch-coordination process (peer round-robin) ----
 
@@ -327,9 +329,6 @@ defmodule Cardamom.ChainStore do
   # ---- read-through: cache, on miss run fetch_fn, refill, return ----
   # ---- TXOs: transaction outputs (the entity that gets spent) ----
 
-  alias Cardamom.Store.Txo
-  alias Cardamom.Ledger.Conway.Tx
-
   @doc """
   Process a block's raw bytes into the TXO store: for each tx, INSERT its outputs as
   TXOs (spent_by null = unspent), and SET spent_by on the TXOs its inputs consume.
@@ -341,18 +340,91 @@ defmodule Cardamom.ChainStore do
   """
   def process_block(raw) when is_binary(raw) do
     with {:ok, txs} <- Tx.txs_in(raw) do
-      for tx <- txs do
-        # New TXOs: this tx's outputs, unspent.
-        tx.outputs
-        |> Enum.with_index()
-        |> Enum.each(fn {out, ix} -> insert_txo(tx.txid, ix, out) end)
+      # TWO PHASES, matching the Agda block-level rule newUtxo = (utxo ∣ ins ᶜ) ∪ outs
+      # computed over the WHOLE block: union ALL this block's outputs FIRST, then apply
+      # ALL spends. This is what makes intra-block output→input chains correct — a tx can
+      # spend an earlier tx's output because all of the block's outputs are present before
+      # any spend is resolved. They are "concurrent by virtue of being in this block"
+      # (Ramsay's separation sense), so the two phases may each run in any order/parallel;
+      # only the phase BOUNDARY (outputs-before-spends) is ordered.
+      Enum.each(txs, &create_outputs/1)
+      # Phase 2 spends; collect any whose target wasn't in the store. After phase 1,
+      # intra-block producers all exist, so a leftover :no_target here is a CROSS-block
+      # reference we don't have (unsynced) — verdict-free/unresolved, not an error to
+      # crash on. We log it so it's visible (could later feed an :unresolved record).
+      unresolved = Enum.flat_map(txs, &apply_spends/1)
 
-        # Spend: mark each input's referenced TXO as spent by this tx.
-        Enum.each(tx.inputs, fn {src_txid, src_ix} -> mark_spent(src_txid, src_ix, tx.txid) end)
+      if unresolved != [] do
+        require Logger
+        Logger.debug(fn -> "process_block: #{length(unresolved)} spend(s) had no in-store target (cross-block / unsynced)" end)
       end
 
+      # MEMPOOL CASCADE: a block changes the UTxO set, so pending txs may now be unviable.
+      # Idempotent + monotone (evictions only push toward terminal states), so this is
+      # order-independent — safe under fully-parallel apply (the mailbox can pick any order).
+      Enum.each(txs, &cascade_mempool/1)
       :ok
     end
+  end
+
+  # For one confirmed block tx: (1) if it was itself PENDING, it just confirmed → evict
+  # :in_block; (2) every UTxO it spent invalidates the pending txs that depended on that
+  # UTxO — a spender is out-competed (:inputs_spent), a referencer can no longer read it.
+  defp cascade_mempool(%{txid: txid, valid: valid} = tx) do
+    # The tx confirmed (promoted out of the mempool, if it was there).
+    if mempool_present?(txid), do: drop_mempool_tx(txid, :in_block)
+
+    # Which UTxOs did this tx consume? Valid → its inputs; invalid → its collateral.
+    spent =
+      if valid, do: Map.get(tx, :inputs, []), else: Map.get(tx, :collateral_inputs, [])
+
+    Enum.each(spent, fn {in_txid, in_ix} ->
+      mempool_spenders_of(in_txid, in_ix)
+      |> Enum.map(& &1.spender_txid)
+      |> Enum.uniq()
+      # Don't re-evict the tx that just confirmed itself (handled above).
+      |> Enum.reject(&(&1 == txid))
+      |> Enum.each(fn pending -> drop_mempool_tx(pending, :inputs_spent) end)
+    end)
+  end
+
+  defp mempool_present?(txid) do
+    import Ecto.Query
+    Repo.exists?(from m in MempoolTxo, where: m.txid == ^txid)
+  end
+
+  # PHASE 1 — outputs. Valid tx: its normal outputs become unspent TXOs. Invalid tx
+  # (phase-2 fail, Agda ~503): only its collateral_return is created (NOT normal outputs).
+  defp create_outputs(%{valid: true, txid: txid, outputs: outputs}) do
+    outputs
+    |> Enum.with_index()
+    |> Enum.each(fn {out, ix} -> insert_txo(txid, ix, out) end)
+  end
+
+  defp create_outputs(%{valid: false, txid: txid, collateral_return: ret}) do
+    if ret, do: insert_txo(txid, 0, ret)
+  end
+
+  # PHASE 2 — spends. Valid tx (Agda ~488): its normal inputs are spent, spent_how
+  # :tx_input. Invalid tx (~503): ONLY collateral is consumed, spent_how :collateral;
+  # normal inputs are NOT spent.
+  # Returns the list of inputs whose target TXO wasn't in the store (cross-block /
+  # unsynced — the caller treats these as unresolved, not errors).
+  defp apply_spends(%{valid: true, txid: txid, inputs: inputs}) do
+    spend_each(inputs, txid, :tx_input)
+  end
+
+  defp apply_spends(%{valid: false, txid: txid, collateral_inputs: collat}) do
+    spend_each(collat, txid, :collateral)
+  end
+
+  defp spend_each(inputs, txid, how) do
+    Enum.flat_map(inputs, fn {src_txid, src_ix} ->
+      case mark_spent(src_txid, src_ix, txid, how) do
+        :ok -> []
+        {:error, :no_target} -> [{src_txid, src_ix}]
+      end
+    end)
   end
 
   @doc "Resolve a TXO by its (txid, ix) reference: cache → SQLite read-through, or nil."
@@ -386,18 +458,31 @@ defmodule Cardamom.ChainStore do
     {:ok, row}
   end
 
-  # Set spent_by on the referenced TXO if we have it. If not (source block unseen),
-  # it's a no-op — verdict-free. Invalidate the cache entry so the spent state is read.
-  defp mark_spent(src_txid, src_ix, spender_txid) do
-    import Ecto.Query
+  @doc """
+  Mark a TXO spent (spent_by + spent_how) — FAIL FAST. Returns `:ok` if the target row
+  existed and was updated, `{:error, :no_target}` if it isn't in the store. We do NOT
+  silently no-op or insert a placeholder: a missing target is a real condition the CALLER
+  must judge with its context — an intra-block producer not yet applied (retry; it WILL
+  arrive) vs a reference to a UTxO we simply don't have (a different verdict, :unresolved).
+  The store op stays dumb; recovery policy lives in the handler that knows which case it is.
+  spent_how: :tx_input (normal valid spend) | :collateral (phase-2-fail penalty).
+  """
+  def mark_spent(src_txid, src_ix, spender_txid, spent_how) do
+    # A TXO is a single entity keyed (txid, ix) — look it up, spend it if present. (Not
+    # an update_all-and-count-rows: that treats a known singleton as a bulk op.)
+    case Repo.get_by(Txo, txid: src_txid, ix: src_ix) do
+      nil ->
+        {:error, :no_target}
 
-    Repo.update_all(
-      from(t in Txo, where: t.txid == ^src_txid and t.ix == ^src_ix),
-      set: [spent_by: spender_txid]
-    )
+      txo ->
+        {:ok, _} =
+          txo
+          |> Ecto.Changeset.change(spent_by: spender_txid, spent_how: Atom.to_string(spent_how))
+          |> Repo.update()
 
-    Cache.delete({:txo, src_txid, src_ix})
-    :ok
+        Cache.delete({:txo, src_txid, src_ix})
+        :ok
+    end
   end
 
   # Datums are arbitrary CBOR terms; persist as bytes (re-encode the decoded term). nil
@@ -407,14 +492,12 @@ defmodule Cardamom.ChainStore do
 
   # ---- Mempool TXOs: PENDING outputs (separate table, identical schema) ----
 
-  alias Cardamom.Store.{MempoolTxo, MempoolGraveyard}
-
   @doc """
   Add a PENDING tx's outputs to the mempool TXO table (speculative — NOT on chain). The
   table is the verdict: this never touches the confirmed `txos` table. Add/replace; the
   live mempool supports delete (unlike confirmed TXOs, which are block-only + UPSERT).
   """
-  def put_mempool_tx(%{txid: txid, outputs: outputs}) do
+  def put_mempool_tx(%{txid: txid, outputs: outputs} = tx) do
     outputs
     |> Enum.with_index()
     |> Enum.each(fn {out, ix} ->
@@ -433,12 +516,61 @@ defmodule Cardamom.ChainStore do
       |> Repo.insert(on_conflict: :replace_all, conflict_target: [:txid, :ix])
     end)
 
+    # Record the spend-graph EDGES: which UTxOs this pending tx depends on, and HOW. The
+    # reverse index (input → spenders) drives the block→mempool cascade + separation.
+    record_edges(txid, Map.get(tx, :inputs, []), "spend")
+    record_edges(txid, Map.get(tx, :reference_inputs, []), "reference")
+    record_edges(txid, Map.get(tx, :collateral_inputs, []), "collateral")
     :ok
+  end
+
+  defp record_edges(spender_txid, inputs, kind) do
+    Enum.each(inputs, fn {in_txid, in_ix} ->
+      %MempoolTxInput{}
+      |> MempoolTxInput.changeset(%{
+        input_txid: in_txid,
+        input_ix: in_ix,
+        spender_txid: spender_txid,
+        kind: kind
+      })
+      |> Repo.insert(on_conflict: :nothing, conflict_target: [:input_txid, :input_ix, :spender_txid, :kind])
+    end)
+  end
+
+  @doc "Pending txs that depend on UTxO (txid, ix) — the cascade/separation reverse query."
+  def mempool_spenders_of(input_txid, input_ix) do
+    import Ecto.Query
+
+    Repo.all(
+      from e in MempoolTxInput,
+        where: e.input_txid == ^input_txid and e.input_ix == ^input_ix
+    )
   end
 
   @doc "Resolve a PENDING TXO by (txid, ix) from the mempool table, or nil."
   def mempool_txo(txid, ix) when is_binary(txid) and is_integer(ix) do
     Repo.get_by(MempoolTxo, txid: txid, ix: ix)
+  end
+
+  @doc "Distinct txids currently in the mempool (for the TxSubmission submitter side)."
+  def unspent_mempool_txids do
+    import Ecto.Query
+    Repo.all(from m in MempoolTxo, distinct: true, select: m.txid)
+  end
+
+  @doc """
+  Evict a tx from the mempool — the TWO ways a tx legitimately LEAVES, named explicitly
+  (the protocol never tells us; see reference_txsubmission_lifecycle):
+
+    * `:in_block`    — it was included in a block (learned from block-fetch / process_block;
+                       authoritative).
+    * `:invalidated` — our own policy dropped it (expired, replaced, or became invalid;
+                       heuristic — TxSubmission has no removal message).
+
+  Thin wrapper over `drop_mempool_tx/2` constraining the reason to the lifecycle vocabulary.
+  """
+  def evict_mempool_tx(txid, reason) when is_binary(txid) and reason in [:in_block, :invalidated] do
+    drop_mempool_tx(txid, reason)
   end
 
   @doc """
@@ -469,6 +601,8 @@ defmodule Cardamom.ChainStore do
     end
 
     Repo.delete_all(from m in MempoolTxo, where: m.txid == ^txid)
+    # Remove this tx's spend-graph edges too (it no longer depends on anything).
+    Repo.delete_all(from e in MempoolTxInput, where: e.spender_txid == ^txid)
     :ok
   end
 

@@ -70,6 +70,26 @@ defmodule Cardamom.Store.MempoolTxoTest do
            "and that confirmed UTXO is unspent — the pending spend is valid against the chain"
   end
 
+  test "evict_mempool_tx: the two lifecycle exits (:in_block, :invalidated)" do
+    a = tx(3)
+    b = tx(16)
+    :ok = ChainStore.put_mempool_tx(a)
+    :ok = ChainStore.put_mempool_tx(b)
+
+    :ok = ChainStore.evict_mempool_tx(a.txid, :in_block)
+    :ok = ChainStore.evict_mempool_tx(b.txid, :invalidated)
+
+    assert ChainStore.mempool_txo(a.txid, 0) == nil
+    assert ChainStore.mempool_txo(b.txid, 0) == nil
+
+    assert [%{reason: "in_block"}] = ChainStore.mempool_graveyard(a.txid) |> Enum.filter(&(&1.ix == 0))
+    assert [%{reason: "invalidated"}] = ChainStore.mempool_graveyard(b.txid) |> Enum.filter(&(&1.ix == 0))
+  end
+
+  test "evict_mempool_tx rejects a non-lifecycle reason" do
+    assert_raise FunctionClauseError, fn -> ChainStore.evict_mempool_tx(tx(3).txid, :whatever) end
+  end
+
   test "when a pending tx CONFIRMS in a block, the chain space gains it (mempool can drop it)" do
     t = tx(16)
     :ok = ChainStore.put_mempool_tx(t)
