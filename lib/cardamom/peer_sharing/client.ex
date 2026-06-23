@@ -50,13 +50,36 @@ defmodule Cardamom.PeerSharing.Client do
 
   @impl true
   def handle_info({:sdu, @peer_sharing, payload}, state) do
+    # Log the RAW bytes exactly as they came off the wire, BEFORE any decode — the
+    # capture mechanism that lets us debug a live exchange (matches chain_sync).
+    Logger.debug(fn -> "peer_sharing raw payload: " <> Base.encode16(payload, case: :lower) end)
+
     case Codec.decode(payload) do
-      {:ok, msg, _rest} -> {:noreply, on_msg(msg, state)}
+      {:ok, msg, _rest} ->
+        emit_in(msg, state)
+        {:noreply, on_msg(msg, state)}
+
       {:error, reason} ->
         Logger.warning("peer_sharing decode error: #{inspect(reason)}")
         {:noreply, state}
     end
   end
+
+  # Log + telemetry the parsed inbound message (the decoded event, after the raw bytes).
+  defp emit_in(msg, state) do
+    Logger.info("peer_sharing #{state.peer} <- #{inbound_label(msg)}")
+
+    :telemetry.execute([:cardamom, :protocol, :event], %{count: 1}, %{
+      protocol: "peer_sharing",
+      msg: inbound_label(msg),
+      peer: state.peer
+    })
+  end
+
+  defp inbound_label({:share_peers, peers}), do: "SharePeers(#{length(peers)})"
+  defp inbound_label({:share_request, n}), do: "ShareRequest(#{n})"
+  defp inbound_label(:done), do: "Done"
+  defp inbound_label(other), do: inspect(other)
 
   def handle_info({:EXIT, _from, reason}, state), do: {:stop, reason, state}
 
