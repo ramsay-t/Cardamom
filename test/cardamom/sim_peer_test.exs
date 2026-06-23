@@ -9,9 +9,11 @@ defmodule Cardamom.SimPeerTest do
   alias Cardamom.{Channel, Mux.Frame, SimPeer}
   alias Cardamom.Protocol.Handshake.Codec, as: HS
   alias Cardamom.Protocol.ChainSync.Codec, as: CS
+  alias Cardamom.Protocol.BlockFetch.Codec, as: BF
 
   @handshake 0
   @chain_sync 2
+  @block_fetch 3
   @keep_alive 8
 
   # SimPeer is a single-process, multi-protocol, directable test responder. It
@@ -164,6 +166,41 @@ defmodule Cardamom.SimPeerTest do
 
       :ok = Frame.send_msg(c, @chain_sync, CS.encode({:roll_forward, <<0>>, [1, <<0::256>>]}))
       refute_receive {:DOWN, ^ref, :process, ^peer, _}, 300
+    end
+
+    test "keep-alive: a malformed keep-alive message is a violation (strict)" do
+      %{client: c, peer: peer} = start(protocols: [:keep_alive], enforce_agency: true)
+      ref = Process.monitor(peer)
+
+      # Not the [0, cookie] ping shape the keep-alive responder expects.
+      :ok = Frame.send_msg(c, @keep_alive, CBOR.encode([99, 99, 99]))
+      assert_receive {:DOWN, ^ref, :process, ^peer, {:protocol_violation, _}}, 1000
+    end
+
+    test "block-fetch: client sending a SERVER message (StartBatch) is out of agency" do
+      %{client: c, peer: peer} = start(protocols: [:block_fetch], enforce_agency: true)
+      ref = Process.monitor(peer)
+
+      # StartBatch is the server's message; a client sending it has no agency.
+      :ok = Frame.send_msg(c, @block_fetch, BF.encode(:start_batch))
+      assert_receive {:DOWN, ^ref, :process, ^peer, {:protocol_violation, _}}, 1000
+    end
+
+    test "block-fetch: a wholly undecodable payload is a violation" do
+      %{client: c, peer: peer} = start(protocols: [:block_fetch], enforce_agency: true)
+      ref = Process.monitor(peer)
+
+      :ok = Frame.send_msg(c, @block_fetch, <<0xFF, 0xFF, 0xFF>>)
+      assert_receive {:DOWN, ^ref, :process, ^peer, {:protocol_violation, _}}, 1000
+    end
+
+    test "a message on an UNSUPPORTED protocol (one SimPeer doesn't speak) closes it" do
+      # SimPeer speaks only chain_sync here; a block-fetch SDU is an unsupported protocol.
+      %{client: c, peer: peer} = start(protocols: [:chain_sync], enforce_agency: true)
+      ref = Process.monitor(peer)
+
+      :ok = Frame.send_msg(c, @block_fetch, BF.encode(:start_batch))
+      assert_receive {:DOWN, ^ref, :process, ^peer, {:protocol_violation, {:unsupported_protocol, 3}}}, 1000
     end
   end
 

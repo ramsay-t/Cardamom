@@ -52,6 +52,55 @@ defmodule Cardamom.Peer.SessionTest do
     assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollForward"}}, 1000
   end
 
+  test "enabling peer_sharing + tx_submission actually STARTS those clients (registry wiring)" do
+    capture("session-allproto", "sim-all")
+    {client_end, server_end} = Channel.Test.pair()
+
+    {:ok, _peer} =
+      SimPeer.start_link(
+        channel: server_end,
+        protocols: [:handshake, :chain_sync, :keep_alive, :block_fetch],
+        accept_version: 14,
+        magic: @magic
+      )
+
+    {:ok, session} =
+      Session.start_link(
+        channel: client_end,
+        peer: "sim-all",
+        magic: @magic,
+        protocols: [:chain_sync, :keep_alive, :block_fetch, :peer_sharing, :tx_submission]
+      )
+
+    assert_receive {:telemetry, [:cardamom, :peer, :connected], _, %{peer: "sim-all"}}, 1000
+
+    # The session's client map: enabled protocols have a live pid; we enabled all five.
+    clients = :sys.get_state(session).clients
+    for name <- [:chain_sync, :keep_alive, :block_fetch, :peer_sharing, :tx_submission] do
+      assert is_pid(clients[name]), "#{name} must be started when enabled"
+      assert Process.alive?(clients[name])
+    end
+  end
+
+  test "a disabled protocol is NOT started (its client slot is nil)" do
+    capture("session-min", "sim-min")
+    {client_end, server_end} = Channel.Test.pair()
+
+    {:ok, _peer} =
+      SimPeer.start_link(channel: server_end, protocols: [:handshake, :keep_alive], accept_version: 14, magic: @magic)
+
+    {:ok, session} =
+      Session.start_link(channel: client_end, peer: "sim-min", magic: @magic, protocols: [:keep_alive])
+
+    assert_receive {:telemetry, [:cardamom, :peer, :connected], _, %{peer: "sim-min"}}, 1000
+
+    clients = :sys.get_state(session).clients
+    assert is_pid(clients[:keep_alive])
+    assert clients[:chain_sync] == nil
+    assert clients[:peer_sharing] == nil
+    assert clients[:tx_submission] == nil
+  end
+
   test "if the handshake is refused, the session stops without starting chain-sync" do
     capture("session-refused", "sim-refused")
     {client_end, server_end} = Channel.Test.pair()

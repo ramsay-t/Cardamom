@@ -121,7 +121,10 @@ defmodule Cardamom.ChainSync.ForestBackpressureTest do
     # Release the forest → the rendezvous completes → NOW the client pulls again.
     send(forest, :release)
 
-    assert {:ok, payload, _, _} = Frame.recv_msg(pe, <<>>, 1_000)
+    # Generous timeout: under a fully-loaded suite the post-release RequestNext can take
+    # a moment to reach the channel; the assertion is about ORDER (it comes after release),
+    # not latency.
+    assert {:ok, payload, _, _} = Frame.recv_msg(pe, <<>>, 5_000)
     assert {:ok, :request_next, ""} = CS.decode(payload),
            "after the forest applied the header, the client must request exactly the next one"
   end
