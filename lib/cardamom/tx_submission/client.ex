@@ -40,7 +40,11 @@ defmodule Cardamom.TxSubmission.Client do
       conn: conn,
       peer: Keyword.get(opts, :peer, "loopback"),
       role: Keyword.get(opts, :role, :receiver),
-      amount: Keyword.get(opts, :request_amount, @default_amount)
+      amount: Keyword.get(opts, :request_amount, @default_amount),
+      # Optional PeerStore handle {mod, h}: a peer that gossips a DEFINITELY-invalid tx
+      # loses reputation. Absent → just log (we still don't store the junk).
+      peer_store: Keyword.get(opts, :peer_store),
+      peer_addr: Keyword.get(opts, :peer_addr)
     }
 
     # Receiver drives the loop: announce Init, then ask for ids. Submitter waits to be
@@ -102,21 +106,17 @@ defmodule Cardamom.TxSubmission.Client do
     state
   end
 
-  # Peer sent tx bodies. Decode each and add to the mempool.
+  # Peer sent tx bodies. Decode → PHASE-1 VALIDATE → add valid ones to the mempool. We do
+  # not gossip onward / store junk; a peer that sends a DEFINITELY-invalid tx loses
+  # reputation. An :unverifiable tx (input we haven't synced) is held without penalty.
   defp on_msg({:reply_txs, txs}, %{role: :receiver} = state) do
     Enum.each(txs, fn body ->
       case Tx.decode_tx(body) do
-        {:ok, tx} ->
-          if store_running?(), do: Cardamom.ChainStore.put_mempool_tx(tx)
-
-          :telemetry.execute([:cardamom, :protocol, :event], %{count: 1}, %{
-            protocol: "tx_submission",
-            msg: "MempoolTx",
-            txid: Base.encode16(tx.txid, case: :lower)
-          })
-
+        {:ok, tx} -> ingest_tx(tx, state)
         {:error, reason} ->
           Logger.warning("tx_submission: undecodable tx body: #{inspect(reason)}")
+          # An undecodable body is structurally bad — the peer sent garbage.
+          penalise(state, :sent_undecodable_tx)
       end
     end)
 
@@ -149,6 +149,45 @@ defmodule Cardamom.TxSubmission.Client do
   defp on_msg(_other, state), do: state
 
   # ---- mempool helpers ----
+
+  # Phase-1 validate, then route by verdict: :ok → mempool; {:rejected,_} → drop + ding the
+  # peer (it gossiped junk); {:unverifiable,_} → hold without penalty (our view is partial,
+  # not the peer's fault). No store running (bare tests) → just decode + telemetry.
+  defp ingest_tx(tx, state) do
+    verdict = if store_running?(), do: Cardamom.ChainStore.validate_tx_phase1(tx), else: :ok
+
+    case verdict do
+      :ok ->
+        if store_running?(), do: Cardamom.ChainStore.put_mempool_tx(tx)
+        emit_tx("MempoolTx", tx, state)
+
+      {:rejected, reason} ->
+        Logger.info("tx_submission #{state.peer}: REJECTED tx (#{inspect(reason)}) — not stored")
+        emit_tx("RejectedTx", tx, state)
+        penalise(state, :sent_invalid_tx)
+
+      {:unverifiable, _missing} ->
+        # We can't see this tx's inputs yet (unsynced). Don't store, don't penalise.
+        emit_tx("UnverifiableTx", tx, state)
+    end
+  end
+
+  defp emit_tx(msg, tx, state) do
+    :telemetry.execute([:cardamom, :protocol, :event], %{count: 1}, %{
+      protocol: "tx_submission",
+      msg: msg,
+      peer: state.peer,
+      txid: Base.encode16(tx.txid, case: :lower)
+    })
+  end
+
+  # Dock a peer's reputation for sending something definitively invalid — only when we
+  # have a PeerStore handle AND the peer's address. Never for :unverifiable.
+  defp penalise(%{peer_store: {_m, _h} = store, peer_addr: %{host: host, port: port}}, event) do
+    Cardamom.PeerStore.record(store, %{host: host, port: port, event: event})
+  end
+
+  defp penalise(_state, _event), do: :ok
 
   defp already_have?(txid) do
     store_running?() and Cardamom.ChainStore.mempool_txo(txid, 0) != nil

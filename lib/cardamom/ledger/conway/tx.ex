@@ -99,7 +99,10 @@ defmodule Cardamom.Ledger.Conway.Tx do
       reference_inputs: decode_inputs(Map.get(body, 18)),
       # Phase-2 (invalid-tx) consumption: collateral inputs spent, collateral-return made.
       collateral_inputs: decode_inputs(Map.get(body, 13)),
-      collateral_return: decode_collateral_return(Map.get(body, 16))
+      collateral_return: decode_collateral_return(Map.get(body, 16)),
+      # fee (key 2) and mint (key 9) — kept raw for phase-1 checks (mint must contain no ADA).
+      fee: Map.get(body, 2),
+      mint: Map.get(body, 9)
     }
   end
 

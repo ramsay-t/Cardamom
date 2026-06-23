@@ -27,6 +27,10 @@ defmodule Cardamom.PeerStore.Sql do
     served: 2,
     disconnect: -3,
     timeout: -5,
+    # Gossiping a definitively-invalid / undecodable tx: a real misbehaviour (but less
+    # severe than a raw protocol violation — it could be a buggy, not malicious, peer).
+    sent_invalid_tx: -10,
+    sent_undecodable_tx: -10,
     protocol_violation: -25
   }
 

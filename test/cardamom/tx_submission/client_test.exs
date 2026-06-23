@@ -63,6 +63,12 @@ defmodule Cardamom.TxSubmission.ClientTest do
       {:ok, _, _, b1} = Frame.recv_msg(pe, <<>>, 1_000)
       {:ok, _, _, _} = Frame.recv_msg(pe, b1, 1_000)
 
+      # Seed the tx's input as a confirmed unspent UTxO so phase-1 validation passes
+      # (:ok) — else the gate holds it as :unverifiable and it isn't stored.
+      for {in_txid, in_ix} <- tx.inputs do
+        {:ok, _} = Cardamom.Store.Repo.insert(%Cardamom.Store.Txo{txid: in_txid, ix: in_ix, value: 1})
+      end
+
       # Peer announces the tx (txid + size).
       send_ts(pe, {:reply_tx_ids, [{tx.txid, byte_size(body)}]})
 
@@ -71,11 +77,18 @@ defmodule Cardamom.TxSubmission.ClientTest do
       assert {:request_txs, [reqid]} = req
       assert reqid == tx.txid
 
-      # Peer replies with the body → client decodes + put_mempool_tx.
+      # Peer replies with the body → client validates (:ok) + put_mempool_tx.
       send_ts(pe, {:reply_txs, [body]})
 
       wait_until(fn -> ChainStore.mempool_txo(tx.txid, 0) != nil end)
       assert %{spent_by: nil} = ChainStore.mempool_txo(tx.txid, 0)
+
+      # AND the live ingest populated the spend-graph edge index (so the block cascade can
+      # find this tx by its input). Proven over the proto-4 wire, not a direct put.
+      for {in_txid, in_ix} <- tx.inputs do
+        spenders = ChainStore.mempool_spenders_of(in_txid, in_ix) |> Enum.map(& &1.spender_txid)
+        assert tx.txid in spenders, "a gossiped tx must record its input edges"
+      end
     end
 
     test "the client does NOT re-request a tx already in the mempool" do
@@ -125,6 +138,60 @@ defmodule Cardamom.TxSubmission.ClientTest do
       # documented stub). The point: we ANSWER, we don't hang or crash.
       assert {:ok, {:reply_txs, bodies}, _} = recv_match(peer_end, fn m -> match?({:reply_txs, _}, m) end)
       assert bodies == []
+    end
+  end
+
+  describe "phase-1 validation gate (don't store junk; ding bad peers)" do
+    test "a valid tx (input exists, unspent) is stored; a double-spend is rejected + dings the peer" do
+      bytes = fn x -> %CBOR.Tag{tag: :bytes, value: x} end
+      {:ok, store} = Cardamom.PeerStore.Sql.start_link([])
+      addr = %{host: "5.5.5.5", port: 3001}
+
+      # Seed: one unspent UTxO (valid to spend) and one already-spent (double-spend bait).
+      {:ok, _} = Cardamom.Store.Repo.insert(%Cardamom.Store.Txo{txid: <<1::256>>, ix: 0, value: 9})
+      {:ok, _} = Cardamom.Store.Repo.insert(%Cardamom.Store.Txo{txid: <<2::256>>, ix: 0, value: 9, spent_by: <<9::256>>, spent_how: "tx_input"})
+
+      {client_end, peer_end} = Channel.Test.pair()
+      {:ok, conn} = Connection.start_link(channel: client_end, peer: "tsv")
+      {:ok, _c} = Client.start_link(conn: conn, peer: "tsv", role: :receiver, peer_store: store, peer_addr: addr)
+      {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+
+      good = CBOR.encode(%{0 => [[bytes.(<<1::256>>), 0]], 1 => [[bytes.(<<0xAA>>), 5]]})
+      doublespend = CBOR.encode(%{0 => [[bytes.(<<2::256>>), 0]], 1 => [[bytes.(<<0xBB>>), 5]]})
+      {:ok, g} = Cardamom.Ledger.Conway.Tx.decode_tx(good)
+      {:ok, d} = Cardamom.Ledger.Conway.Tx.decode_tx(doublespend)
+
+      send_ts(peer_end, {:reply_txs, [good, doublespend]})
+      Process.sleep(80)
+
+      # Good one stored; double-spend NOT stored.
+      assert Cardamom.ChainStore.mempool_txo(g.txid, 0) != nil
+      assert Cardamom.ChainStore.mempool_txo(d.txid, 0) == nil
+
+      # The peer's reputation dropped (sent an invalid tx).
+      [peer] = Cardamom.PeerStore.list_known(store) |> Enum.filter(&(&1.host == "5.5.5.5"))
+      assert peer.quality < 0, "a peer that gossips an invalid tx loses reputation"
+    end
+
+    test "an unverifiable tx (unsynced input) is NOT stored and does NOT ding the peer" do
+      bytes = fn x -> %CBOR.Tag{tag: :bytes, value: x} end
+      {:ok, store} = Cardamom.PeerStore.Sql.start_link([])
+      addr = %{host: "6.6.6.6", port: 3001}
+
+      {client_end, peer_end} = Channel.Test.pair()
+      {:ok, conn} = Connection.start_link(channel: client_end, peer: "tsu")
+      {:ok, _c} = Client.start_link(conn: conn, peer: "tsu", role: :receiver, peer_store: store, peer_addr: addr)
+      {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+
+      # Input <<7>>#0 we've never seen → unverifiable.
+      body = CBOR.encode(%{0 => [[bytes.(<<7::256>>), 0]], 1 => [[bytes.(<<0xAA>>), 5]]})
+      {:ok, t} = Cardamom.Ledger.Conway.Tx.decode_tx(body)
+      send_ts(peer_end, {:reply_txs, [body]})
+      Process.sleep(80)
+
+      assert Cardamom.ChainStore.mempool_txo(t.txid, 0) == nil, "unverifiable tx not stored"
+      # No peer recorded / no penalty (we don't blame them for our incomplete view).
+      assert Cardamom.PeerStore.list_known(store) |> Enum.filter(&(&1.host == "6.6.6.6")) == []
     end
   end
 

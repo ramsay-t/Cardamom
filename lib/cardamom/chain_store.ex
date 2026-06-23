@@ -243,6 +243,15 @@ defmodule Cardamom.ChainStore do
         case BlockDecode.verify_body(blk) do
           :ok ->
             result = put_block(blk)
+
+            # Body-hash VERIFIED → now extract the block's transactions into the TXO /
+            # mempool engine: create confirmed TXOs, spend their inputs, and run the
+            # block→mempool cascade. ONLY after verification (never extract TXOs from
+            # unverified bytes — Harvard boundary). Idempotent, so re-fetching a block is
+            # safe. This is what feeds goal (b) — the live UTxO set + mempool — from real
+            # block data.
+            process_block(blk.raw)
+
             # FINISH-time event: decoded + verified + stored, with real detail (the
             # UI/log shows the block landing, not just bytes arriving).
             :telemetry.execute([:cardamom, :protocol, :event], %{count: 1}, %{
@@ -437,6 +446,59 @@ defmodule Cardamom.ChainStore do
     import Ecto.Query
     Repo.all(from t in Txo, where: is_nil(t.spent_by))
   end
+
+  @doc """
+  Phase-1 (structural/ledger) validation — the subset we can do WITHOUT protocol params,
+  signature checks, or slot tracking. Each check is a Conway UTxO-rule precondition (Agda
+  Utxo.lagda.md ~544-546):
+
+    * txIns ≢ ∅                    — must spend something
+    * txIns ∩ refInputs ≡ ∅        — can't spend AND reference the same UTxO
+    * coin mint ≡ 0                — ADA cannot be minted
+    * (no double-spend)            — an input already spent in our CONFIRMED set
+    * txIns ∪ refInputs ⊆ dom utxo — inputs/refs must exist (resolved against our view)
+
+  Returns `:ok` | `{:rejected, reason}` (definitely bad) | `{:unverifiable, missing}` (an
+  input/ref we haven't synced — NOT the peer's fault; the caller must not penalise). The
+  unresolved case is distinguished from rejection because our UTxO view is incomplete by
+  design (observer): missing ≠ invalid.
+  """
+  def validate_tx_phase1(%{inputs: inputs, reference_inputs: refs} = tx) do
+    cond do
+      inputs == [] ->
+        {:rejected, :no_inputs}
+
+      not MapSet.disjoint?(MapSet.new(inputs), MapSet.new(refs)) ->
+        {:rejected, :spend_reference_overlap}
+
+      mints_ada?(Map.get(tx, :mint)) ->
+        {:rejected, :mint_ada}
+
+      true ->
+        resolve_inputs(inputs, refs)
+    end
+  end
+
+  # Resolve every input + reference input against our confirmed set. An input that exists
+  # but is SPENT → double-spend (rejected). One we don't have → unverifiable (collect).
+  defp resolve_inputs(inputs, refs) do
+    spent = for {t, i} <- inputs, (r = txo(t, i)) && r.spent_by != nil, do: {t, i}
+    missing = for {t, i} <- inputs ++ refs, txo(t, i) == nil, do: {t, i}
+
+    cond do
+      spent != [] -> {:rejected, {:double_spend, spent}}
+      missing != [] -> {:unverifiable, missing}
+      true -> :ok
+    end
+  end
+
+  # mint (key 9) is a multiasset map keyed by policy id; ADA (the empty/ada policy) must
+  # not appear. A bare integer or a non-empty ada entry is illegal ADA minting. We reject
+  # any mint that carries a plain coin (the conservative, spec-aligned check: coin mint ≡ 0).
+  defp mints_ada?(nil), do: false
+  defp mints_ada?(0), do: false
+  defp mints_ada?(n) when is_integer(n), do: n != 0
+  defp mints_ada?(_other), do: false
 
   defp insert_txo(txid, ix, out) do
     {:ok, row} =
