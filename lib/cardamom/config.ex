@@ -15,14 +15,23 @@ defmodule Cardamom.Config do
 
   @mainnet_magic 764_824_073
 
-  # Built-in defaults = Preview.
+  # Built-in defaults = Preview. `protocols` lists which mini-protocols to run on boot —
+  # every protocol is independently toggleable. Default = the chain-following set; the
+  # OBSERVATIONAL protocols (peer_sharing, tx_submission) are off unless config enables
+  # them (observe-don't-act: turning them on is a deliberate choice).
   @defaults %{
     network: 2,
     first_peer: %{host: "preview-node.play.dev.cardano.org", port: 3001},
-    db: nil
+    db: nil,
+    protocols: [:chain_sync, :keep_alive, :block_fetch]
   }
 
-  @type t :: %{network: non_neg_integer(), first_peer: %{host: String.t(), port: non_neg_integer()}, db: String.t() | nil}
+  @type t :: %{
+          network: non_neg_integer(),
+          first_peer: %{host: String.t(), port: non_neg_integer()},
+          db: String.t() | nil,
+          protocols: [atom()]
+        }
 
   @doc "Resolve config from defaults ← file (opts[:config_file]) ← opts."
   @spec resolve(keyword()) :: {:ok, t()} | {:error, term()}
@@ -51,7 +60,18 @@ defmodule Cardamom.Config do
     |> put_if(json, "network", :network)
     |> put_if(json, "db", :db)
     |> put_peer(json["first_peer"])
+    |> put_protocols(json["protocols"])
   end
+
+  # protocols in JSON are strings ("chain_sync"); map to the known atoms, silently
+  # dropping unknowns (never String.to_atom on config we then dispatch on — closed set).
+  defp put_protocols(acc, names) when is_list(names) do
+    known = Map.new(Cardamom.Peer.Session.known_protocols(), &{Atom.to_string(&1), &1})
+    protocols = Enum.flat_map(names, fn n -> List.wrap(Map.get(known, n)) end)
+    Map.put(acc, :protocols, protocols)
+  end
+
+  defp put_protocols(acc, _), do: acc
 
   defp put_if(acc, json, str_key, atom_key) do
     case Map.fetch(json, str_key) do
@@ -65,7 +85,7 @@ defmodule Cardamom.Config do
 
   # opts (keyword) → only the config keys we recognise.
   defp opts_map(opts) do
-    Map.new(Keyword.take(opts, [:network, :first_peer, :db]))
+    Map.new(Keyword.take(opts, [:network, :first_peer, :db, :protocols]))
   end
 
   defp deep_merge(base, override), do: Map.merge(base, override)

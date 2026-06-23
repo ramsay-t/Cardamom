@@ -43,12 +43,14 @@ defmodule Cardamom.Node do
             {:ok, channel} ->
               report(:report_connected, host, port)
 
-              # Pass through an optional :protocols list (default: all, decided in
-              # Session). A block-fetch-only diagnostic run sets protocols:
-              # [:block_fetch, :keep_alive] so the captured traffic is unambiguous.
+              # Which mini-protocols run is config-driven (cfg.protocols, every protocol
+              # independently toggleable on boot), but an explicit opts :protocols still
+              # overrides for tests/diagnostics. A peer_store handle (if provided) is
+              # passed through so peer_sharing can record candidates.
               session_opts =
-                [channel: channel, peer: label, magic: cfg.network]
+                [channel: channel, peer: label, magic: cfg.network, protocols: cfg.protocols]
                 |> maybe_put(:protocols, Keyword.get(opts, :protocols))
+                |> maybe_put(:peer_store, Keyword.get(opts, :peer_store))
 
               Session.start_link(session_opts)
 
