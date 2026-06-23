@@ -38,7 +38,28 @@ defmodule Cardamom.ChainStore do
 
   alias Cardamom.Store.{Cache, Header, Kv, Repo}
   alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput}
+  alias Cardamom.Store.Cached
   alias Cardamom.Ledger.Conway.Tx
+  import Ecto.Query
+
+  # Cached store for the mempool spend-graph edge index, the HOTTEST read (the per-block
+  # cascade asks "who spends X?" for every spent input). Caches the list of SPENDER TXIDS
+  # (keys) by input — not whole rows: the list changes only when edges add/remove (clear
+  # invalidation points), and each spender's row is independently cached by its own PK.
+  # Resolving the spenders is then a parallel map of cheap cached lookups.
+  defp edge_index do
+    Cached.new_list(
+      cache_tag: :mempool_edges,
+      load: fn {in_txid, in_ix} ->
+        Repo.all(
+          from e in MempoolTxInput,
+            where: e.input_txid == ^in_txid and e.input_ix == ^in_ix,
+            distinct: true,
+            select: e.spender_txid
+        )
+      end
+    )
+  end
 
   # ---- fetch-coordination process (peer round-robin) ----
 
@@ -387,18 +408,18 @@ defmodule Cardamom.ChainStore do
     spent =
       if valid, do: Map.get(tx, :inputs, []), else: Map.get(tx, :collateral_inputs, [])
 
+    # mempool_spenders_of returns SPENDER TXIDS (keys); evict each. Redundant evictions
+    # are harmless (drop_mempool_tx is idempotent — a tx already gone is a no-op), so we
+    # don't defensively dedup: the BEAM way is to accept redundant work, not guard it.
+    # Skipping the just-confirmed tx is a cheap correctness nicety, not a safety need.
     Enum.each(spent, fn {in_txid, in_ix} ->
       mempool_spenders_of(in_txid, in_ix)
-      |> Enum.map(& &1.spender_txid)
-      |> Enum.uniq()
-      # Don't re-evict the tx that just confirmed itself (handled above).
       |> Enum.reject(&(&1 == txid))
       |> Enum.each(fn pending -> drop_mempool_tx(pending, :inputs_spent) end)
     end)
   end
 
   defp mempool_present?(txid) do
-    import Ecto.Query
     Repo.exists?(from m in MempoolTxo, where: m.txid == ^txid)
   end
 
@@ -596,17 +617,15 @@ defmodule Cardamom.ChainStore do
         kind: kind
       })
       |> Repo.insert(on_conflict: :nothing, conflict_target: [:input_txid, :input_ix, :spender_txid, :kind])
+
+      # This input's spender list changed → drop its cached entry.
+      Cached.invalidate_key(edge_index(), {in_txid, in_ix})
     end)
   end
 
   @doc "Pending txs that depend on UTxO (txid, ix) — the cascade/separation reverse query."
   def mempool_spenders_of(input_txid, input_ix) do
-    import Ecto.Query
-
-    Repo.all(
-      from e in MempoolTxInput,
-        where: e.input_txid == ^input_txid and e.input_ix == ^input_ix
-    )
+    Cached.get_list(edge_index(), {input_txid, input_ix})
   end
 
   @doc "Resolve a PENDING TXO by (txid, ix) from the mempool table, or nil."
@@ -663,7 +682,13 @@ defmodule Cardamom.ChainStore do
     end
 
     Repo.delete_all(from m in MempoolTxo, where: m.txid == ^txid)
-    # Remove this tx's spend-graph edges too (it no longer depends on anything).
+
+    # Invalidate the edge-cache entry for each input this tx touched (its spender list
+    # changed), THEN remove its edges. (Read the inputs before deleting.)
+    Repo.all(from e in MempoolTxInput, where: e.spender_txid == ^txid, select: {e.input_txid, e.input_ix})
+    |> Enum.uniq()
+    |> Enum.each(&Cached.invalidate_key(edge_index(), &1))
+
     Repo.delete_all(from e in MempoolTxInput, where: e.spender_txid == ^txid)
     :ok
   end

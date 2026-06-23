@@ -42,11 +42,13 @@ defmodule Cardamom.Store.MempoolCascadeTest do
   test "edges are recorded when a pending tx is added" do
     txid = pending([{<<1::256>>, 0}], [{<<2::256>>, 0}])
 
-    spenders = ChainStore.mempool_spenders_of(<<1::256>>, 0) |> Enum.map(& &1.spender_txid)
-    refreaders = ChainStore.mempool_spenders_of(<<2::256>>, 0) |> Enum.map(& {&1.spender_txid, &1.kind})
+    # mempool_spenders_of returns the SPENDER TXIDS that depend on an input (any kind —
+    # spend OR reference; both make the input a dependency the cascade must invalidate).
+    spenders = ChainStore.mempool_spenders_of(<<1::256>>, 0)
+    refreaders = ChainStore.mempool_spenders_of(<<2::256>>, 0)
 
-    assert txid in spenders
-    assert {txid, "reference"} in refreaders
+    assert txid in spenders, "the spend edge is recorded"
+    assert txid in refreaders, "the reference edge is recorded too (a spent refInput invalidates the reader)"
   end
 
   test "a block spending a pending tx's input evicts it as :inputs_spent" do

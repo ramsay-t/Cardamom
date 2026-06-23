@@ -54,7 +54,7 @@ defmodule Cardamom.Store.MempoolDoubleSpendTest do
     assert ChainStore.mempool_txo(tx_a.txid, 0) != nil
     assert ChainStore.mempool_txo(tx_b.txid, 0) != nil
 
-    spenders = ChainStore.mempool_spenders_of(shared, 0) |> MapSet.new(& &1.spender_txid)
+    spenders = ChainStore.mempool_spenders_of(shared, 0) |> MapSet.new()
     assert MapSet.member?(spenders, tx_a.txid)
     assert MapSet.member?(spenders, tx_b.txid)
 
