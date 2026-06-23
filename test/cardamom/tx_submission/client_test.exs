@@ -86,7 +86,7 @@ defmodule Cardamom.TxSubmission.ClientTest do
       # AND the live ingest populated the spend-graph edge index (so the block cascade can
       # find this tx by its input). Proven over the proto-4 wire, not a direct put.
       for {in_txid, in_ix} <- tx.inputs do
-        spenders = ChainStore.mempool_spenders_of(in_txid, in_ix) |> Enum.map(& &1.spender_txid)
+        spenders = ChainStore.mempool_spenders_of(in_txid, in_ix)
         assert tx.txid in spenders, "a gossiped tx must record its input edges"
       end
     end
@@ -144,7 +144,6 @@ defmodule Cardamom.TxSubmission.ClientTest do
   describe "phase-1 validation gate (don't store junk; ding bad peers)" do
     test "a valid tx (input exists, unspent) is stored; a double-spend is rejected + dings the peer" do
       bytes = fn x -> %CBOR.Tag{tag: :bytes, value: x} end
-      {:ok, store} = Cardamom.PeerStore.Sql.start_link([])
       addr = %{host: "5.5.5.5", port: 3001}
 
       # Seed: one unspent UTxO (valid to spend) and one already-spent (double-spend bait).
@@ -153,7 +152,7 @@ defmodule Cardamom.TxSubmission.ClientTest do
 
       {client_end, peer_end} = Channel.Test.pair()
       {:ok, conn} = Connection.start_link(channel: client_end, peer: "tsv")
-      {:ok, _c} = Client.start_link(conn: conn, peer: "tsv", role: :receiver, peer_store: store, peer_addr: addr)
+      {:ok, _c} = Client.start_link(conn: conn, peer: "tsv", role: :receiver, peer_addr: addr)
       {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
 
       good = CBOR.encode(%{0 => [[bytes.(<<1::256>>), 0]], 1 => [[bytes.(<<0xAA>>), 5]]})
@@ -168,19 +167,18 @@ defmodule Cardamom.TxSubmission.ClientTest do
       assert Cardamom.ChainStore.mempool_txo(g.txid, 0) != nil
       assert Cardamom.ChainStore.mempool_txo(d.txid, 0) == nil
 
-      # The peer's reputation dropped (sent an invalid tx).
-      [peer] = Cardamom.PeerStore.list_known(store) |> Enum.filter(&(&1.host == "5.5.5.5"))
+      # The peer's reputation dropped (sent an invalid tx) — recorded in the chain DB.
+      [peer] = Cardamom.ChainStore.known_peers() |> Enum.filter(&(&1.host == "5.5.5.5"))
       assert peer.quality < 0, "a peer that gossips an invalid tx loses reputation"
     end
 
     test "an unverifiable tx (unsynced input) is NOT stored and does NOT ding the peer" do
       bytes = fn x -> %CBOR.Tag{tag: :bytes, value: x} end
-      {:ok, store} = Cardamom.PeerStore.Sql.start_link([])
       addr = %{host: "6.6.6.6", port: 3001}
 
       {client_end, peer_end} = Channel.Test.pair()
       {:ok, conn} = Connection.start_link(channel: client_end, peer: "tsu")
-      {:ok, _c} = Client.start_link(conn: conn, peer: "tsu", role: :receiver, peer_store: store, peer_addr: addr)
+      {:ok, _c} = Client.start_link(conn: conn, peer: "tsu", role: :receiver, peer_addr: addr)
       {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
 
       # Input <<7>>#0 we've never seen → unverifiable.
@@ -191,7 +189,7 @@ defmodule Cardamom.TxSubmission.ClientTest do
 
       assert Cardamom.ChainStore.mempool_txo(t.txid, 0) == nil, "unverifiable tx not stored"
       # No peer recorded / no penalty (we don't blame them for our incomplete view).
-      assert Cardamom.PeerStore.list_known(store) |> Enum.filter(&(&1.host == "6.6.6.6")) == []
+      assert Cardamom.ChainStore.known_peers() |> Enum.filter(&(&1.host == "6.6.6.6")) == []
     end
   end
 

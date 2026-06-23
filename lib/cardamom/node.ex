@@ -44,13 +44,12 @@ defmodule Cardamom.Node do
               report(:report_connected, host, port)
 
               # Which mini-protocols run is config-driven (cfg.protocols, every protocol
-              # independently toggleable on boot), but an explicit opts :protocols still
-              # overrides for tests/diagnostics. A peer_store handle (if provided) is
-              # passed through so peer_sharing can record candidates.
+              # independently toggleable on boot); an explicit opts :protocols overrides
+              # for tests/diagnostics. Peers persist via ChainStore (the shared chain DB),
+              # so there's no peer_store handle to thread.
               session_opts =
                 [channel: channel, peer: label, magic: cfg.network, protocols: cfg.protocols]
                 |> maybe_put(:protocols, Keyword.get(opts, :protocols))
-                |> maybe_put(:peer_store, Keyword.get(opts, :peer_store))
 
               Session.start_link(session_opts)
 

@@ -7,7 +7,7 @@ defmodule Cardamom.Ledger do
   Era-specific decode (Conway header fields, ledger state transition, datums) is
   an implementation of THIS behaviour, never hardcoded into the network layer.
 
-  Injected as a `{module, handle}` pair (same seam as `Channel`/`PeerStore`), so
+  Injected as a `{module, handle}` pair (same seam as `Channel`), so
   the network layer talks to `Cardamom.Ledger.Stub` now and a real era ledger
   later, with no change to `Connection`.
 

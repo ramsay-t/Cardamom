@@ -42,7 +42,6 @@ defmodule Cardamom.Peer.Session do
     # config choice (observe-don't-act). Each protocol is independent; an omitted one
     # simply means no traffic for that proto# on the mux.
     protocols = Keyword.get(opts, :protocols, default_protocols())
-    peer_store = Keyword.get(opts, :peer_store)
 
     Process.flag(:trap_exit, true)
 
@@ -60,8 +59,7 @@ defmodule Cardamom.Peer.Session do
           conn: conn,
           peer: peer,
           ledger: ledger,
-          keepalive_ms: keepalive_ms,
-          peer_store: peer_store
+          keepalive_ms: keepalive_ms
         }
 
         # Uniform start: for each ENABLED protocol, start its client and keep the pid
@@ -119,8 +117,8 @@ defmodule Cardamom.Peer.Session do
     bf
   end
 
-  defp start_peer_sharing(%{conn: conn, peer: peer, peer_store: store}) do
-    {:ok, ps} = Cardamom.PeerSharing.Client.start_link(conn: conn, peer: peer, peer_store: store)
+  defp start_peer_sharing(%{conn: conn, peer: peer}) do
+    {:ok, ps} = Cardamom.PeerSharing.Client.start_link(conn: conn, peer: peer)
     ps
   end
 

@@ -4,7 +4,8 @@ defmodule Cardamom.TxSubmission.Client do
 
   PULL-BASED and asymmetric (see reference_txsubmission_lifecycle): the RECEIVER pulls
   txs from the SUBMITTER. There is no tx-removal message — mempool exit is learned from
-  block-fetch (`:in_block`) or our own policy (`:invalidated`), never from this protocol.
+  block-fetch (`:in_block` / `:invalid`) or our own policy (`:inputs_spent` / `:expired`),
+  never from this protocol.
 
     * `role: :receiver` — fills OUR mempool (the observe path). We send Init then loop:
       RequestTxIds → on ReplyTxIds, RequestTxs for the ids we don't already hold → on
@@ -41,9 +42,8 @@ defmodule Cardamom.TxSubmission.Client do
       peer: Keyword.get(opts, :peer, "loopback"),
       role: Keyword.get(opts, :role, :receiver),
       amount: Keyword.get(opts, :request_amount, @default_amount),
-      # Optional PeerStore handle {mod, h}: a peer that gossips a DEFINITELY-invalid tx
-      # loses reputation. Absent → just log (we still don't store the junk).
-      peer_store: Keyword.get(opts, :peer_store),
+      # A peer that gossips a DEFINITELY-invalid tx loses reputation (ChainStore.record_peer),
+      # keyed by its address. Absent peer_addr → just log (we still don't store the junk).
       peer_addr: Keyword.get(opts, :peer_addr)
     }
 
@@ -73,6 +73,8 @@ defmodule Cardamom.TxSubmission.Client do
     end
   end
 
+  def handle_info({:EXIT, _from, reason}, state), do: {:stop, reason, state}
+
   defp emit_in(msg, state) do
     Logger.info("tx_submission #{state.peer} <- #{inbound_label(msg)}")
 
@@ -90,8 +92,6 @@ defmodule Cardamom.TxSubmission.Client do
   defp inbound_label(:init), do: "Init"
   defp inbound_label(:done), do: "Done"
   defp inbound_label(other), do: inspect(other)
-
-  def handle_info({:EXIT, _from, reason}, state), do: {:stop, reason, state}
 
   # ---- receiver side ----
 
@@ -181,10 +181,10 @@ defmodule Cardamom.TxSubmission.Client do
     })
   end
 
-  # Dock a peer's reputation for sending something definitively invalid — only when we
-  # have a PeerStore handle AND the peer's address. Never for :unverifiable.
-  defp penalise(%{peer_store: {_m, _h} = store, peer_addr: %{host: host, port: port}}, event) do
-    Cardamom.PeerStore.record(store, %{host: host, port: port, event: event})
+  # Dock a peer's reputation for sending something definitively invalid — only when we know
+  # the peer's address and the store is running. Never for :unverifiable.
+  defp penalise(%{peer_addr: %{host: host, port: port}}, event) do
+    if store_running?(), do: Cardamom.ChainStore.record_peer(%{host: host, port: port, event: event})
   end
 
   defp penalise(_state, _event), do: :ok

@@ -37,7 +37,7 @@ defmodule Cardamom.ChainStore do
   use GenServer
 
   alias Cardamom.Store.{Cache, Header, Kv, Repo}
-  alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput}
+  alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput, Peer}
   alias Cardamom.Store.Cached
   alias Cardamom.Ledger.Conway.Tx
   import Ecto.Query
@@ -59,6 +59,12 @@ defmodule Cardamom.ChainStore do
         )
       end
     )
+  end
+
+  # Cached PK-keyed store for the mempool TXOs — the cache-vital read (every gossiped tx,
+  # every cascade lookup hits it). Keyed (txid, ix), same shape as the confirmed txos.
+  defp mempool_store do
+    Cached.new(schema: MempoolTxo, cache_tag: :mempool_txo, key_fields: [:txid, :ix])
   end
 
   # ---- fetch-coordination process (peer round-robin) ----
@@ -584,19 +590,22 @@ defmodule Cardamom.ChainStore do
     outputs
     |> Enum.with_index()
     |> Enum.each(fn {out, ix} ->
-      %MempoolTxo{}
-      |> MempoolTxo.changeset(%{
-        txid: txid,
-        ix: ix,
-        address: out.address,
-        value: out.value,
-        datum_hash: out.datum_hash,
-        datum: encode_datum(out.datum),
-        raw: out.raw,
-        created_txid: txid,
-        spent_by: nil
-      })
-      |> Repo.insert(on_conflict: :replace_all, conflict_target: [:txid, :ix])
+      row =
+        MempoolTxo.changeset(%MempoolTxo{}, %{
+          txid: txid,
+          ix: ix,
+          address: out.address,
+          value: out.value,
+          datum_hash: out.datum_hash,
+          datum: encode_datum(out.datum),
+          raw: out.raw,
+          created_txid: txid,
+          spent_by: nil
+        })
+        |> Ecto.Changeset.apply_changes()
+
+      # Write-through: insert + cache (so the cache-vital mempool read is warm).
+      {:ok, _} = Cached.put(mempool_store(), row)
     end)
 
     # Record the spend-graph EDGES: which UTxOs this pending tx depends on, and HOW. The
@@ -628,9 +637,9 @@ defmodule Cardamom.ChainStore do
     Cached.get_list(edge_index(), {input_txid, input_ix})
   end
 
-  @doc "Resolve a PENDING TXO by (txid, ix) from the mempool table, or nil."
+  @doc "Resolve a PENDING TXO by (txid, ix) — cache → SQLite read-through."
   def mempool_txo(txid, ix) when is_binary(txid) and is_integer(ix) do
-    Repo.get_by(MempoolTxo, txid: txid, ix: ix)
+    Cached.get(mempool_store(), {txid, ix})
   end
 
   @doc "Distinct txids currently in the mempool (for the TxSubmission submitter side)."
@@ -643,14 +652,18 @@ defmodule Cardamom.ChainStore do
   Evict a tx from the mempool — the TWO ways a tx legitimately LEAVES, named explicitly
   (the protocol never tells us; see reference_txsubmission_lifecycle):
 
-    * `:in_block`    — it was included in a block (learned from block-fetch / process_block;
-                       authoritative).
-    * `:invalidated` — our own policy dropped it (expired, replaced, or became invalid;
-                       heuristic — TxSubmission has no removal message).
+    * `:in_block`     — included in a block as VALID (learned from block-fetch; authoritative).
+    * `:invalid`      — included but FAILED phase-2 (collateral taken).
+    * `:inputs_spent` — a conflicting tx spent its inputs first; out-competed, NOT at fault.
+    * `:expired`      — its validity interval (ttl) passed (future; needs slot tracking).
+    * `:rejected`     — phase-1 fail on ingest; never really entered the mempool.
 
-  Thin wrapper over `drop_mempool_tx/2` constraining the reason to the lifecycle vocabulary.
+  (TxSubmission has no removal message, so exit is inferred — see
+  reference_txsubmission_lifecycle / project_cardamom_tx_lifecycle.) Thin wrapper over
+  `drop_mempool_tx/2` constraining the reason to the lifecycle vocabulary.
   """
-  def evict_mempool_tx(txid, reason) when is_binary(txid) and reason in [:in_block, :invalidated] do
+  def evict_mempool_tx(txid, reason)
+      when is_binary(txid) and reason in [:in_block, :invalid, :inputs_spent, :expired, :rejected] do
     drop_mempool_tx(txid, reason)
   end
 
@@ -681,6 +694,8 @@ defmodule Cardamom.ChainStore do
       |> Repo.insert()
     end
 
+    # Invalidate the mempool_txo cache entry for each output we're removing.
+    Enum.each(rows, fn m -> Cached.invalidate(mempool_store(), {m.txid, m.ix}) end)
     Repo.delete_all(from m in MempoolTxo, where: m.txid == ^txid)
 
     # Invalidate the edge-cache entry for each input this tx touched (its spender list
@@ -697,6 +712,57 @@ defmodule Cardamom.ChainStore do
   def mempool_graveyard(txid) when is_binary(txid) do
     import Ecto.Query
     Repo.all(from g in MempoolGraveyard, where: g.txid == ^txid)
+  end
+
+  # ---- Peers: reputation, on the shared Repo (peers belong to THIS chain — same magic,
+  # ---- same DB — so they are chain data like everything else, not a separate store).
+
+  # event -> quality delta. The relative ORDER is the contract (good raises, failures
+  # lower, a protocol violation or invalid-tx gossip costs most). Unknown events: neutral 0
+  # but still register the peer (so a network-discovered candidate becomes known).
+  @peer_deltas %{
+    connected: 5,
+    clean_close: 3,
+    served: 2,
+    peer_shared: 0,
+    disconnect: -3,
+    timeout: -5,
+    sent_invalid_tx: -10,
+    sent_undecodable_tx: -10,
+    protocol_violation: -25
+  }
+
+  @doc """
+  Record an observation about a peer `%{host:, port:, event:}`, moving its `quality` by the
+  event's delta (and registering it if new). This is how reputation MEANS something — good
+  behaviour raises rank, misbehaviour (incl. gossiping invalid txs) lowers it. The trust
+  layer (eclipse-resistance) will sit on top of this score.
+  """
+  def record_peer(%{host: host, port: port, event: event}) do
+    delta = Map.get(@peer_deltas, event, 0)
+    now = System.system_time(:second)
+    base = (Repo.get_by(Peer, host: host, port: port) || %Peer{quality: 0}).quality || 0
+
+    {:ok, _} =
+      %Peer{}
+      |> Peer.changeset(%{
+        host: host,
+        port: port,
+        quality: base + delta,
+        last_event: Atom.to_string(event),
+        last_seen: now
+      })
+      |> Repo.insert(
+        on_conflict: [set: [quality: base + delta, last_event: Atom.to_string(event), last_seen: now]],
+        conflict_target: [:host, :port]
+      )
+
+    :ok
+  end
+
+  @doc "Known peers, ranked best-quality-first (hot-start dial order)."
+  def known_peers do
+    Repo.all(from p in Peer, order_by: [desc: p.quality])
   end
 
   # nil results are NOT cached (a genuine absence shouldn't pin a negative entry —

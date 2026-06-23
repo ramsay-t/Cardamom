@@ -2,30 +2,29 @@ defmodule Cardamom.PeerSharing.ClientTest do
   @moduledoc """
   PeerSharing (proto 10) client. OBSERVE-DON'T-ACT: on start we ask a peer for
   addresses (MsgShareRequest), decode the reply (MsgSharePeers), and RECORD each as a
-  low-trust candidate in the PeerStore — but NEVER dial them (dialing is the trust
-  layer's job, not built). We DO participate honestly: if the peer asks US to share, we
-  reply with what we know. Driven over a bearer with scripted proto-10 messages.
+  low-trust candidate via ChainStore (peers are chain data) — but NEVER dial them
+  (dialing is the trust layer's job, not built). We DO participate honestly: if the peer
+  asks US to share, we reply with what we know. Driven over a bearer with scripted
+  proto-10 messages.
   """
-  use ExUnit.Case, async: false
+  use Cardamom.DataCase, async: false
 
-  alias Cardamom.{Channel, Connection, Mux.Frame}
+  alias Cardamom.{Channel, Connection, ChainStore, Mux.Frame}
   alias Cardamom.PeerSharing.Client
   alias Cardamom.Protocol.PeerSharing.Codec, as: PS
-  alias Cardamom.PeerStore.Static
 
   @peer_sharing 10
 
   setup do
     Process.flag(:trap_exit, true)
-    # A Static peer store we can inspect (and pre-seed for the share-back case).
-    {:ok, store} = Static.start_link(seed: [%{host: "203.0.113.7", port: 3001, quality: 9}])
+    # A known peer (for the share-back case) recorded in the chain store.
+    :ok = ChainStore.record_peer(%{host: "203.0.113.7", port: 3001, event: :connected})
     {client_end, peer_end} = Channel.Test.pair()
     {:ok, conn} = Connection.start_link(channel: client_end, peer: "ps")
 
-    {:ok, client} =
-      Client.start_link(conn: conn, peer: "ps", peer_store: store, request_amount: 5)
+    {:ok, client} = Client.start_link(conn: conn, peer: "ps", request_amount: 5)
 
-    %{peer_end: peer_end, store: store, client: client}
+    %{peer_end: peer_end, client: client}
   end
 
   test "on start the client sends MsgShareRequest for the configured amount", %{peer_end: pe} do
@@ -33,16 +32,16 @@ defmodule Cardamom.PeerSharing.ClientTest do
     assert {:ok, {:share_request, 5}, ""} = PS.decode(payload)
   end
 
-  test "received shared peers are RECORDED as candidates (but never dialed)", %{peer_end: pe, store: store} do
+  test "received shared peers are RECORDED as candidates (but never dialed)", %{peer_end: pe} do
     {:ok, _req, _, _} = Frame.recv_msg(pe, <<>>, 1_000)
 
     shared = [%{host: "1.2.3.4", port: 3001}, %{host: "5.6.7.8", port: 3001}]
     :ok = Frame.send_msg(pe, @peer_sharing, PS.encode({:share_peers, shared}))
 
-    # They land in the PeerStore as known candidates. (Quality is the store's business;
-    # the point is they're recorded, NOT dialed — there is no dial call anywhere here.)
+    # They land in the chain store as known candidates (quality 0 via :peer_shared) — the
+    # point is they're recorded, NOT dialed; there is no dial call anywhere here.
     wait_until(fn ->
-      hosts = Cardamom.PeerStore.list_known(store) |> Enum.map(& &1.host)
+      hosts = ChainStore.known_peers() |> Enum.map(& &1.host)
       "1.2.3.4" in hosts and "5.6.7.8" in hosts
     end)
   end
@@ -69,13 +68,13 @@ defmodule Cardamom.PeerSharing.ClientTest do
     assert Process.alive?(client), "Done + garbage must not crash the client"
   end
 
-  test "no peer_store configured: received peers are observed, not crashed" do
+  test "an empty share_peers reply is handled without crashing" do
     {client_end, peer_end} = Channel.Test.pair()
     {:ok, conn} = Connection.start_link(channel: client_end, peer: "ps2")
-    {:ok, c} = Client.start_link(conn: conn, peer: "ps2", peer_store: nil, request_amount: 3)
+    {:ok, c} = Client.start_link(conn: conn, peer: "ps2", request_amount: 3)
     {:ok, _req, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
 
-    :ok = Frame.send_msg(peer_end, @peer_sharing, PS.encode({:share_peers, [%{host: "1.2.3.4", port: 3001}]}))
+    :ok = Frame.send_msg(peer_end, @peer_sharing, PS.encode({:share_peers, []}))
     Process.sleep(50)
     assert Process.alive?(c)
   end

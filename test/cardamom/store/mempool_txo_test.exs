@@ -70,20 +70,26 @@ defmodule Cardamom.Store.MempoolTxoTest do
            "and that confirmed UTXO is unspent — the pending spend is valid against the chain"
   end
 
-  test "evict_mempool_tx: the two lifecycle exits (:in_block, :invalidated)" do
+  test "evict_mempool_tx: lifecycle exits (:in_block, :inputs_spent), and the cache is invalidated" do
     a = tx(3)
     b = tx(16)
     :ok = ChainStore.put_mempool_tx(a)
     :ok = ChainStore.put_mempool_tx(b)
 
-    :ok = ChainStore.evict_mempool_tx(a.txid, :in_block)
-    :ok = ChainStore.evict_mempool_tx(b.txid, :invalidated)
+    # Warm the cache (these reads now serve from Nebulex).
+    assert ChainStore.mempool_txo(a.txid, 0) != nil
+    assert ChainStore.mempool_txo(b.txid, 0) != nil
 
-    assert ChainStore.mempool_txo(a.txid, 0) == nil
+    :ok = ChainStore.evict_mempool_tx(a.txid, :in_block)
+    :ok = ChainStore.evict_mempool_tx(b.txid, :inputs_spent)
+
+    # After graveyarding, the (previously-cached) reads must return nil — proving the
+    # cache was invalidated, not serving a stale row.
+    assert ChainStore.mempool_txo(a.txid, 0) == nil, "graveyarded tx must not be served from cache"
     assert ChainStore.mempool_txo(b.txid, 0) == nil
 
     assert [%{reason: "in_block"}] = ChainStore.mempool_graveyard(a.txid) |> Enum.filter(&(&1.ix == 0))
-    assert [%{reason: "invalidated"}] = ChainStore.mempool_graveyard(b.txid) |> Enum.filter(&(&1.ix == 0))
+    assert [%{reason: "inputs_spent"}] = ChainStore.mempool_graveyard(b.txid) |> Enum.filter(&(&1.ix == 0))
   end
 
   test "evict_mempool_tx rejects a non-lifecycle reason" do
