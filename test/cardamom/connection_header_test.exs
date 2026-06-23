@@ -53,9 +53,11 @@ defmodule Cardamom.ConnectionHeaderTest do
     tip = [[hdr.slot, %CBOR.Tag{tag: :bytes, value: hdr.hash}], hdr.block_number]
     :ok = Frame.send_msg(pe, @chain_sync, CS.encode({:roll_forward, envelope, tip}))
 
-    assert_receive {:event, meta}, 1000
-    assert meta.header_hash == Base.encode16(hdr.hash, case: :lower)
-    assert meta.header_slot == 9999
+    # Match the event for THIS header specifically (slot 9999) — not merely the first
+    # {:event,_} in the mailbox, which under a full-suite run can be a stale/other event.
+    expected = Base.encode16(hdr.hash, case: :lower)
+    assert_receive {:event, %{header_slot: 9999} = meta}, 1000
+    assert meta.header_hash == expected
     refute Map.has_key?(meta, :header_raw_term), "must decode, not fall back"
   end
 
