@@ -1,15 +1,20 @@
 defmodule Cardamom.Ledger.Conway.Header do
   @moduledoc """
-  Decoder for the Praos block header as sent over node-to-node chain-sync.
+  The shared, NORMALISED block-header struct that every era's decoder produces, and the
+  store/forest consume. Despite the `Conway` name (kept so `ChainStore`/`Store.Header`, which
+  pattern-match this struct, don't churn), this is era-INDEPENDENT: a Byron, TPraos, or Praos
+  header all decode into this same shape via `Cardamom.Ledger.Header.decode/2`.
 
-  SOURCE OF TRUTH: `ouroboros-consensus-protocol/.../Praos/Header.hs` (the
-  `HeaderBody` `EncCBOR`/`DecCBOR`), VERIFIED against real captured Preview bytes
-  (test/fixtures/preview_rollforward.hex, era 4, 961-byte header). NOTE: this is
-  the CONSENSUS Praos header, not the ledger CDDL's block header — and the
-  `OCert` and `ProtVer` are encoded as flat `CBORGroup`s (spliced inline), so the
-  `header_body` is a FLAT 15-element array, not the 10 nested fields the ledger
-  CDDL reads suggest. (That "10 vs 15" was CBORGroup inlining + reading the wrong
-  layer — see CLAUDE_NOTES.)
+  Fields a later era doesn't have are nil (Byron has no vrf_*/operational_cert; Praos has a
+  single VRF so `vrf_result_2` is nil). The actual era-specific CBOR shapes live in:
+
+    * `Cardamom.Ledger.Byron.Header`   (era 0)
+    * `Cardamom.Ledger.Shelley.Header` (eras 1-4, TPraos, flat 15-field, two VRFs)
+    * `Cardamom.Ledger.Praos.Header`   (eras 5-7, Praos, nested 10-field, one VRF)
+
+  `decode/1` here remains as a BACK-COMPAT alias for the TPraos shape (delegates to
+  `Shelley.Header`) — the era-4 fixture and older tests call it. New code should call the
+  era-dispatching `Cardamom.Ledger.Header.decode/2`.
 
   Verified field layout (header = [header_body, kes_signature(448)]):
 
@@ -34,8 +39,6 @@ defmodule Cardamom.Ledger.Conway.Header do
   Strict: a header that doesn't match this exact shape is an error, not coerced.
   The hash is the REAL blake2b-256 of the raw header bytes.
   """
-
-  alias Cardamom.Crypto
 
   @type t :: %__MODULE__{
           hash: <<_::256>>,
@@ -72,96 +75,11 @@ defmodule Cardamom.Ledger.Conway.Header do
   ]
 
   @doc """
-  Decode RAW header bytes (after the chain-sync transport envelope
-  `[era, #6.24(bytes)]` has been stripped) into a fully-decoded `%Header{}`,
-  including its real blake2b-256 hash. `{:ok, header}` | `{:error, reason}`.
-  Never raises.
+  BACK-COMPAT alias: decode RAW header bytes assuming the TPraos (Shelley-family, flat 15-field)
+  shape, into a `%Header{}`. The era-4 Preview fixture and older tests call this directly. New
+  code should use the era-dispatching `Cardamom.Ledger.Header.decode/2`, which picks the right
+  per-era decoder. Delegates to `Cardamom.Ledger.Shelley.Header` (the actual home of this shape).
   """
   @spec decode(binary()) :: {:ok, t()} | {:error, term()}
-  def decode(raw) when is_binary(raw) do
-    with {:ok, term, _rest} <- cbor_decode(raw),
-         {:ok, header_body, body_sig} <- as_header_shape(term),
-         {:ok, body} <- decode_body(header_body),
-         :ok <- check_kes_sig(body_sig) do
-      hash = Crypto.blake2b_256(raw)
-      {:ok, struct(__MODULE__, Map.merge(body, %{hash: hash, hash_hex: hex(hash), raw_size: byte_size(raw)}))}
-    end
-  rescue
-    e -> {:error, {:exception, e}}
-  end
-
-  def decode(_), do: {:error, :not_binary}
-
-  # header is a 2-element array [header_body, body_signature].
-  defp as_header_shape([header_body, body_sig]), do: {:ok, header_body, body_sig}
-  defp as_header_shape(other), do: {:error, {:not_a_header, other}}
-
-  # header_body is a FLAT 15-element array (OCert and ProtVer inlined).
-  defp decode_body([
-         block_number,
-         slot,
-         prev_hash,
-         issuer_vkey,
-         vrf_vkey,
-         vrf_result,
-         vrf_result_2,
-         block_body_size,
-         block_body_hash,
-         oc_hot_vkey,
-         oc_n,
-         oc_kes_period,
-         oc_sigma,
-         proto_major,
-         proto_minor
-       ])
-       when is_integer(block_number) and is_integer(slot) and is_integer(block_body_size) and
-              is_integer(oc_n) and is_integer(oc_kes_period) and
-              is_integer(proto_major) and is_integer(proto_minor) do
-    {:ok,
-     %{
-       block_number: block_number,
-       slot: slot,
-       prev_hash: decode_prev_hash(prev_hash),
-       issuer_vkey: bytes(issuer_vkey),
-       vrf_vkey: bytes(vrf_vkey),
-       vrf_result: vrf_result,
-       vrf_result_2: vrf_result_2,
-       block_body_size: block_body_size,
-       block_body_hash: bytes(block_body_hash),
-       operational_cert: %{
-         hot_vkey: bytes(oc_hot_vkey),
-         sequence_number: oc_n,
-         kes_period: oc_kes_period,
-         sigma: bytes(oc_sigma)
-       },
-       protocol_version: {proto_major, proto_minor}
-     }}
-  end
-
-  defp decode_body(other), do: {:error, {:bad_header_body, other}}
-
-  defp decode_prev_hash(nil), do: nil
-  defp decode_prev_hash(h), do: bytes(h)
-
-  # KES signature is bytes .size 448; sanity-check present + binary.
-  defp check_kes_sig(sig) do
-    case bytes(sig) do
-      b when is_binary(b) -> :ok
-      _ -> {:error, :bad_kes_signature}
-    end
-  end
-
-  # The cbor lib decodes byte strings to %CBOR.Tag{tag: :bytes, value: ...}; unwrap.
-  defp bytes(%CBOR.Tag{tag: :bytes, value: v}), do: v
-  defp bytes(b) when is_binary(b), do: b
-  defp bytes(other), do: other
-
-  defp cbor_decode(raw) do
-    case CBOR.decode(raw) do
-      {:ok, term, rest} -> {:ok, term, rest}
-      {:error, e} -> {:error, {:cbor, e}}
-    end
-  end
-
-  defp hex(bin), do: Base.encode16(bin, case: :lower)
+  defdelegate decode(raw), to: Cardamom.Ledger.Shelley.Header
 end

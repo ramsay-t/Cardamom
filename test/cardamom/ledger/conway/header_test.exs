@@ -72,7 +72,7 @@ defmodule Cardamom.Ledger.Conway.HeaderTest do
     test "a header_body with the wrong arity errors" do
       short_body = [1, 2, 3]
       raw = CBOR.encode([short_body, %CBOR.Tag{tag: :bytes, value: <<0::448*8>>}])
-      assert {:error, {:bad_header_body, _}} = Header.decode(raw)
+      assert {:error, {:bad_tpraos_header_body, _}} = Header.decode(raw)
     end
 
     test "never raises on arbitrary bytes" do
@@ -108,12 +108,12 @@ defmodule Cardamom.Ledger.Conway.HeaderTest do
 
     test "a non-integer opcert sequence number (field 10) is rejected by the guard" do
       raw = body_with(%{10 => "not-an-int"})
-      assert {:error, {:bad_header_body, _}} = Header.decode(raw)
+      assert {:error, {:bad_tpraos_header_body, _}} = Header.decode(raw)
     end
 
     test "a non-integer protocol major (field 13) is rejected" do
       raw = body_with(%{13 => "soon"})
-      assert {:error, {:bad_header_body, _}} = Header.decode(raw)
+      assert {:error, {:bad_tpraos_header_body, _}} = Header.decode(raw)
     end
 
     test "a non-integer block_number is rejected (guard, not coerced)" do
@@ -128,7 +128,7 @@ defmodule Cardamom.Ledger.Conway.HeaderTest do
 
     test "a header_body that is too short is rejected" do
       raw = CBOR.encode([[1, 2, 3], %CBOR.Tag{tag: :bytes, value: <<0::448*8>>}])
-      assert {:error, {:bad_header_body, _}} = Header.decode(raw)
+      assert {:error, {:bad_tpraos_header_body, _}} = Header.decode(raw)
     end
 
     test "a header with no KES signature element is rejected" do

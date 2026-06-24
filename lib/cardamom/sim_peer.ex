@@ -101,7 +101,16 @@ defmodule Cardamom.SimPeer do
         {:noreply, state}
 
       {:error, _} ->
-        # The client's connection dropped. Judge whether it left politely.
+        # The client's connection dropped. On a GRACEFUL Ouroboros close the MsgDone and the
+        # FIN coalesce on the wire, so the final recv can surface the closed-error with the
+        # MsgDone STILL sitting unparsed in our buffer. Drain it one last time before judging,
+        # or we'd wrongly score a polite close as :dirty (saw_done would never flip).
+        state =
+          case drain(state) do
+            {:cont, drained} -> drained
+            {:close, _reason, drained} -> drained
+          end
+
         report_close(state)
         {:stop, :normal, state}
     end

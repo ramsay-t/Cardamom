@@ -15,7 +15,12 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
 
   alias Cardamom.Crypto
 
-  @era 6
+  # This builder produces the FLAT 15-field TPraos header body (two VRFs, OCert+ProtVer
+  # inlined), so it must be tagged era 4 (Alonzo, the last TPraos era) — NOT era 6 (Conway),
+  # which is Praos and uses the nested 10-field body. Tagging it 6 made the era-dispatching
+  # decoder route SimPeer headers to the Praos decoder, which correctly rejected them. (A Praos
+  # 10-field builder mode can be added later for SimPeer tests that want to exercise Praos.)
+  @era 4
 
   @doc """
   Build a header. Opts: `:block_number`, `:slot`, `:prev_hash` (32-byte binary or
@@ -26,8 +31,9 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
     slot = Keyword.get(opts, :slot, 0)
     prev_hash = Keyword.get(opts, :prev_hash, nil)
 
-    # Real Praos HeaderBody: a FLAT 15-element array (OCert + ProtVer inlined as
-    # CBORGroups), matching ouroboros-consensus + the captured Preview fixture.
+    # FLAT 15-element TPraos header body (two VRFs; OCert + ProtVer inlined as CBORGroups),
+    # matching the captured era-4 Preview fixture. (This is the TPraos shape, not Praos —
+    # hence @era 4 above.)
     header_body = [
       block_number,
       slot,

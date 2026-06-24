@@ -9,8 +9,9 @@ defmodule Cardamom.Ledger.Conway.Tx do
                   it must match the wire exactly — we carve per-tx byte spans, never
                   re-encode the decoded term.
     * `inputs`  — `[{txid, index}]`, the TXOs this tx SPENDS (transaction_body key 0).
-    * `outputs` — `[%{address, value, datum_hash, datum, raw}]`, the new TXOs this tx
-                  CREATES (key 1). `value` is lovelace (multi-asset folded later).
+    * `outputs` — `[%{address, value, multiasset, datum_hash, datum, raw}]`, the new TXOs
+                  this tx CREATES (key 1). `value` is the lovelace coin; `multiasset` is the
+                  full `{policy_id => {asset_name => amount}}` token bundle (nil for ADA-only).
 
   Witnesses / certs / mint / validity are not decoded — they live in the block raw
   (Blocks table) and aren't needed for TXO tracking (goal b). Strict: never raises;
@@ -24,9 +25,11 @@ defmodule Cardamom.Ledger.Conway.Tx do
   alias Cardamom.Crypto
 
   @type input :: {binary(), non_neg_integer()}
+  @type multiasset :: %{optional(binary()) => %{optional(binary()) => non_neg_integer()}}
   @type output :: %{
           address: binary(),
           value: non_neg_integer(),
+          multiasset: multiasset() | nil,
           datum_hash: binary() | nil,
           datum: term() | nil,
           raw: binary()
@@ -129,6 +132,7 @@ defmodule Cardamom.Ledger.Conway.Tx do
     %{
       address: unbytes(addr),
       value: coin(value),
+      multiasset: multiasset(value),
       datum_hash: legacy_datum_hash(rest),
       datum: nil,
       raw: CBOR.encode([addr, value | rest])
@@ -140,6 +144,7 @@ defmodule Cardamom.Ledger.Conway.Tx do
     %{
       address: unbytes(Map.get(o, 0)),
       value: coin(Map.get(o, 1)),
+      multiasset: multiasset(Map.get(o, 1)),
       datum_hash: datum_hash_of(Map.get(o, 2)),
       datum: inline_datum_of(Map.get(o, 2)),
       raw: CBOR.encode(o)
@@ -156,10 +161,26 @@ defmodule Cardamom.Ledger.Conway.Tx do
   defp inline_datum_of([1, datum]), do: datum
   defp inline_datum_of(_), do: nil
 
-  # value: a bare coin (uint) or [coin, multiasset]. We track lovelace; assets later.
+  # value (Conway CDDL line 174): `coin/ [coin, multiasset<positive_coin>]`. A bare uint is
+  # ADA-only (Shelley has NO multiasset at all — shelley.cddl `value = coin`); Mary+ adds the
+  # `[coin, multiasset]` pair. `coin/1` keeps the lovelace integer for back-compat.
   defp coin(v) when is_integer(v), do: v
   defp coin([coin | _assets]) when is_integer(coin), do: coin
   defp coin(_), do: 0
+
+  # multiasset (Conway CDDL line 178): `{* policy_id => {+ asset_name => a0}}`. Preserve the
+  # whole token bundle, unwrapping CBOR byte-tags (policy_id = script_hash 28B, asset_name =
+  # bytes .size 0..32) to raw binaries. nil for a bare-coin (ADA-only / Shelley) value.
+  defp multiasset(v) when is_integer(v), do: nil
+  defp multiasset([_coin, ma]) when is_map(ma), do: unwrap_multiasset(ma)
+  defp multiasset([_coin | _]), do: nil
+  defp multiasset(_), do: nil
+
+  defp unwrap_multiasset(ma) do
+    Map.new(ma, fn {policy_id, assets} ->
+      {unbytes(policy_id), Map.new(assets, fn {name, amt} -> {unbytes(name), amt} end)}
+    end)
+  end
 
   defp unbytes(%CBOR.Tag{tag: :bytes, value: b}), do: b
   defp unbytes(b) when is_binary(b), do: b

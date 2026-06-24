@@ -39,7 +39,7 @@ defmodule Cardamom.ChainStore do
   alias Cardamom.Store.{Cache, Header, Kv, Repo}
   alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput, Peer}
   alias Cardamom.Store.Cached
-  alias Cardamom.Ledger.Conway.Tx
+  alias Cardamom.Ledger.Block
   import Ecto.Query
 
   # Cached store for the mempool spend-graph edge index, the HOTTEST read (the per-block
@@ -375,7 +375,10 @@ defmodule Cardamom.ChainStore do
   that's correct and converges as more blocks are processed.
   """
   def process_block(raw) when is_binary(raw) do
-    with {:ok, txs} <- Tx.txs_in(raw) do
+    # Route by era: the `[era, inner]` envelope carries the tag, so Block.txs_in/1 reads it and
+    # dispatches Byron (era 0) vs the Shelley-family decoder (eras 1-7). Both normalise to the
+    # same tx/output shape, so the two-phase UTxO update below is era-uniform.
+    with {:ok, txs} <- Block.txs_in(raw) do
       # TWO PHASES, matching the Agda block-level rule newUtxo = (utxo ∣ ins ᶜ) ∪ outs
       # computed over the WHOLE block: union ALL this block's outputs FIRST, then apply
       # ALL spends. This is what makes intra-block output→input chains correct — a tx can

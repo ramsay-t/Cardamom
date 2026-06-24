@@ -15,7 +15,7 @@ defmodule Cardamom.Ledger.Conway.TxTest do
   """
   use ExUnit.Case, async: true
 
-  alias Cardamom.Ledger.Conway.{Block, Tx}
+  alias Cardamom.Ledger.Conway.Tx
 
   defp fixture(n) do
     Path.join([__DIR__, "..", "..", "..", "fixtures", "blocks", "block-#{n}.hex"])
@@ -110,14 +110,51 @@ defmodule Cardamom.Ledger.Conway.TxTest do
       assert out.datum_hash == nil
     end
 
-    test "MULTI-ASSET value [coin, assets] decodes to the lovelace coin" do
+    # value (conway.cddl:174 `coin/ [coin, multiasset<positive_coin>]`, multiasset:178
+    # `{* policy_id => {+ asset_name => a0}}`): keep BOTH the lovelace coin (back-compat) AND
+    # the full token bundle. policy_id = script_hash (28B), asset_name = bytes .size 0..32.
+    test "MULTI-ASSET value [coin, assets] keeps the lovelace coin AND the token bundle" do
+      policy = :crypto.strong_rand_bytes(28)
+      asset = "TOKEN"
+
       body = %{
         0 => [[bytes(:crypto.strong_rand_bytes(32)), 0]],
-        1 => [%{0 => bytes(<<7>>), 1 => [1_234, %{bytes(<<0xAB>>) => %{bytes(<<0xCD>>) => 1}}]}]
+        1 => [%{0 => bytes(<<7>>), 1 => [1_234, %{bytes(policy) => %{bytes(asset) => 99}}]}]
       }
 
       {:ok, [tx]} = Tx.txs_in(block_of(body))
-      assert hd(tx.outputs).value == 1_234
+      out = hd(tx.outputs)
+      assert out.value == 1_234, "lovelace coin preserved for back-compat"
+      # multiasset unwrapped to raw binaries: %{policy_id => %{asset_name => amount}}.
+      assert out.multiasset == %{policy => %{asset => 99}}
+    end
+
+    # shelley.cddl `value = coin` (no multiasset); any ADA-only output is a bare uint.
+    test "a bare-coin (ADA-only / Shelley) value has nil multiasset" do
+      body = %{
+        0 => [[bytes(:crypto.strong_rand_bytes(32)), 0]],
+        1 => [%{0 => bytes(<<7>>), 1 => 5_000_000}]
+      }
+
+      {:ok, [tx]} = Tx.txs_in(block_of(body))
+      out = hd(tx.outputs)
+      assert out.value == 5_000_000
+      assert out.multiasset == nil
+    end
+
+    test "a legacy-array output's multiasset is also preserved" do
+      policy = :crypto.strong_rand_bytes(28)
+
+      body = %{
+        0 => [[bytes(:crypto.strong_rand_bytes(32)), 0]],
+        1 => [[bytes(<<7>>), [42, %{bytes(policy) => %{bytes(<<>>) => 1}}]]]
+      }
+
+      {:ok, [tx]} = Tx.txs_in(block_of(body))
+      out = hd(tx.outputs)
+      assert out.value == 42
+      # asset_name may be empty (size 0..32) — the empty-name token still kept.
+      assert out.multiasset == %{policy => %{<<>> => 1}}
     end
 
     test "legacy-array output WITH a datum hash (3rd element) decodes" do
