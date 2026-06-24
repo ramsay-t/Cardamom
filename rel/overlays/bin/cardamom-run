@@ -1,0 +1,70 @@
+#!/bin/sh
+# cardamom-run — start the node from a single params file, in the BACKGROUND (daemon).
+#
+#   bin/cardamom-run -p preview.params              # start (daemon) — returns immediately
+#   bin/cardamom-run -p preview.params -t catchup   # tag THIS run's log: cardamom-<ts>-catchup.log
+#   bin/cardamom-shutdown                            # GRACEFUL stop (peers leave with MsgDone → FIN)
+#
+# Why daemon and not foreground? There is exactly ONE graceful-shutdown path: the OTP
+# supervision tree, reached by init:stop (SIGTERM / `bin/cardamom stop`). A foreground
+# Ctrl-C sends SIGINT, which ERTS routes to its break handler — an ABRUPT halt that skips
+# the tree, so peers never get their MsgDone (the truncated-log bug we saw live). ERTS will
+# NOT let us reinterpret SIGINT (os:set_signal/2 rejects sigint, even on OTP 28), so there is
+# no in-VM flag that makes Ctrl-C graceful. Rather than wrap a fragile signal-forwarding shell
+# around it, we simply don't use the foreground: start as a daemon and stop deliberately with
+# `bin/cardamom-shutdown` (≡ `bin/cardamom stop`), which always lands on the graceful path.
+#
+# The params file (JSON) describes the DEPLOYMENT: network, first_peer, data_dir, port,
+# protocols — the things that are stable across runs. It is passed to the app via
+# CARDAMOM_CONFIG. The log tag is a PER-RUN thing (you want a fresh one each time so logs stay
+# comparable), so it lives on the command line via -t / --log-tag, exported as CARDAMOM_SESSION
+# (which the app prefers over the file's log_tag). Mainnet magic is refused in code.
+set -e
+
+PARAMS=""
+LOG_TAG=""
+# Default to a backgrounded start. `console` is still allowed for interactive debugging (it
+# attaches an iex shell; stop it from there or with bin/cardamom-shutdown in another terminal).
+MODE="daemon"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--params) PARAMS="$2"; shift 2 ;;
+    -t|--log-tag) LOG_TAG="$2"; shift 2 ;;
+    daemon|daemon_iex|console) MODE="$1"; shift ;;
+    start) echo "cardamom-run: foreground 'start' is not supported (Ctrl-C can't be made graceful); using daemon. Stop with bin/cardamom-shutdown." >&2; MODE="daemon"; shift ;;
+    *) echo "cardamom-run: unknown argument '$1'" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$PARAMS" ]; then
+  echo "usage: cardamom-run -p <params-file> [-t <log-tag>] [daemon|console]" >&2
+  exit 2
+fi
+
+if [ ! -f "$PARAMS" ]; then
+  echo "cardamom-run: params file not found: $PARAMS" >&2
+  exit 2
+fi
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+# Absolute path so the running node (whose cwd may differ) reads the same file.
+CARDAMOM_CONFIG="$(cd "$(dirname "$PARAMS")" && pwd)/$(basename "$PARAMS")"
+export CARDAMOM_CONFIG
+
+# Per-run log tag (overrides the file's log_tag for THIS run only).
+if [ -n "$LOG_TAG" ]; then
+  CARDAMOM_SESSION="$LOG_TAG"
+  export CARDAMOM_SESSION
+fi
+
+echo "cardamom-run: params=$CARDAMOM_CONFIG mode=$MODE${LOG_TAG:+ log-tag=$LOG_TAG}"
+"$DIR/cardamom" "$MODE"
+RC=$?
+
+if [ "$MODE" = "daemon" ] && [ "$RC" -eq 0 ]; then
+  echo "cardamom-run: node started in the background."
+  echo "  stop:   $DIR/cardamom-shutdown        (graceful: peers leave with MsgDone → FIN)"
+  echo "  attach: $DIR/cardamom remote          (iex into the running node)"
+fi
+exit "$RC"

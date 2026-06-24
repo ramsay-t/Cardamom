@@ -10,7 +10,24 @@ defmodule Cardamom.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       test_coverage: [tool: ExCoveralls],
-      package: package()
+      package: package(),
+      releases: releases()
+    ]
+  end
+
+  # `MIX_ENV=prod mix release` builds a self-contained OTP release (app + deps + ERTS)
+  # under _build/prod/rel/cardamom — runnable on a server with no Elixir/Erlang installed.
+  #   bin/cardamom daemon        # start in the background (DB-resume + sync the gap)
+  #   bin/cardamom stop          # SIGTERM → graceful MsgDone → clean FIN
+  #   bin/cardamom eval "Cardamom.Release.migrate()"   # run pending DB migrations
+  # The DATA_DIR (chain DB) lives OUTSIDE the release dir, so upgrading = swap the release
+  # and restart; the DB and its resume point persist. See runtime.exs.
+  defp releases do
+    [
+      cardamom: [
+        include_executables_for: [:unix],
+        applications: [cardamom: :permanent]
+      ]
     ]
   end
 

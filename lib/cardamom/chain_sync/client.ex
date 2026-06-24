@@ -28,6 +28,10 @@ defmodule Cardamom.ChainSync.Client do
   alias Cardamom.Mux.Reassembler
 
   @chain_sync 2
+  # Default era for header shapes that arrive WITHOUT an era tag (older bare-bytes fixtures).
+  # 4 = Alonzo/TPraos — the 15-field shape HeaderBuilder produces. Real relays always send the
+  # tag, and HeaderBuilder now tags its envelope era 4 too; this is just the no-tag fallback.
+  @default_era 4
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
@@ -68,10 +72,13 @@ defmodule Cardamom.ChainSync.Client do
 
   @impl true
   def handle_info({:sdu, @chain_sync, payload}, state) do
-    # Log the RAW chain-sync payload bytes, exactly as they came off the wire,
-    # BEFORE any decode — no matching, no interpretation, no re-encoding. This is
-    # the bytes that ARRIVED; whatever decode does next, the truth is captured.
-    Logger.debug(fn -> "chain_sync raw payload: " <> Base.encode16(payload, case: :lower) end)
+    # RAW chain-sync payload bytes, exactly as they came off the wire, BEFORE any decode. Tagged
+    # category: :raw_bytes — DROPPED by the file handler's filter unless raw-byte logging is on
+    # (Cardamom.Debug; off by default since headers.raw keeps these bytes and the flood is huge).
+    Logger.debug(
+      fn -> "chain_sync raw payload: " <> Base.encode16(payload, case: :lower) end,
+      Cardamom.Debug.tag()
+    )
 
     # Reassemble via the generic Reassembler: carries a message split across SDUs (a
     # ~1KB header) AND drains many-messages-per-SDU (a relay may pack >1 message in one
@@ -157,19 +164,31 @@ defmodule Cardamom.ChainSync.Client do
   end
 
   # Turn a RollForward header term into log/telemetry metadata via the LEDGER layer.
-  # The header arrives wrapped (wrapCBORinCBOR + an era tag); we strip the transport
-  # envelope to raw header bytes (a NETWORK concern), then the ledger interprets them
-  # (its concern). Log the decoded point at :info; full raw header hex at :debug
-  # (above, before decode). NEVER reconstruct bytes by re-encoding.
+  # The header arrives wrapped (wrapCBORinCBOR + an ERA TAG); we strip the transport envelope
+  # to {era_tag, raw header bytes} (a NETWORK concern), then the era-dispatching ledger decoder
+  # interprets them (its concern) — Byron / TPraos / Praos all have different header shapes, so
+  # the era tag is what selects the right decoder. EVERY successfully-decoded era is fed to the
+  # forest and persisted: that is what lets the chain advance across hard forks (the old code
+  # only knew one shape and silently dropped all others). NEVER reconstruct bytes by re-encoding.
   defp header_meta(header) do
-    raw = unwrap_header(header)
+    case unwrap_header(header) do
+      {era, raw} when is_binary(raw) ->
+        decode_and_store(era, raw)
 
-    case raw && Cardamom.Ledger.Conway.Header.decode(raw) do
+      _ ->
+        Logger.warning("chain_sync: header did not match the [era, #6.24(bytes)] envelope")
+        %{header_raw_term: inspect(header)}
+    end
+  end
+
+  defp decode_and_store(era, raw) do
+    case Cardamom.Ledger.Header.decode(era, raw) do
       {:ok, h} ->
         feed_forest(h.hash_hex, prev_hex(h.prev_hash))
         persist_header(h, raw)
 
         %{
+          header_era: era,
           header_hash: h.hash_hex,
           header_slot: h.slot,
           header_block: h.block_number,
@@ -177,8 +196,11 @@ defmodule Cardamom.ChainSync.Client do
           header_bytes: byte_size(raw)
         }
 
-      _ ->
-        %{header_raw_term: inspect(header), header_bytes: byte_size_of(raw)}
+      {:error, reason} ->
+        # A genuine decode failure — log it LOUDLY with the era so shape drift (e.g. a new hard
+        # fork we don't yet decode) is visible, not silently swallowed like the pre-fix bug.
+        Logger.warning("chain_sync: header decode FAILED era=#{era} reason=#{inspect(reason)}")
+        %{header_era: era, header_decode_error: inspect(reason), header_bytes: byte_size(raw)}
     end
   end
 
@@ -213,25 +235,27 @@ defmodule Cardamom.ChainSync.Client do
     e -> Logger.warning("chain_store put_header failed: #{inspect(e)}")
   end
 
-  # Strip the transport envelope to the raw header CBOR bytes. CONFIRMED from real
-  # Preview: `[era, #6.24(bytes)]` — era tag, then CBOR tag-24 (wrapCBORinCBOR)
-  # wrapping the header byte string. Others kept for SimPeer/older shapes. Anything
-  # else → nil (caller logs the raw term rather than inventing data).
-  defp unwrap_header([_era, %CBOR.Tag{tag: 24, value: %CBOR.Tag{tag: :bytes, value: raw}}])
-       when is_binary(raw),
-       do: raw
+  # Strip the transport envelope to `{era_tag, raw header bytes}`. CONFIRMED from real Preview:
+  # `[era, #6.24(bytes)]` — era tag, then CBOR tag-24 (wrapCBORinCBOR) wrapping the header byte
+  # string. We KEEP the era tag now (the era-dispatching decoder needs it; Byron/TPraos/Praos
+  # are different shapes). The no-era / bare-bytes shapes are SimPeer/older fixtures; default
+  # them to era 6 (Conway/Praos), which is what the builder now emits. Anything unrecognised →
+  # nil (caller logs the raw term rather than inventing data).
+  defp unwrap_header([era, %CBOR.Tag{tag: 24, value: %CBOR.Tag{tag: :bytes, value: raw}}])
+       when is_integer(era) and is_binary(raw),
+       do: {era, raw}
 
   defp unwrap_header(%CBOR.Tag{tag: 24, value: %CBOR.Tag{tag: :bytes, value: raw}})
        when is_binary(raw),
-       do: raw
+       do: {@default_era, raw}
 
-  defp unwrap_header([_era, %CBOR.Tag{tag: :bytes, value: raw}]) when is_binary(raw), do: raw
-  defp unwrap_header(%CBOR.Tag{tag: :bytes, value: raw}) when is_binary(raw), do: raw
-  defp unwrap_header(raw) when is_binary(raw), do: raw
+  defp unwrap_header([era, %CBOR.Tag{tag: :bytes, value: raw}]) when is_integer(era) and is_binary(raw),
+    do: {era, raw}
+
+  defp unwrap_header(%CBOR.Tag{tag: :bytes, value: raw}) when is_binary(raw), do: {@default_era, raw}
+  defp unwrap_header(raw) when is_binary(raw), do: {@default_era, raw}
   defp unwrap_header(_other), do: nil
 
-  defp byte_size_of(b) when is_binary(b), do: byte_size(b)
-  defp byte_size_of(_), do: nil
 
   defp describe([slot | _]) when is_integer(slot), do: %{slot: slot}
   defp describe(other), do: %{raw: inspect(other)}

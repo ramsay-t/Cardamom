@@ -1,18 +1,22 @@
 defmodule Cardamom.Control do
   @moduledoc """
   The single addressable command hub for the node. Access functions (in
-  `Cardamom`) message this registered process; it knows the topology and
-  orchestrates clean shutdowns.
+  `Cardamom`) message this registered process; it knows the topology and can
+  disconnect peers on demand.
 
   It is `:permanent` and crashes-are-fine (the Armstrong model): if it dies the
   supervisor restarts it, and it rediscovers the topology on `init` rather than
   relying on in-memory references that died with it.
 
-  Shutdown philosophy (see CLAUDE_NOTES / security.md): Control *initiates and
-  observes*, it does NOT coordinate acks. Graceful disconnect = ask the relevant
-  supervisor to terminate the peer subtree; the polite `MsgDone` lives in each
-  Connection's `terminate/2` (OTP-native), bounded by the child shutdown timeout.
-  Control never re-implements the supervisor's shutdown state machine.
+  Shutdown philosophy (see CLAUDE_NOTES / security.md): there is ONE graceful-shutdown
+  path — the OTP supervision tree. On node stop (`bin/cardamom stop`, SIGTERM, or
+  `shutdown/0`), the tree unwinds in reverse order, PeerSupervisor terminates each peer
+  subtree, and the polite `MsgDone` lives in each Connection's `terminate/2` (OTP-native),
+  bounded by the child shutdown timeout. Control does NOT re-implement any of that.
+
+  `disconnect_all/0` is a *different* operation: drop every peer politely but KEEP the node
+  running (e.g. to re-topology). It reuses the same supervisor-terminate mechanism, so a
+  disconnect and a shutdown-driven teardown take the identical polite route per peer.
   """
 
   use GenServer
@@ -34,9 +38,14 @@ defmodule Cardamom.Control do
   """
   def disconnect_all, do: GenServer.call(__MODULE__, :disconnect_all, 30_000)
 
-  @doc "Graceful disconnect of all peers, then stop the whole node."
+  @doc """
+  Stop the whole node gracefully. This does NOT disconnect peers itself — it asks the BEAM
+  to stop the application, and the supervision tree unwinds: PeerSupervisor terminates each
+  peer subtree, firing every Connection's terminate/2 (polite MsgDone → FIN), bounded by the
+  children's shutdown timeouts. The tree is the ONE graceful-shutdown path; `bin/cardamom
+  stop` and SIGTERM take the identical route. This is just a named, RPC-able door to it.
+  """
   def shutdown do
-    disconnect_all()
     System.stop(0)
     :ok
   end

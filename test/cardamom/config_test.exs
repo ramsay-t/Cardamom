@@ -12,6 +12,23 @@ defmodule Cardamom.ConfigTest do
     assert cfg.db == nil
   end
 
+  describe "handshake flags (all configurable, default = observer)" do
+    test "default handshake is the conservative observer stance" do
+      {:ok, cfg} = Config.resolve([])
+      assert cfg.handshake == %{initiator_only: true, peer_sharing: 0, query: false}
+    end
+
+    test "a params file can set the handshake flags (e.g. advertise peer_sharing)" do
+      path = Path.join(System.tmp_dir!(), "cardamom_hs_#{System.unique_integer([:positive])}.json")
+      File.write!(path, ~s({"handshake": {"peer_sharing": 1}}))
+      on_exit(fn -> File.rm(path) end)
+
+      {:ok, cfg} = Config.resolve(config_file: path)
+      # The overridden flag changes; the others KEEP their defaults (deep merge).
+      assert cfg.handshake == %{initiator_only: true, peer_sharing: 1, query: false}
+    end
+  end
+
   test "explicit opts override defaults" do
     {:ok, cfg} = Config.resolve(first_peer: %{host: "localhost", port: 4444}, db: "test-db")
     assert cfg.first_peer == %{host: "localhost", port: 4444}

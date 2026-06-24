@@ -32,9 +32,9 @@ defmodule Cardamom.Protocol.Handshake.Client do
   def run(channel, opts) do
     magic = Keyword.fetch!(opts, :magic)
     versions = Keyword.get(opts, :versions, [14])
+    vdata = version_data(magic, opts)
 
-    table =
-      Map.new(versions, fn v -> {v, version_data(magic)} end)
+    table = Map.new(versions, fn v -> {v, vdata} end)
 
     # WE have agency: propose. (Send is the last act before we flip to receiving.)
     with :ok <- Frame.send_msg(channel, @handshake_protocol, Codec.encode({:propose_versions, table})),
@@ -58,9 +58,15 @@ defmodule Cardamom.Protocol.Handshake.Client do
   defp interpret({:refuse, reason}), do: {:error, {:refused, reason}}
   defp interpret(other), do: {:error, {:unexpected_handshake_reply, other}}
 
-  # v14 nodeToNodeVersionData. initiator_only = true (observer); peer_sharing off;
-  # query false (we're connecting to talk, not to query versions).
-  defp version_data(magic) do
-    %{network_magic: magic, initiator_only: true, peer_sharing: 0, query: false}
+  # v14 nodeToNodeVersionData — EVERY field comes from the run opts (sourced from the
+  # params file via Config), so the handshake we present is fully configurable. Defaults
+  # are the conservative observer stance: initiator_only true, peer_sharing 0, query false.
+  defp version_data(magic, opts) do
+    %{
+      network_magic: magic,
+      initiator_only: Keyword.get(opts, :initiator_only, true),
+      peer_sharing: Keyword.get(opts, :peer_sharing, 0),
+      query: Keyword.get(opts, :query, false)
+    }
   end
 end

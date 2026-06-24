@@ -59,8 +59,12 @@ defmodule Cardamom.TxSubmission.Client do
 
   @impl true
   def handle_info({:sdu, @tx_submission, payload}, state) do
-    # RAW bytes off the wire, BEFORE decode — the live-debug capture (matches chain_sync).
-    Logger.debug(fn -> "tx_submission raw payload: " <> Base.encode16(payload, case: :lower) end)
+    # Raw-byte capture, tagged :raw_bytes (dropped by the handler filter unless enabled; see
+    # Cardamom.Debug). Matches chain_sync.
+    Logger.debug(
+      fn -> "tx_submission raw payload: " <> Base.encode16(payload, case: :lower) end,
+      Cardamom.Debug.tag()
+    )
 
     case Codec.decode(payload) do
       {:ok, msg, _rest} ->

@@ -1,0 +1,29 @@
+#!/bin/sh
+# cardamom-migrate — run pending DB migrations for the chain DB a params file points at.
+#
+#   bin/cardamom-migrate -p preview.params
+#
+# Use this as the deploy step BEFORE bin/cardamom-run, so the (existing) chain DB schema is
+# up to date before the new release starts. The params file's data_dir + network locate the
+# DB; migrations are forward-only/additive.
+set -e
+
+PARAMS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--params) PARAMS="$2"; shift 2 ;;
+    *) echo "cardamom-migrate: unknown argument '$1'" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$PARAMS" ] || [ ! -f "$PARAMS" ]; then
+  echo "usage: cardamom-migrate -p <params-file>" >&2
+  exit 2
+fi
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CARDAMOM_CONFIG="$(cd "$(dirname "$PARAMS")" && pwd)/$(basename "$PARAMS")"
+export CARDAMOM_CONFIG
+
+echo "cardamom-migrate: params=$CARDAMOM_CONFIG"
+exec "$DIR/cardamom" eval "Cardamom.Release.migrate()"

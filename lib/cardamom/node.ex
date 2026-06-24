@@ -23,14 +23,28 @@ defmodule Cardamom.Node do
 
   alias Cardamom.{Channel, Config, Peer.Session}
 
+  @doc """
+  Connect + start a session via `Session.start_link` (the session is linked to the
+  caller). Used by scripts/tests that own the session's lifetime directly.
+  """
   @spec start(keyword()) :: {:ok, pid()} | {:error, term()}
-  def start(opts \\ []) do
+  def start(opts \\ []), do: connect(opts, &Session.start_link/1)
+
+  @doc """
+  Connect + start a session UNDER `Cardamom.PeerSupervisor`, so the running node shuts it
+  down GRACEFULLY (its terminate/2 sends MsgDone) on app stop. Used by the boot Connector.
+  """
+  @spec start_supervised(keyword()) :: {:ok, pid()} | {:error, term()}
+  def start_supervised(opts \\ []),
+    do: connect(opts, &Cardamom.PeerSupervisor.start_session/1)
+
+  # Resolve config, run the politeness gate, open the TCP channel, build session opts, then
+  # hand off to `start_fun` (start_link or start a supervised child) with those opts.
+  defp connect(opts, start_fun) do
     with {:ok, cfg} <- Config.resolve(opts) do
       %{host: host, port: port} = cfg.first_peer
       label = Keyword.get(opts, :peer, host)
 
-      # POLITENESS GATE: ask Control whether we may dial (cooldown/backoff/breaker).
-      # Skip the gate only if Control isn't running (bare unit tests).
       case connect_gate(host, port) do
         {:wait, ms} ->
           Logger.info("connect to #{host}:#{port} deferred by policy (wait #{ms}ms)")
@@ -43,15 +57,17 @@ defmodule Cardamom.Node do
             {:ok, channel} ->
               report(:report_connected, host, port)
 
-              # Which mini-protocols run is config-driven (cfg.protocols, every protocol
-              # independently toggleable on boot); an explicit opts :protocols overrides
-              # for tests/diagnostics. Peers persist via ChainStore (the shared chain DB),
-              # so there's no peer_store handle to thread.
               session_opts =
-                [channel: channel, peer: label, magic: cfg.network, protocols: cfg.protocols]
+                [
+                  channel: channel,
+                  peer: label,
+                  magic: cfg.network,
+                  protocols: cfg.protocols,
+                  handshake: cfg.handshake
+                ]
                 |> maybe_put(:protocols, Keyword.get(opts, :protocols))
 
-              Session.start_link(session_opts)
+              start_fun.(session_opts)
 
             {:error, reason} ->
               report(:report_failed, host, port)

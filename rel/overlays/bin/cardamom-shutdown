@@ -1,0 +1,15 @@
+#!/bin/sh
+# cardamom-shutdown — GRACEFUL stop of a running node.
+#
+#   bin/cardamom-shutdown
+#
+# This is a thin, intention-naming alias for `bin/cardamom stop`. There is exactly ONE
+# graceful-shutdown path in Cardamom: the OTP supervision tree. Stopping the node unwinds
+# the tree in reverse order — PeerSupervisor terminates each peer subtree, firing every
+# Connection's terminate/2 (polite MsgDone/MsgClientDone → FIN), bounded by the children's
+# shutdown timeouts — then the VM halts. SIGTERM (systemd / a deploy script) takes the
+# identical route via the BEAM's init:stop. Nothing re-implements that sequence.
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+echo "cardamom-shutdown: graceful stop via the supervision tree (peers leave with MsgDone → FIN)"
+exec "$DIR/cardamom" stop

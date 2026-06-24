@@ -44,5 +44,13 @@ defmodule Cardamom.Store.Repo do
     do: raise(ArgumentError, "refusing to build a store path for mainnet (magic #{@mainnet_magic})")
 
   def db_path(magic) when is_integer(magic) and magic >= 0,
-    do: Path.join("data", "forest-#{magic}.db")
+    do: Path.join(data_dir(), "forest-#{magic}.db")
+
+  @doc """
+  The base directory holding the per-network DB files. Defaults to a relative `data/`
+  (fine for dev/test, cwd-relative), but in production a release sets an ABSOLUTE path
+  via `config :cardamom, :data_dir` (from CARDAMOM_DATA_DIR in runtime.exs) so the chain
+  DB lives OUTSIDE the swappable release dir and survives version upgrades.
+  """
+  def data_dir, do: Application.get_env(:cardamom, :data_dir, "data")
 end

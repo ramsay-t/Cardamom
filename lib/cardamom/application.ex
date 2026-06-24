@@ -5,13 +5,12 @@ defmodule Cardamom.Application do
 
   use Application
 
-  @port String.to_integer(System.get_env("CARDAMOM_PORT", "4001"))
-
   @impl true
   def start(_type, _args) do
     attach_file_logger()
     configure_store_db()
     ensure_store_dir()
+    port = ui_port()
 
     children =
       [
@@ -32,15 +31,46 @@ defmodule Cardamom.Application do
         Cardamom.Peers,
         # The candidate-chain forest + tip pointer; fed (hash, parent) by Connection.
         Cardamom.Forest.Server,
-        # Command hub: status, graceful disconnect/shutdown (permanent; rediscovers
+        # Command hub: status + on-demand graceful disconnect (permanent; rediscovers
         # topology on restart). The control surface the `Cardamom` module delegates to.
-        Cardamom.Control,
-        # Hand-coded HTTP UI: http://localhost:#{@port}
-        {Bandit, plug: Cardamom.Web.Router, scheme: :http, port: @port}
-      ] ++ dev_only()
+        # Wire it to the PeerSupervisor so disconnect_all/0 terminates live sessions
+        # (MsgDone → FIN) WITHOUT stopping the node. Shutdown is NOT Control's job — that
+        # is the supervision tree's, which unwinds the same peer subtrees on stop.
+        {Cardamom.Control, peer_supervisor: Cardamom.PeerSupervisor},
+        # Hand-coded HTTP UI: http://localhost:#{port}
+        {Bandit, plug: Cardamom.Web.Router, scheme: :http, port: port},
+        # Supervises live peer sessions so they shut down GRACEFULLY (MsgDone → FIN) on
+        # app stop. Before the Connector so a boot-dialed session has a home.
+        Cardamom.PeerSupervisor,
+        # Dials the boot peer from the params file (connect: true) — what makes a RELEASE
+        # actually connect. Last in the tree so the store/forest/control are up first.
+        # Skipped in :test (tests dial explicitly).
+        connector()
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Kernel.++(dev_only())
 
     opts = [strategy: :one_for_one, name: Cardamom.Supervisor]
     Supervisor.start_link(children, opts)
+  end
+
+  # Runs AFTER our supervision tree has fully unwound (so every Session.terminate has already
+  # logged its "sending MsgDone" goodbye) but while :logger is still up (kernel/logger stop
+  # last, in reverse start order). Force a final fsync of our file handler so the graceful
+  # teardown is durably on disk before init:stop takes the VM down. Best-effort — a missing
+  # handler (e.g. it failed to attach) must not turn a clean shutdown into a crash.
+  @impl true
+  def stop(_state) do
+    :logger_std_h.filesync(:cardamom_file)
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  # Boot-dial the params-file peer, outside :test (tests dial explicitly).
+  defp connector do
+    if Application.get_env(:cardamom, :env) == :test, do: nil, else: Cardamom.Connector
   end
 
   # The network magic is known at BOOT (config: CARDAMOM_CONFIG file, else default =
@@ -50,14 +80,40 @@ defmodule Cardamom.Application do
   # it; and the store's magic can't diverge from the handshake's. Mainnet refused by
   # db_path/1. In :test we keep the throwaway tmp DB from config (don't override).
   defp configure_store_db do
-    unless Application.get_env(:cardamom, :env) == :test do
-      {:ok, cfg} = Cardamom.Config.resolve(config_opts())
-      path = Cardamom.Store.Repo.db_path(cfg.network)
-      repo_cfg = Application.get_env(:cardamom, Cardamom.Store.Repo, [])
-      Application.put_env(:cardamom, Cardamom.Store.Repo, Keyword.put(repo_cfg, :database, path))
-      require Logger
-      Logger.info("store: durable DB = #{path} (network magic #{cfg.network})")
-    end
+    unless Application.get_env(:cardamom, :env) == :test, do: configure_store_db!()
+  end
+
+  @doc """
+  Bind the Repo's `database:` to the magic-tagged file under the (possibly env-set) data
+  dir — the SAME binding the app does at boot. Public so release tasks (Cardamom.Release)
+  point at the SAME DB the running node will, rather than the compile-time default.
+  """
+  def configure_store_db! do
+    {:ok, cfg} = Cardamom.Config.resolve(config_opts())
+
+    # data_dir from the params file (if set) wins — so one -p file fully locates the DB.
+    if cfg.data_dir, do: Application.put_env(:cardamom, :data_dir, cfg.data_dir)
+
+    path = Cardamom.Store.Repo.db_path(cfg.network)
+    repo_cfg = Application.get_env(:cardamom, Cardamom.Store.Repo, [])
+    Application.put_env(:cardamom, Cardamom.Store.Repo, Keyword.put(repo_cfg, :database, path))
+    require Logger
+    Logger.info("store: durable DB = #{path} (network magic #{cfg.network})")
+    path
+  end
+
+  # UI port precedence: params-file `port` > CARDAMOM_PORT env > 4001. (In :test we keep
+  # the env/default to avoid a file resolve during the test run.)
+  defp ui_port do
+    from_file =
+      if Application.get_env(:cardamom, :env) != :test do
+        case Cardamom.Config.resolve(config_opts()) do
+          {:ok, %{port: p}} when is_integer(p) -> p
+          _ -> nil
+        end
+      end
+
+    from_file || String.to_integer(System.get_env("CARDAMOM_PORT", "4001"))
   end
 
   defp config_opts do
@@ -88,21 +144,23 @@ defmodule Cardamom.Application do
   # session name via CARDAMOM_SESSION env or :cardamom :session app env.
   # Attached at boot so the whole session (boot→shutdown) lands in one file.
   defp attach_file_logger do
-    File.mkdir_p("log")
-    path = session_log_path()
+    dir = log_dir()
+    File.mkdir_p(dir)
+    path = session_log_path(dir)
 
-    :logger.add_handler(:cardamom_file, :logger_std_h, %{
-      config: %{
-        file: String.to_charlist(path),
-        max_no_bytes: 50_000_000,
-        max_no_files: 3
-      },
-      formatter:
-        Logger.Formatter.new(
-          format: "$time $metadata[$level] $message\n",
-          metadata: [:peer, :protocol, :msg, :slot, :version]
-        )
-    })
+    :logger.add_handler(:cardamom_file, :logger_std_h, file_handler_config(path))
+
+    # Pull the params-file `debug_raw_bytes` into app env so Cardamom.Debug sees it, THEN install
+    # the :raw_bytes category filter (drops the huge raw-wire hex dumps unless switched on; see
+    # Cardamom.Debug). Both must run AFTER the handler exists.
+    if Application.get_env(:cardamom, :env) != :test do
+      case Cardamom.Config.resolve(config_opts()) do
+        {:ok, %{debug_raw_bytes: v}} -> Application.put_env(:cardamom, :debug_raw_bytes, v == true)
+        _ -> :ok
+      end
+    end
+
+    Cardamom.Debug.apply_boot_default()
 
     require Logger
     Logger.info("session log: #{path}")
@@ -111,21 +169,94 @@ defmodule Cardamom.Application do
     e -> IO.warn("file logger not attached: #{inspect(e)}")
   end
 
-  defp session_log_path do
+  @doc """
+  The :logger_std_h handler config for our per-session forensic file logger, for a given
+  `path`. Public so a test can attach the SAME config and prove its shutdown-critical
+  behaviour (no drift between what's tested and what runs).
+
+  SHUTDOWN-CRITICAL: the graceful teardown (Session.terminate → "sending MsgDone") logs in
+  the very last moments before init:stop tears the node down. The truncated-log bug was the
+  handler's OVERLOAD PROTECTION: under a header flood the log queue blows past the defaults
+  (drop_mode_qlen 200, flush_qlen 1000) and the handler DISCARDS messages — including the
+  final teardown lines. We disable that dropping (we want a COMPLETE forensic record, not a
+  live-latency-optimised one):
+
+    * `burst_limit_enable: false` — THE decisive one: the default burst limiter caps logging to
+      500 events / 1000ms and silently DROPS the rest. A header flood trips it instantly, so the
+      later teardown lines vanish. Disabling it is what actually fixes the truncation.
+    * `sync_mode_qlen: 0` — never buffer async; every event is written synchronously.
+    * `drop_mode_qlen` / `flush_qlen` → astronomically high — never drop, never flush-discard.
+    * `filesync_repeat_interval: 100` — fsync continuously, so an abrupt end loses ≤ ~100ms.
+
+  The trade-off (a slow log sink back-pressures the node) is acceptable for an observer node
+  whose whole point is the record.
+  """
+  def file_handler_config(path) do
+    %{
+      config: %{
+        file: String.to_charlist(path),
+        max_no_bytes: 50_000_000,
+        max_no_files: 3,
+        burst_limit_enable: false,
+        sync_mode_qlen: 0,
+        drop_mode_qlen: 1_000_000_000,
+        flush_qlen: 1_000_000_000,
+        filesync_repeat_interval: 100
+      },
+      formatter:
+        Logger.Formatter.new(
+          format: "$time $metadata[$level] $message\n",
+          metadata: [:peer, :protocol, :msg, :slot, :version]
+        )
+    }
+  end
+
+  defp session_log_path(dir) do
     {{y, mo, d}, {h, mi, s}} = :calendar.local_time()
 
     stamp =
       :io_lib.format("~4..0B~2..0B~2..0B-~2..0B~2..0B~2..0B", [y, mo, d, h, mi, s])
       |> List.to_string()
 
-    case session_name() do
-      nil -> "log/cardamom-#{stamp}.log"
-      name -> "log/cardamom-#{stamp}-#{sanitize(name)}.log"
-    end
+    name =
+      case session_name() do
+        nil -> "cardamom-#{stamp}.log"
+        tag -> "cardamom-#{stamp}-#{sanitize(tag)}.log"
+      end
+
+    Path.join(dir, name)
   end
 
+  # Log dir precedence: CARDAMOM_LOG_DIR env > params-file `log_dir` > "log" (relative).
+  defp log_dir do
+    from_file =
+      if Application.get_env(:cardamom, :env) != :test do
+        case Cardamom.Config.resolve(config_opts()) do
+          {:ok, %{log_dir: d}} when is_binary(d) -> d
+          _ -> nil
+        end
+      end
+
+    System.get_env("CARDAMOM_LOG_DIR") || from_file || "log"
+  rescue
+    _ -> "log"
+  end
+
+  # Log-file tag precedence: CARDAMOM_SESSION env > :session app-env > the params file's
+  # `log_tag` > none. (The file is resolved best-effort; logging must never block boot.)
   defp session_name do
-    System.get_env("CARDAMOM_SESSION") || Application.get_env(:cardamom, :session)
+    System.get_env("CARDAMOM_SESSION") || Application.get_env(:cardamom, :session) || file_log_tag()
+  end
+
+  defp file_log_tag do
+    if Application.get_env(:cardamom, :env) != :test do
+      case Cardamom.Config.resolve(config_opts()) do
+        {:ok, %{log_tag: tag}} when is_binary(tag) -> tag
+        _ -> nil
+      end
+    end
+  rescue
+    _ -> nil
   end
 
   # Keep filenames safe: alnum, dash, underscore only.

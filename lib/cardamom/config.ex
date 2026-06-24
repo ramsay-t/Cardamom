@@ -23,13 +23,42 @@ defmodule Cardamom.Config do
     network: 2,
     first_peer: %{host: "preview-node.play.dev.cardano.org", port: 3001},
     db: nil,
-    protocols: [:chain_sync, :keep_alive, :block_fetch]
+    # data_dir: where the chain DB (forest-<magic>.db) lives. nil → the built-in default
+    # ("data", relative). A params file should set an ABSOLUTE path for a deployed node.
+    data_dir: nil,
+    # port: the read-only HTTP UI port. nil → the app default (4001).
+    port: nil,
+    # log_tag: appended to the session log filename (cardamom-<ts>-<tag>.log) so a run is
+    # identifiable. nil → no tag.
+    log_tag: nil,
+    # log_dir: where session logs are written. nil → the built-in default ("log", relative).
+    # A deployed node should set an ABSOLUTE path so logs don't scatter to the launch cwd.
+    log_dir: nil,
+    # connect?: whether the node DIALS its boot peers on start. Default true (a deployed
+    # node connects); set false for a store-only / inspection boot.
+    connect: true,
+    # handshake: the nodeToNodeVersionData flags we PRESENT to the relay. Defaults are the
+    # conservative observer stance (initiator-only, no peer-sharing, not a version query).
+    # All configurable from the params file so what we advertise is never hidden in code.
+    handshake: %{initiator_only: true, peer_sharing: 0, query: false},
+    protocols: [:chain_sync, :keep_alive, :block_fetch],
+    # debug_raw_bytes: log the full hex of every wire payload at :debug. OFF by default — the
+    # raw bytes are kept durably in the store (headers.raw etc.); these dumps are huge
+    # (~38MB/2min). Turn on only for byte-level diagnosis / LogReplayPeer. See Cardamom.Debug.
+    debug_raw_bytes: false
   }
 
   @type t :: %{
           network: non_neg_integer(),
           first_peer: %{host: String.t(), port: non_neg_integer()},
           db: String.t() | nil,
+          data_dir: String.t() | nil,
+          port: non_neg_integer() | nil,
+          log_tag: String.t() | nil,
+          log_dir: String.t() | nil,
+          connect: boolean(),
+          debug_raw_bytes: boolean(),
+          handshake: %{initiator_only: boolean(), peer_sharing: 0..1, query: boolean()},
           protocols: [atom()]
         }
 
@@ -59,8 +88,36 @@ defmodule Cardamom.Config do
     %{}
     |> put_if(json, "network", :network)
     |> put_if(json, "db", :db)
+    |> put_if(json, "data_dir", :data_dir)
+    |> put_if(json, "port", :port)
+    |> put_if(json, "log_tag", :log_tag)
+    |> put_if(json, "log_dir", :log_dir)
+    |> put_if(json, "connect", :connect)
+    |> put_if(json, "debug_raw_bytes", :debug_raw_bytes)
+    |> put_handshake(json["handshake"])
     |> put_peer(json["first_peer"])
     |> put_protocols(json["protocols"])
+  end
+
+  # handshake JSON has string keys; map the three known flags to atoms (closed set, no
+  # String.to_atom). Returned as a partial map; deep_merge fills the rest from defaults.
+  defp put_handshake(acc, %{} = hs) do
+    flags =
+      %{}
+      |> maybe_flag(hs, "initiator_only", :initiator_only)
+      |> maybe_flag(hs, "peer_sharing", :peer_sharing)
+      |> maybe_flag(hs, "query", :query)
+
+    if flags == %{}, do: acc, else: Map.put(acc, :handshake, flags)
+  end
+
+  defp put_handshake(acc, _), do: acc
+
+  defp maybe_flag(into, src, str_key, atom_key) do
+    case Map.fetch(src, str_key) do
+      {:ok, v} -> Map.put(into, atom_key, v)
+      :error -> into
+    end
   end
 
   # protocols in JSON are strings ("chain_sync"); map to the known atoms, silently
@@ -85,10 +142,17 @@ defmodule Cardamom.Config do
 
   # opts (keyword) → only the config keys we recognise.
   defp opts_map(opts) do
-    Map.new(Keyword.take(opts, [:network, :first_peer, :db, :protocols]))
+    Map.new(Keyword.take(opts, [:network, :first_peer, :db, :data_dir, :port, :log_tag, :log_dir, :connect, :debug_raw_bytes, :handshake, :protocols]))
   end
 
-  defp deep_merge(base, override), do: Map.merge(base, override)
+  # Merge override onto base, deep-merging the nested :handshake map so a partial file
+  # (e.g. just peer_sharing) keeps the other handshake defaults.
+  defp deep_merge(base, override) do
+    Map.merge(base, override, fn
+      :handshake, b, o when is_map(b) and is_map(o) -> Map.merge(b, o)
+      _k, _b, o -> o
+    end)
+  end
 
   defp guard_mainnet(%{network: @mainnet_magic}), do: {:error, {:refused_mainnet, @mainnet_magic}}
   defp guard_mainnet(cfg), do: {:ok, cfg}

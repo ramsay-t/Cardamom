@@ -42,10 +42,23 @@ defmodule Cardamom.Peer.Session do
     # config choice (observe-don't-act). Each protocol is independent; an omitted one
     # simply means no traffic for that proto# on the mux.
     protocols = Keyword.get(opts, :protocols, default_protocols())
+    # Handshake flags we present (from the params file via Config; defaults = observer).
+    hs = Keyword.get(opts, :handshake, %{})
 
     Process.flag(:trap_exit, true)
 
-    case Client.run(channel, magic: magic, versions: versions) do
+    handshake_opts =
+      [magic: magic, versions: versions] ++
+        Enum.filter(
+          [
+            initiator_only: Map.get(hs, :initiator_only),
+            peer_sharing: Map.get(hs, :peer_sharing),
+            query: Map.get(hs, :query)
+          ],
+          fn {_k, v} -> v != nil end
+        )
+
+    case Client.run(channel, handshake_opts) do
       {:ok, agreed} ->
         Logger.info("handshake ok peer=#{peer} version=#{agreed.version} protocols=#{inspect(protocols)}")
 
