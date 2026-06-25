@@ -214,16 +214,32 @@ defmodule Cardamom.Ledger.Conway.Tx do
 
   defp unwrap_era(_), do: {:error, :not_block_envelope}
 
-  # Split an `array(N)` of items into the list of each item's ORIGINAL byte span.
-  defp split_array(<<head, _::binary>> = bin) when head >= 0x80 and head <= 0x97 do
-    n = head - 0x80
-    <<_::8, rest::binary>> = bin
-    {:ok, take_n(rest, n, [])}
+  # Split an array of items into each item's ORIGINAL byte span. We do NOT hand-decode the array
+  # header byte (that was the :bad_tx_bodies bug — we only handled some of CBOR's array framings:
+  # 0x80-0x97 / 0x98, but real Conway tx_bodies use 0x9F indefinite-length). Instead let the CBOR
+  # LIB tell us how many items the array has (it knows every framing — definite of any size AND
+  # indefinite), then carve that many byte-spans with take/1. The lib decides framing; we only
+  # measure spans (for byte-exact txids, which a re-encode would not preserve).
+  defp split_array(bin) do
+    case CBOR.decode(bin) do
+      {:ok, items, _rest} when is_list(items) ->
+        {:ok, _array_head, after_head} = step_into_array(bin)
+        {:ok, take_n(after_head, length(items), [])}
+
+      _ ->
+        {:error, :bad_tx_bodies}
+    end
   end
 
-  # array with a 1-byte count (0x98 NN) — larger blocks.
-  defp split_array(<<0x98, n, rest::binary>>), do: {:ok, take_n(rest, n, [])}
-  defp split_array(_), do: {:error, :bad_tx_bodies}
+  # Consume just the CBOR array header (the count/indefinite marker), returning the bytes at the
+  # first element. Handles definite (0x80-0x9B) and indefinite (0x9F) array headers — the only
+  # header forms; the lib validated it's an array above, so this is pure header-length arithmetic.
+  defp step_into_array(<<h, rest::binary>>) when h >= 0x80 and h <= 0x97, do: {:ok, h, rest}
+  defp step_into_array(<<0x98, _::8, rest::binary>>), do: {:ok, 0x98, rest}
+  defp step_into_array(<<0x99, _::16, rest::binary>>), do: {:ok, 0x99, rest}
+  defp step_into_array(<<0x9A, _::32, rest::binary>>), do: {:ok, 0x9A, rest}
+  defp step_into_array(<<0x9B, _::64, rest::binary>>), do: {:ok, 0x9B, rest}
+  defp step_into_array(<<0x9F, rest::binary>>), do: {:ok, 0x9F, rest}
 
   defp take_n(_bin, 0, acc), do: Enum.reverse(acc)
 
@@ -232,7 +248,8 @@ defmodule Cardamom.Ledger.Conway.Tx do
     take_n(rest, n - 1, [item | acc])
   end
 
-  # Decode one CBOR item; return {its original bytes, rest}.
+  # Decode one CBOR item via the LIB; return {its original bytes, rest}. The span is the byte
+  # prefix the lib consumed — byte-exact, no re-encoding (so a tx body's txid hash is faithful).
   defp take(bin) do
     {:ok, _term, rest} = CBOR.decode(bin)
     span = byte_size(bin) - byte_size(rest)

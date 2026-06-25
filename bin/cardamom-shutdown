@@ -1,0 +1,11 @@
+#!/bin/sh
+# bin/cardamom-shutdown — convenience wrapper for the release's graceful stop (peers leave with
+# MsgDone → FIN via the supervision tree). Forwards all args.
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REL="$ROOT/_build/prod/rel/cardamom/bin/cardamom-shutdown"
+if [ ! -x "$REL" ]; then
+  echo "cardamom-shutdown: release not built. Run:  MIX_ENV=prod mix release --overwrite" >&2
+  exit 1
+fi
+exec "$REL" "$@"

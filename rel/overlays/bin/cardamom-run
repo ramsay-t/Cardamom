@@ -23,6 +23,7 @@ set -e
 
 PARAMS=""
 LOG_TAG=""
+PORT=""
 # Default to a backgrounded start. `console` is still allowed for interactive debugging (it
 # attaches an iex shell; stop it from there or with bin/cardamom-shutdown in another terminal).
 MODE="daemon"
@@ -31,6 +32,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -p|--params) PARAMS="$2"; shift 2 ;;
     -t|--log-tag) LOG_TAG="$2"; shift 2 ;;
+    -P|--port) PORT="$2"; shift 2 ;;
     daemon|daemon_iex|console) MODE="$1"; shift ;;
     start) echo "cardamom-run: foreground 'start' is not supported (Ctrl-C can't be made graceful); using daemon. Stop with bin/cardamom-shutdown." >&2; MODE="daemon"; shift ;;
     *) echo "cardamom-run: unknown argument '$1'" >&2; exit 2 ;;
@@ -38,7 +40,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$PARAMS" ]; then
-  echo "usage: cardamom-run -p <params-file> [-t <log-tag>] [daemon|console]" >&2
+  echo "usage: cardamom-run -p <params-file> [-t <log-tag>] [-P <ui-port>] [daemon|console]" >&2
   exit 2
 fi
 
@@ -58,7 +60,15 @@ if [ -n "$LOG_TAG" ]; then
   export CARDAMOM_SESSION
 fi
 
-echo "cardamom-run: params=$CARDAMOM_CONFIG mode=$MODE${LOG_TAG:+ log-tag=$LOG_TAG}"
+# Per-run UI port (overrides the file's `port` for THIS run) — so you can run a second instance,
+# or test on a different port, without editing the params file. Exported as CARDAMOM_PORT, which
+# the app prefers over the file when explicitly set.
+if [ -n "$PORT" ]; then
+  CARDAMOM_PORT="$PORT"
+  export CARDAMOM_PORT
+fi
+
+echo "cardamom-run: params=$CARDAMOM_CONFIG mode=$MODE${LOG_TAG:+ log-tag=$LOG_TAG}${PORT:+ port=$PORT}"
 "$DIR/cardamom" "$MODE"
 RC=$?
 

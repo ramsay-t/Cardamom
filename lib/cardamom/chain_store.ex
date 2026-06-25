@@ -37,7 +37,7 @@ defmodule Cardamom.ChainStore do
   use GenServer
 
   alias Cardamom.Store.{Cache, Header, Kv, Repo}
-  alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput, Peer}
+  alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput, Peer, BlockGraveyard}
   alias Cardamom.Store.Cached
   alias Cardamom.Ledger.Block
   import Ecto.Query
@@ -171,6 +171,65 @@ defmodule Cardamom.ChainStore do
   end
 
   @doc """
+  A cheap chain-data SUMMARY for the UI: how far body backfill has caught up with headers, and
+  the UTXO-set totals. All indexed counts. The headers-vs-bodies gap (shrinking live) is the
+  metronome's progress story; the txo totals are the UTxO engine's output.
+  """
+  def chain_summary do
+    headers = Repo.aggregate(Header, :count)
+    bodies = Repo.aggregate(BlockRow, :count)
+    pending = Repo.aggregate(from(b in BlockRow, where: b.txo_processed == false), :count)
+    txos = Repo.aggregate(Txo, :count)
+    unspent = Repo.aggregate(from(t in Txo, where: is_nil(t.spent_by)), :count)
+
+    %{
+      headers: headers,
+      bodies: bodies,
+      gap: max(headers - bodies, 0),
+      pending: pending,
+      txos: txos,
+      unspent: unspent,
+      spent: txos - unspent
+    }
+  end
+
+  @doc """
+  The most recent tx-bearing blocks (for the UI feed): `[%{block_no, slot, tx_count}]`, newest
+  first, up to `limit`. Empty blocks (the vast majority on early Preview) are excluded — the
+  feed shows where actual transaction activity happened.
+  """
+  def recent_tx_blocks(limit \\ 10) do
+    Repo.all(
+      from b in BlockRow,
+        where: b.tx_count > 0,
+        order_by: [desc: b.block_no],
+        limit: ^limit,
+        select: %{block_no: b.block_no, slot: b.slot, tx_count: b.tx_count}
+    )
+  end
+
+  @doc """
+  The NEXT run of header points (`[[slot, hash], ...]`, slot-ordered, up to `limit`) whose
+  block body we DON'T have yet — i.e. headers ahead of our body coverage. The metronome body-
+  fetcher feeds these straight to `get_blocks/1` (which range-fetches consecutive misses). A
+  LEFT JOIN headers→blocks where the block is absent; capped so one tick fetches at most one
+  500-block range. Returns [] when bodies have caught up to headers.
+  """
+  def headers_missing_bodies(limit \\ 500) do
+    import Ecto.Query
+
+    Repo.all(
+      from h in Header,
+        left_join: b in BlockRow,
+        on: b.hash == h.hash,
+        where: is_nil(b.hash),
+        order_by: [asc: h.slot],
+        limit: ^limit,
+        select: [h.slot, h.hash]
+    )
+  end
+
+  @doc """
   Get a list of blocks for the given POINTS (`[[slot, hash], ...]`), fetching any we
   don't have. Returns a list (request order) of SELF-DESCRIBING results — each
   carries its own point/block so the caller can act without re-correlating to the
@@ -277,7 +336,11 @@ defmodule Cardamom.ChainStore do
             # unverified bytes — Harvard boundary). Idempotent, so re-fetching a block is
             # safe. This is what feeds goal (b) — the live UTxO set + mempool — from real
             # block data.
-            process_block(blk.raw)
+            # Extract TXOs + complete: mark done if fully resolved, else a per-block watcher
+            # marks done only when its deferred cross-block spends ALL resolve (so txo_processed
+            # is truthful — every spend applied, not "retriers spawned"). A crash leaves the
+            # block false → the reconciler re-derives + re-watches it.
+            extract_block(blk.hash, blk.raw, blk.header.slot)
 
             # FINISH-time event: decoded + verified + stored, with real detail (the
             # UI/log shows the block landing, not just bytes arriving).
@@ -374,10 +437,11 @@ defmodule Cardamom.ChainStore do
   spent_by reflects only what we've seen; for an observer answering "current state",
   that's correct and converges as more blocks are processed.
   """
-  def process_block(raw) when is_binary(raw) do
+  def process_block(raw, slot \\ nil) when is_binary(raw) do
     # Route by era: the `[era, inner]` envelope carries the tag, so Block.txs_in/1 reads it and
     # dispatches Byron (era 0) vs the Shelley-family decoder (eras 1-7). Both normalise to the
-    # same tx/output shape, so the two-phase UTxO update below is era-uniform.
+    # same tx/output shape, so the two-phase UTxO update below is era-uniform. `slot` is the
+    # block's slot, stamped onto each txo (created_slot / spent_slot) so a reorg can roll it back.
     with {:ok, txs} <- Block.txs_in(raw) do
       # TWO PHASES, matching the Agda block-level rule newUtxo = (utxo ∣ ins ᶜ) ∪ outs
       # computed over the WHOLE block: union ALL this block's outputs FIRST, then apply
@@ -386,24 +450,77 @@ defmodule Cardamom.ChainStore do
       # any spend is resolved. They are "concurrent by virtue of being in this block"
       # (Ramsay's separation sense), so the two phases may each run in any order/parallel;
       # only the phase BOUNDARY (outputs-before-spends) is ordered.
-      Enum.each(txs, &create_outputs/1)
-      # Phase 2 spends; collect any whose target wasn't in the store. After phase 1,
-      # intra-block producers all exist, so a leftover :no_target here is a CROSS-block
-      # reference we don't have (unsynced) — verdict-free/unresolved, not an error to
-      # crash on. We log it so it's visible (could later feed an :unresolved record).
-      unresolved = Enum.flat_map(txs, &apply_spends/1)
-
-      if unresolved != [] do
-        require Logger
-        Logger.debug(fn -> "process_block: #{length(unresolved)} spend(s) had no in-store target (cross-block / unsynced)" end)
-      end
+      Enum.each(txs, &create_outputs(&1, slot))
+      # Phase 2 spends. After phase 1, intra-block producers all exist, so a leftover :no_target
+      # is a CROSS-block reference to a block we haven't ingested yet — NOT an error, just a spend
+      # we can't apply until backfill reaches the producer. We DON'T spawn anything per-spend: the
+      # block simply isn't fully extracted, so the caller leaves txo_processed=0 and the periodic
+      # RECONCILER re-runs process_block (idempotent) until the producer arrives and the spend
+      # lands. One retry loop (the reconciler's 30s sweep), not a pile of 1Hz per-block watchers.
+      deferred = Enum.flat_map(txs, &apply_spends(&1, slot))
 
       # MEMPOOL CASCADE: a block changes the UTxO set, so pending txs may now be unviable.
       # Idempotent + monotone (evictions only push toward terminal states), so this is
       # order-independent — safe under fully-parallel apply (the mailbox can pick any order).
       Enum.each(txs, &cascade_mempool/1)
-      :ok
+
+      # :ok = fully extracted (caller marks done). :deferred = some cross-block spend still awaits
+      # its producer → caller leaves the block txo_processed=0 for the reconciler to retry.
+      if deferred == [], do: :ok, else: :deferred
     end
+  end
+
+  @doc """
+  Extract a block's TXOs AND drive completion: run process_block, then mark the block done — but
+  ONLY if fully resolved. If a cross-block spend is still deferred, leave txo_processed=0 so the
+  periodic reconciler re-runs it once backfill reaches the producer (idempotent replay: outputs
+  UPSERT, already-applied spends no-op). The single "process + complete" entry used by the live
+  ingest path, the reconciler, and tests. `hash` is the block's (header) hash; `raw` its bytes.
+  """
+  def extract_block(hash, raw, slot \\ nil) when is_binary(hash) and is_binary(raw) do
+    case process_block(raw, slot) do
+      :ok -> mark_txo_processed(hash)
+      :deferred -> :ok
+    end
+  end
+
+  @doc "Flag a stored block's TXO extraction as complete (recovery ledger)."
+  def mark_txo_processed(hash) when is_binary(hash) do
+    import Ecto.Query
+    Repo.update_all(from(b in BlockRow, where: b.hash == ^hash), set: [txo_processed: true])
+    Cache.delete({:block, hash})
+    :ok
+  end
+
+  @doc """
+  Re-process every stored block whose TXOs were NOT fully extracted (txo_processed = false):
+  blocks interrupted by a crash mid-process, or pre-migration rows. Idempotent — process_block
+  is UPSERT outputs + fail-fast spends — so re-running a partially-done block just fills the
+  gaps and re-spawns any still-needed deferred-spend retriers. Returns the count re-processed.
+
+  This is the self-heal for dangling spends WITHOUT a durable pending table: the block's `raw`
+  is already stored, so re-processing is a free idempotent replay. Run on boot AND periodically.
+  """
+  def reconcile_unprocessed_blocks(limit \\ 1_000) do
+    import Ecto.Query
+
+    pending =
+      Repo.all(
+        from b in BlockRow,
+          where: b.txo_processed == false,
+          order_by: [asc: b.slot],
+          limit: ^limit,
+          select: {b.hash, b.raw, b.slot}
+      )
+
+    Enum.each(pending, fn {hash, raw, slot} ->
+      # Same "process + complete" as the live path (slot stamped for rollback). Re-processing is
+      # an idempotent replay (UPSERT outputs + fail-fast spends), so already-applied spends no-op;
+      # marks done only when fully resolved, else stays pending for the next reconcile tick.
+      extract_block(hash, raw, slot)
+    end)
+
+    length(pending)
   end
 
   # For one confirmed block tx: (1) if it was itself PENDING, it just confirmed → evict
@@ -434,32 +551,36 @@ defmodule Cardamom.ChainStore do
 
   # PHASE 1 — outputs. Valid tx: its normal outputs become unspent TXOs. Invalid tx
   # (phase-2 fail, Agda ~503): only its collateral_return is created (NOT normal outputs).
-  defp create_outputs(%{valid: true, txid: txid, outputs: outputs}) do
+  # `slot` is the block's slot, stamped as created_slot for rollback.
+  defp create_outputs(%{valid: true, txid: txid, outputs: outputs}, slot) do
     outputs
     |> Enum.with_index()
-    |> Enum.each(fn {out, ix} -> insert_txo(txid, ix, out) end)
+    |> Enum.each(fn {out, ix} -> insert_txo(txid, ix, out, slot) end)
   end
 
-  defp create_outputs(%{valid: false, txid: txid, collateral_return: ret}) do
-    if ret, do: insert_txo(txid, 0, ret)
+  defp create_outputs(%{valid: false, txid: txid, collateral_return: ret}, slot) do
+    if ret, do: insert_txo(txid, 0, ret, slot)
   end
 
   # PHASE 2 — spends. Valid tx (Agda ~488): its normal inputs are spent, spent_how
   # :tx_input. Invalid tx (~503): ONLY collateral is consumed, spent_how :collateral;
-  # normal inputs are NOT spent.
-  # Returns the list of inputs whose target TXO wasn't in the store (cross-block /
-  # unsynced — the caller treats these as unresolved, not errors).
-  defp apply_spends(%{valid: true, txid: txid, inputs: inputs}) do
-    spend_each(inputs, txid, :tx_input)
+  # normal inputs are NOT spent. `slot` stamped as spent_slot for rollback.
+  defp apply_spends(%{valid: true, txid: txid, inputs: inputs}, slot) do
+    spend_each(inputs, txid, :tx_input, slot)
   end
 
-  defp apply_spends(%{valid: false, txid: txid, collateral_inputs: collat}) do
-    spend_each(collat, txid, :collateral)
+  defp apply_spends(%{valid: false, txid: txid, collateral_inputs: collat}, slot) do
+    spend_each(collat, txid, :collateral, slot)
   end
 
-  defp spend_each(inputs, txid, how) do
+  # Apply each spend; RETURN the ones that couldn't apply (target not yet in store). A
+  # {:error, :no_target} is NOT an error for a confirmed block — the input MUST exist in a block
+  # we haven't ingested yet (cross-block / out-of-order backfill). The caller (process_block)
+  # treats a non-empty return as "deferred" → leaves the block txo_processed=0 → the periodic
+  # reconciler re-runs it until the producer arrives. mark_spent stays a dumb fail-fast store op.
+  defp spend_each(inputs, txid, how, slot) do
     Enum.flat_map(inputs, fn {src_txid, src_ix} ->
-      case mark_spent(src_txid, src_ix, txid, how) do
+      case mark_spent(src_txid, src_ix, txid, how, slot) do
         :ok -> []
         {:error, :no_target} -> [{src_txid, src_ix}]
       end
@@ -530,7 +651,7 @@ defmodule Cardamom.ChainStore do
   defp mints_ada?(n) when is_integer(n), do: n != 0
   defp mints_ada?(_other), do: false
 
-  defp insert_txo(txid, ix, out) do
+  defp insert_txo(txid, ix, out, slot) do
     {:ok, row} =
       %Txo{}
       |> Txo.changeset(%{
@@ -541,6 +662,39 @@ defmodule Cardamom.ChainStore do
         datum_hash: out.datum_hash,
         datum: encode_datum(out.datum),
         raw: out.raw,
+        created_txid: txid,
+        created_slot: slot,
+        spent_by: nil
+      })
+      |> Repo.insert(on_conflict: :replace_all, conflict_target: [:txid, :ix])
+
+    Cache.put({:txo, txid, ix}, row)
+    {:ok, row}
+  end
+
+  @doc """
+  Seed a GENESIS UTXO into the confirmed `txos` table: an initial-funds output that
+  exists in the genesis ledger state, not in any block body (so no block produces it).
+  Chain blocks spend these (e.g. Preview block 3 spends the Byron 30B-ADA genesis UTXO),
+  so they must be present BEFORE block ingestion for those spends to resolve.
+
+  Same store shape as `insert_txo/3` — UPSERT on (txid, ix) so re-seeding on reboot is
+  idempotent. Genesis outputs carry only an address + value (no datum/datum_hash). The
+  output's `created_txid` is the genesis pseudo-txid itself (it has no producing tx).
+  Returns `{:ok, row}`.
+  """
+  def insert_genesis_utxo(txid, ix, address, value)
+      when is_binary(txid) and is_integer(ix) and is_binary(address) and is_integer(value) do
+    {:ok, row} =
+      %Txo{}
+      |> Txo.changeset(%{
+        txid: txid,
+        ix: ix,
+        address: address,
+        value: value,
+        datum_hash: nil,
+        datum: nil,
+        raw: nil,
         created_txid: txid,
         spent_by: nil
       })
@@ -559,9 +713,10 @@ defmodule Cardamom.ChainStore do
   The store op stays dumb; recovery policy lives in the handler that knows which case it is.
   spent_how: :tx_input (normal valid spend) | :collateral (phase-2-fail penalty).
   """
-  def mark_spent(src_txid, src_ix, spender_txid, spent_how) do
+  def mark_spent(src_txid, src_ix, spender_txid, spent_how, slot \\ nil) do
     # A TXO is a single entity keyed (txid, ix) — look it up, spend it if present. (Not
-    # an update_all-and-count-rows: that treats a known singleton as a bulk op.)
+    # an update_all-and-count-rows: that treats a known singleton as a bulk op.) `slot` is the
+    # SPENDING block's slot, stamped as spent_slot so a rollback past it can resurrect this UTXO.
     case Repo.get_by(Txo, txid: src_txid, ix: src_ix) do
       nil ->
         {:error, :no_target}
@@ -569,12 +724,75 @@ defmodule Cardamom.ChainStore do
       txo ->
         {:ok, _} =
           txo
-          |> Ecto.Changeset.change(spent_by: spender_txid, spent_how: Atom.to_string(spent_how))
+          |> Ecto.Changeset.change(
+            spent_by: spender_txid,
+            spent_how: Atom.to_string(spent_how),
+            spent_slot: slot
+          )
           |> Repo.update()
 
         Cache.delete({:txo, src_txid, src_ix})
         :ok
     end
+  end
+
+  @doc """
+  ROLLBACK the confirmed chain to `slot` (a reorg: the relay told us to roll back, a fork won).
+  Everything ABOVE `slot` is undone, in the order that keeps the UTxO set correct:
+
+    1. RESURRECT spent UTXOs whose SPEND was above the point — `spent_slot > slot` → back to
+       unspent (spent_by/spent_how/spent_slot → nil). The spend happened in a now-orphaned block,
+       so the UTXO is live again. (Ramsay's "spent UTXOs especially" — the resurrection case.)
+    2. DELETE outputs created above the point — `created_slot > slot` → they never existed on the
+       winning chain.
+    3. GRAVEYARD the orphaned blocks (slot > point) — move them out of `blocks` for forensics,
+       and mark them txo-unprocessed is moot (they're gone). Their headers stay (the forest
+       prunes its own view via Forest.Server.rollback).
+
+  Ordering matters: resurrect (1) BEFORE delete (2) — a UTXO created below P but spent above P
+  must be resurrected, not deleted; a UTXO created above P is deleted regardless of its spend.
+  Then caches for touched rows are cleared. Idempotent: rolling back to the same point twice is a
+  no-op (nothing left above it). Returns the count of {resurrected, deleted, graveyarded}.
+  """
+  def rollback(slot) when is_integer(slot) do
+    # 1. RESURRECT: un-spend UTXOs whose spend was in a rolled-back block.
+    {resurrected, _} =
+      Repo.update_all(
+        from(t in Txo, where: not is_nil(t.spent_slot) and t.spent_slot > ^slot),
+        set: [spent_by: nil, spent_how: nil, spent_slot: nil]
+      )
+
+    # 2. DELETE: outputs created in a rolled-back block never happened.
+    {deleted, _} = Repo.delete_all(from t in Txo, where: not is_nil(t.created_slot) and t.created_slot > ^slot)
+
+    # 3. GRAVEYARD: move orphaned blocks out of the live set, recording what we rolled back to.
+    orphaned = Repo.all(from b in BlockRow, where: b.slot > ^slot)
+
+    Enum.each(orphaned, fn b ->
+      %BlockGraveyard{}
+      |> BlockGraveyard.changeset(%{
+        hash: b.hash,
+        slot: b.slot,
+        block_no: b.block_no,
+        tx_count: b.tx_count,
+        raw: b.raw,
+        rolled_back_to_slot: slot
+      })
+      |> Repo.insert(on_conflict: :nothing, conflict_target: :hash)
+
+      Cache.delete({:block, b.hash})
+    end)
+
+    graveyarded = Repo.delete_all(from b in BlockRow, where: b.slot > ^slot) |> elem(0)
+
+    # The TXO cache holds individual rows by (txid, ix); the bulk resurrect/delete above bypassed
+    # it, so clear the cache wholesale to avoid serving stale spent/exists state after a rollback.
+    # (A rollback is rare; a full cache clear is cheap and unambiguous vs. tracking touched keys.)
+    Cache.delete_all()
+
+    require Logger
+    Logger.info("rollback to slot #{slot}: resurrected #{resurrected}, deleted #{deleted}, graveyarded #{graveyarded} block(s)")
+    {:ok, %{resurrected: resurrected, deleted: deleted, graveyarded: graveyarded}}
   end
 
   # Datums are arbitrary CBOR terms; persist as bytes (re-encode the decoded term). nil

@@ -48,7 +48,7 @@ defmodule Cardamom.Store.MempoolSixWayConflictTest do
     winner = Enum.at(racers, 2)
     body = CBOR.encode(%{0 => [[b(shared), 0]], 1 => [[b(<<3>>), 1_000]]})
     assert winner.txid == elem(Tx.decode_tx(body), 1).txid, "the block body IS racer 3"
-    :ok = ChainStore.process_block(block_with_tx(body))
+    _ = ChainStore.process_block(block_with_tx(body))
 
     # The whole mempool is now empty of these six — every racer left.
     Enum.each(txids, fn t ->

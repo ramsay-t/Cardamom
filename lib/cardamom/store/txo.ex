@@ -24,9 +24,17 @@ defmodule Cardamom.Store.Txo do
     field :spent_by, :binary
     # How it was consumed: "tx_input" (normal) | "collateral" (phase-2 penalty). null = unspent.
     field :spent_how, :string
+    # Slots for ROLLBACK: the block-slot this output was created in, and the block-slot it was
+    # spent in (null while unspent). A reorg to point P deletes created_slot>P and resurrects
+    # (un-spends) spent_slot>P. See ChainStore.rollback/1.
+    field :created_slot, :integer
+    field :spent_slot, :integer
   end
 
-  @fields [:txid, :ix, :address, :value, :datum_hash, :datum, :raw, :created_txid, :spent_by, :spent_how]
+  @fields [
+    :txid, :ix, :address, :value, :datum_hash, :datum, :raw,
+    :created_txid, :spent_by, :spent_how, :created_slot, :spent_slot
+  ]
   @required [:txid, :ix]
 
   def changeset(txo, attrs) do

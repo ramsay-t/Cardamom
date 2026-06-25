@@ -45,7 +45,15 @@ defmodule Cardamom.Config do
     # debug_raw_bytes: log the full hex of every wire payload at :debug. OFF by default — the
     # raw bytes are kept durably in the store (headers.raw etc.); these dumps are huge
     # (~38MB/2min). Turn on only for byte-level diagnosis / LogReplayPeer. See Cardamom.Debug.
-    debug_raw_bytes: false
+    debug_raw_bytes: false,
+    # fetch_bodies: proactively fetch block BODIES to catch up with headers (the metronome),
+    # building the full UTxO set. Default true. Set false for a headers-only / store-light boot.
+    fetch_bodies: true,
+    # genesis: paths to the network's genesis files, whose initial funds seed the UTxO set
+    # BEFORE block ingestion (chain blocks spend genesis UTXOs that no block produces — see
+    # Cardamom.Genesis). Both eras optional/nil: a network may have only one era's funds, or
+    # none configured (then nothing is seeded). Shape %{shelley: path | nil, byron: path | nil}.
+    genesis: %{shelley: nil, byron: nil}
   }
 
   @type t :: %{
@@ -58,6 +66,8 @@ defmodule Cardamom.Config do
           log_dir: String.t() | nil,
           connect: boolean(),
           debug_raw_bytes: boolean(),
+          fetch_bodies: boolean(),
+          genesis: %{shelley: String.t() | nil, byron: String.t() | nil},
           handshake: %{initiator_only: boolean(), peer_sharing: 0..1, query: boolean()},
           protocols: [atom()]
         }
@@ -94,6 +104,8 @@ defmodule Cardamom.Config do
     |> put_if(json, "log_dir", :log_dir)
     |> put_if(json, "connect", :connect)
     |> put_if(json, "debug_raw_bytes", :debug_raw_bytes)
+    |> put_if(json, "fetch_bodies", :fetch_bodies)
+    |> put_genesis(json["genesis"])
     |> put_handshake(json["handshake"])
     |> put_peer(json["first_peer"])
     |> put_protocols(json["protocols"])
@@ -112,6 +124,19 @@ defmodule Cardamom.Config do
   end
 
   defp put_handshake(acc, _), do: acc
+
+  # genesis JSON has string keys; map the two known era paths to atoms (closed set, no
+  # String.to_atom). Returned as a partial map; deep_merge fills the rest from defaults.
+  defp put_genesis(acc, %{} = g) do
+    paths =
+      %{}
+      |> maybe_flag(g, "shelley", :shelley)
+      |> maybe_flag(g, "byron", :byron)
+
+    if paths == %{}, do: acc, else: Map.put(acc, :genesis, paths)
+  end
+
+  defp put_genesis(acc, _), do: acc
 
   defp maybe_flag(into, src, str_key, atom_key) do
     case Map.fetch(src, str_key) do
@@ -142,7 +167,7 @@ defmodule Cardamom.Config do
 
   # opts (keyword) → only the config keys we recognise.
   defp opts_map(opts) do
-    Map.new(Keyword.take(opts, [:network, :first_peer, :db, :data_dir, :port, :log_tag, :log_dir, :connect, :debug_raw_bytes, :handshake, :protocols]))
+    Map.new(Keyword.take(opts, [:network, :first_peer, :db, :data_dir, :port, :log_tag, :log_dir, :connect, :debug_raw_bytes, :fetch_bodies, :genesis, :handshake, :protocols]))
   end
 
   # Merge override onto base, deep-merging the nested :handshake map so a partial file
@@ -150,6 +175,7 @@ defmodule Cardamom.Config do
   defp deep_merge(base, override) do
     Map.merge(base, override, fn
       :handshake, b, o when is_map(b) and is_map(o) -> Map.merge(b, o)
+      :genesis, b, o when is_map(b) and is_map(o) -> Map.merge(b, o)
       _k, _b, o -> o
     end)
   end

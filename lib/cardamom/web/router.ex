@@ -39,6 +39,10 @@ defmodule Cardamom.Web.Router do
     json(conn, forest_view())
   end
 
+  get "/chaindata.json" do
+    json(conn, chaindata_view())
+  end
+
   match _ do
     send_resp(conn, 404, "not found")
   end
@@ -74,6 +78,18 @@ defmodule Cardamom.Web.Router do
   defp short(h) when is_binary(h), do: Base.encode16(h, case: :lower) |> String.slice(0, 12)
   defp short(h), do: inspect(h)
 
+  # Chain-data view: the body-backfill progress (headers vs bodies gap) + UTXO-set totals +
+  # the recent tx-bearing blocks. Empty view if the store isn't up (e.g. early boot).
+  defp chaindata_view do
+    if Process.whereis(Cardamom.ChainStore) do
+      Map.put(Cardamom.ChainStore.chain_summary(), :recent_txs, Cardamom.ChainStore.recent_tx_blocks(10))
+    else
+      %{headers: 0, bodies: 0, gap: 0, pending: 0, txos: 0, unspent: 0, spent: 0, recent_txs: []}
+    end
+  rescue
+    _ -> %{headers: 0, bodies: 0, gap: 0, pending: 0, txos: 0, unspent: 0, spent: 0, recent_txs: []}
+  end
+
   defp page do
     """
     <!doctype html>
@@ -99,6 +115,8 @@ defmodule Cardamom.Web.Router do
         .side { flex:0 0 380px; min-width:360px; }
         .side pre { max-height:none; }
         #forest { max-height:70vh; overflow:auto; }
+        .bar { background:#222; border:1px solid #333; height:10px; margin:.3rem 0 .8rem; border-radius:3px; overflow:hidden; }
+        .bar-fill { background:#8fd; height:100%; width:0%; transition:width .5s; }
       </style>
     </head>
     <body>
@@ -112,6 +130,13 @@ defmodule Cardamom.Web.Router do
       <div class="cols">
         <!-- LEFT: the wide / log-heavy stuff, gets the flexible space -->
         <div class="main">
+          <h2>Chain data <span class="meta" id="backfill-summary"></span></h2>
+          <div id="chaindata"></div>
+          <div class="bar"><div class="bar-fill" id="backfill-bar"></div></div>
+          <table id="recenttxs"><thead><tr>
+            <th>block</th><th>slot</th><th>txs</th>
+          </tr></thead><tbody></tbody></table>
+
           <h2>Network topology — open connections</h2>
           <table id="peers"><thead><tr>
             <th>address</th><th>dir</th><th>ver</th><th>name</th><th>protocols (activity)</th>
@@ -211,6 +236,24 @@ defmodule Cardamom.Web.Router do
                   '  nodes ' + fv.node_count + '  forks ' + fv.forks + '  floating ' + fv.floating
                 : '(empty)';
             document.getElementById('forest').textContent = renderForest(fv.rows);
+
+            const cd = await (await fetch('/chaindata.json')).json();
+            const pct = cd.headers > 0 ? Math.floor(100 * cd.bodies / cd.headers) : 0;
+            document.getElementById('backfill-summary').textContent =
+              'bodies ' + cd.bodies + ' / headers ' + cd.headers +
+              (cd.gap > 0 ? '  (' + cd.gap + ' behind)' : '  (caught up)');
+            document.getElementById('backfill-bar').style.width = pct + '%';
+            document.getElementById('chaindata').innerHTML =
+              '<span class="stat">bodies <span class="num">' + cd.bodies + '</span></span>' +
+              '<span class="stat">gap <span class="num">' + cd.gap + '</span></span>' +
+              '<span class="stat">pending <span class="num">' + cd.pending + '</span></span>' +
+              '<span class="stat">UTXOs <span class="num">' + cd.txos + '</span></span>' +
+              '<span class="stat">unspent <span class="num">' + cd.unspent + '</span></span>' +
+              '<span class="stat">spent <span class="num">' + cd.spent + '</span></span>';
+            document.querySelector('#recenttxs tbody').innerHTML = (cd.recent_txs || []).map(function(t){
+              return '<tr><td>' + t.block_no + '</td><td class="meta">' + t.slot +
+                     '</td><td>' + t.tx_count + '</td></tr>';
+            }).join('') || '<tr><td colspan="3" class="meta">no transactions seen yet</td></tr>';
 
             const procs = (await (await fetch('/processes.json')).json()).processes;
             document.querySelector('#procs tbody').innerHTML = procs.map(function(p){

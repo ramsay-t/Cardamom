@@ -180,6 +180,16 @@ defmodule Cardamom.BlockFetch.Client do
   defp on_msg({:block, wrapped}, %{req: %{} = req} = state) do
     case unwrap(wrapped) do
       {:ok, raw} ->
+        # Optional raw-byte capture of the COMPLETE block (tagged :raw_bytes; dropped by the
+        # file handler unless raw-byte logging is on — see Cardamom.Debug). Logged at the
+        # WHOLE-block level (post-reassembly), so it's a complete, replayable capture — and the
+        # no-truncation/no-burst-drop file handler now keeps it intact (the old 8192 truncation
+        # that made this useless is gone). This is how we capture a REAL Praos block to fixture.
+        Logger.debug(
+          fn -> "block_fetch raw block: " <> Base.encode16(raw, case: :lower) end,
+          Cardamom.Debug.tag()
+        )
+
         # SPAWN-time event: a block's bytes arrived, handing it to a decode handler.
         emit("BlockReceived", %{bytes: byte_size(raw)}, state)
         # Hand the block to its sink in its OWN process; it signals back when done so

@@ -9,6 +9,11 @@
   "log_tag": "preview",
   "connect": true,
   "debug_raw_bytes": false,
+  "fetch_bodies": true,
+  "genesis": {
+    "shelley": "/Users/ramsay/GoogleDrive/IOHK/preview-config/shelley-genesis.json",
+    "byron": "/Users/ramsay/GoogleDrive/IOHK/preview-config/byron-genesis.json"
+  },
   "handshake": { "initiator_only": true, "peer_sharing": 0, "query": false },
   "protocols": ["chain_sync", "keep_alive", "block_fetch"]
 }

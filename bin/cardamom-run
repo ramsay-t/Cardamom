@@ -1,0 +1,15 @@
+#!/bin/sh
+# bin/cardamom-run — convenience wrapper so you can type `bin/cardamom-run -p preview.params`
+# from the repo root instead of the full _build path. Forwards all args to the RELEASE's
+# cardamom-run (which starts the node as a daemon from a params file).
+#
+# The release lives under _build (gitignored), so build it first with `mix release`. We give a
+# friendly error rather than a confusing "not found" if it isn't there yet.
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REL="$ROOT/_build/prod/rel/cardamom/bin/cardamom-run"
+if [ ! -x "$REL" ]; then
+  echo "cardamom-run: release not built. Run:  MIX_ENV=prod mix release --overwrite" >&2
+  exit 1
+fi
+exec "$REL" "$@"

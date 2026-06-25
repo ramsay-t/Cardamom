@@ -37,7 +37,7 @@ defmodule Cardamom.Store.TxoTest do
   end
 
   test "processing a block stores its outputs as unspent TXOs, resolvable by (txid, ix)" do
-    :ok = ChainStore.process_block(fixture(3))
+    _ = ChainStore.process_block(fixture(3))
 
     t3 = txid(3)
     assert %{spent_by: nil, value: v} = ChainStore.txo(t3, 0)
@@ -47,11 +47,11 @@ defmodule Cardamom.Store.TxoTest do
   end
 
   test "the headline: block 16 spends block 3's output 0; both sets of TXOs are correct" do
-    :ok = ChainStore.process_block(fixture(3))
+    _ = ChainStore.process_block(fixture(3))
     t3 = txid(3)
     assert %{spent_by: nil} = ChainStore.txo(t3, 0), "block 3's output starts unspent"
 
-    :ok = ChainStore.process_block(fixture(16))
+    _ = ChainStore.process_block(fixture(16))
     t16 = txid(16)
 
     # Block 3's output 0 is now SPENT, by block 16's tx.
@@ -63,8 +63,8 @@ defmodule Cardamom.Store.TxoTest do
   end
 
   test "a valid spend records spent_how :tx_input" do
-    :ok = ChainStore.process_block(fixture(3))
-    :ok = ChainStore.process_block(fixture(16))
+    _ = ChainStore.process_block(fixture(3))
+    _ = ChainStore.process_block(fixture(16))
     assert %{spent_how: "tx_input"} = ChainStore.txo(txid(3), 0)
   end
 
@@ -91,7 +91,7 @@ defmodule Cardamom.Store.TxoTest do
     block = block_with([invalid_tx], [0])
     {:ok, [decoded]} = Tx.txs_in(block)
     spender = decoded.txid
-    :ok = ChainStore.process_block(block)
+    _ = ChainStore.process_block(block)
 
     # Collateral WAS consumed, spent_how :collateral.
     assert %{spent_by: ^spender, spent_how: "collateral"} = ChainStore.txo(collat_in, 0)
@@ -108,7 +108,7 @@ defmodule Cardamom.Store.TxoTest do
     tx = %{0 => [[bytes.(<<1::256>>), 0]], 1 => [%{0 => bytes.(<<9>>), 1 => 42, 2 => [1, inline]}]}
     block = block_with([tx], [])
     {:ok, [decoded]} = Tx.txs_in(block)
-    :ok = ChainStore.process_block(block)
+    _ = ChainStore.process_block(block)
 
     row = ChainStore.txo(decoded.txid, 0)
     assert row != nil
@@ -118,8 +118,8 @@ defmodule Cardamom.Store.TxoTest do
   end
 
   test "the UTXO set (unspent only) excludes spent outputs" do
-    :ok = ChainStore.process_block(fixture(3))
-    :ok = ChainStore.process_block(fixture(16))
+    _ = ChainStore.process_block(fixture(3))
+    _ = ChainStore.process_block(fixture(16))
 
     t3 = txid(3)
     t16 = txid(16)
@@ -131,7 +131,7 @@ defmodule Cardamom.Store.TxoTest do
 
   test "resolving an input whose source block isn't processed yet → unresolved (nil), not error" do
     # Process ONLY block 16. Its input references block 3's txid, which we haven't seen.
-    :ok = ChainStore.process_block(fixture(16))
+    _ = ChainStore.process_block(fixture(16))
     t3 = txid(3)
 
     # The spent output simply isn't in our index yet — verdict-free, like an orphan

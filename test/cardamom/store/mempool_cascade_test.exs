@@ -56,7 +56,7 @@ defmodule Cardamom.Store.MempoolCascadeTest do
     survivor = pending([{<<9::256>>, 0}])
 
     # A block spends UTxO <<1>>#0 (the input `doomed` wanted). It is now out-competed.
-    :ok = ChainStore.process_block(block_spending([{<<1::256>>, 0}]))
+    _ = ChainStore.process_block(block_spending([{<<1::256>>, 0}]))
 
     assert ChainStore.mempool_txo(doomed, 0) == nil, "the out-competed tx leaves the mempool"
     assert [%{reason: "inputs_spent"}] = ChainStore.mempool_graveyard(doomed) |> Enum.filter(&(&1.ix == 0))
@@ -70,7 +70,7 @@ defmodule Cardamom.Store.MempoolCascadeTest do
 
     # The block spends <<4>>#0 — a UTxO `reader` only REFERENCES. A spent refInput can't
     # be read, so the reader is invalidated too.
-    :ok = ChainStore.process_block(block_spending([{<<4::256>>, 0}]))
+    _ = ChainStore.process_block(block_spending([{<<4::256>>, 0}]))
 
     assert ChainStore.mempool_txo(reader, 0) == nil, "a reader whose refInput was spent is evicted"
   end
@@ -83,7 +83,7 @@ defmodule Cardamom.Store.MempoolCascadeTest do
 
     inner = <<0x85>> <> CBOR.encode(%{}) <> CBOR.encode([body]) <> CBOR.encode([]) <> CBOR.encode([]) <> CBOR.encode([])
     block = <<0x82>> <> CBOR.encode(4) <> inner
-    :ok = ChainStore.process_block(block)
+    _ = ChainStore.process_block(block)
 
     assert ChainStore.mempool_txo(tx.txid, 0) == nil, "confirmed tx leaves the live mempool"
     assert [%{reason: "in_block"}] = ChainStore.mempool_graveyard(tx.txid) |> Enum.filter(&(&1.ix == 0))
@@ -92,8 +92,8 @@ defmodule Cardamom.Store.MempoolCascadeTest do
   test "the cascade is idempotent: re-processing the same block doesn't error" do
     doomed = pending([{<<1::256>>, 0}])
     block = block_spending([{<<1::256>>, 0}])
-    :ok = ChainStore.process_block(block)
-    :ok = ChainStore.process_block(block)
+    _ = ChainStore.process_block(block)
+    _ = ChainStore.process_block(block)
     assert ChainStore.mempool_txo(doomed, 0) == nil
   end
 end

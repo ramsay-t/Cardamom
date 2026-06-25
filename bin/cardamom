@@ -1,0 +1,11 @@
+#!/bin/sh
+# bin/cardamom — convenience wrapper for the raw release control script (start, stop, remote,
+# rpc, pid, eval, …). Forwards all args. E.g.  bin/cardamom remote   /   bin/cardamom stop
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REL="$ROOT/_build/prod/rel/cardamom/bin/cardamom"
+if [ ! -x "$REL" ]; then
+  echo "cardamom: release not built. Run:  MIX_ENV=prod mix release --overwrite" >&2
+  exit 1
+fi
+exec "$REL" "$@"

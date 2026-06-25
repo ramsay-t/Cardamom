@@ -21,6 +21,7 @@ defmodule Cardamom.Ledger.Conway.BlockTest do
     assert decoded.raw == blk.raw, "verbatim bytes kept"
   end
 
+
   test "verify_body PASSES for a genuine block (body matches header commitment)" do
     blk = BlockBuilder.build(block_number: 5, slot: 500, tx_count: 2)
     {:ok, decoded} = Block.decode(blk.raw)

@@ -60,7 +60,7 @@ defmodule Cardamom.Store.MempoolDoubleSpendTest do
 
     # The next block contains tx_a (it won the race). Process it.
     body_a = CBOR.encode(%{0 => [[b(shared), 0]], 1 => [[b(<<0xA1>>), 1_000]]})
-    :ok = ChainStore.process_block(block_with_tx(body_a))
+    _ = ChainStore.process_block(block_with_tx(body_a))
 
     # Resolve by matching hashes: tx_a confirmed (:in_block); tx_b out-competed (:inputs_spent).
     assert ChainStore.mempool_txo(tx_a.txid, 0) == nil, "the winner left the mempool"
@@ -92,7 +92,7 @@ defmodule Cardamom.Store.MempoolDoubleSpendTest do
 
     # The block confirms tx_b this time.
     body_b = CBOR.encode(%{0 => [[b(shared), 0]], 1 => [[b(<<0xB2>>), 1_000]]})
-    :ok = ChainStore.process_block(block_with_tx(body_b))
+    _ = ChainStore.process_block(block_with_tx(body_b))
 
     # Verdicts must be SWAPPED vs the first test.
     assert [%{reason: "in_block"}] =
@@ -120,7 +120,7 @@ defmodule Cardamom.Store.MempoolDoubleSpendTest do
       :ok = ChainStore.put_mempool_tx(tx_lose)
 
       body = CBOR.encode(%{0 => [[b(shared), 0]], 1 => [[b(unquote(winner_marker)), 1_000]]})
-      :ok = ChainStore.process_block(block_with_tx(body))
+      _ = ChainStore.process_block(block_with_tx(body))
 
       assert [%{reason: "in_block"}] = ChainStore.mempool_graveyard(tx_win.txid) |> Enum.filter(&(&1.ix == 0))
       assert [%{reason: "inputs_spent"}] = ChainStore.mempool_graveyard(tx_lose.txid) |> Enum.filter(&(&1.ix == 0))

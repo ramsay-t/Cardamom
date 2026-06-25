@@ -1,0 +1,11 @@
+#!/bin/sh
+# bin/cardamom-migrate — convenience wrapper for the release's DB migration step (applies
+# pending Ecto migrations against the network's durable store). Forwards all args.
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REL="$ROOT/_build/prod/rel/cardamom/bin/cardamom-migrate"
+if [ ! -x "$REL" ]; then
+  echo "cardamom-migrate: release not built. Run:  MIX_ENV=prod mix release --overwrite" >&2
+  exit 1
+fi
+exec "$REL" "$@"

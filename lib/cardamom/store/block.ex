@@ -15,9 +15,13 @@ defmodule Cardamom.Store.Block do
     field :block_no, :integer
     field :tx_count, :integer
     field :raw, :binary
+    # True once this block's txs have been fully extracted into the TXO engine. Drives crash
+    # recovery: un-processed blocks are re-run on boot / by the reconciler (deferred-spend
+    # retriers don't survive a restart, so this is how dangling spends self-heal).
+    field :txo_processed, :boolean, default: false
   end
 
-  @fields [:hash, :slot, :block_no, :tx_count, :raw]
+  @fields [:hash, :slot, :block_no, :tx_count, :raw, :txo_processed]
   @required [:hash, :raw]
 
   def changeset(block, attrs) do

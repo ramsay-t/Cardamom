@@ -42,10 +42,25 @@ defmodule Cardamom.Application do
         # Supervises live peer sessions so they shut down GRACEFULLY (MsgDone → FIN) on
         # app stop. Before the Connector so a boot-dialed session has a home.
         Cardamom.PeerSupervisor,
+        # Seed the initial UTXO set from the network's genesis files (initial funds that no
+        # block produces, e.g. Preview's Byron 30B-ADA fund that block 3 spends). One-shot,
+        # idempotent (UPSERT). After ChainStore (it writes through it) and BEFORE the reconciler
+        # /Connector/BodyFetcher so those genesis UTXOs exist before any block spend resolves
+        # against them. Skipped in :test (tests drive Genesis.load directly).
+        genesis_seeder(),
+        # Self-heals the TXO set: re-processes any stored block whose spends didn't fully
+        # resolve (deferred-spend retriers die on restart). Boot sweep + periodic reconcile.
+        # After the store is up; skipped in :test. Before the Connector so recovery runs before
+        # new blocks stream in.
+        reconciler(),
         # Dials the boot peer from the params file (connect: true) — what makes a RELEASE
         # actually connect. Last in the tree so the store/forest/control are up first.
         # Skipped in :test (tests dial explicitly).
-        connector()
+        connector(),
+        # The metronome: proactively fetches block BODIES to catch up with HEADERS (range
+        # requests, up to 500/tick) so the full UTxO set is built. After the Connector so a
+        # peer channel exists to fetch from. Config :fetch_bodies (default on); skipped in :test.
+        body_fetcher()
       ]
       |> Enum.reject(&is_nil/1)
       |> Kernel.++(dev_only())
@@ -73,6 +88,26 @@ defmodule Cardamom.Application do
     if Application.get_env(:cardamom, :env) == :test, do: nil, else: Cardamom.Connector
   end
 
+  # TXO self-heal sweeper, outside :test (tests drive ChainStore directly).
+  defp reconciler do
+    if Application.get_env(:cardamom, :env) == :test, do: nil, else: Cardamom.Reconciler
+  end
+
+  # One-shot genesis UTXO seeder, outside :test (tests drive Cardamom.Genesis.load directly).
+  defp genesis_seeder do
+    if Application.get_env(:cardamom, :env) == :test, do: nil, else: Cardamom.Genesis.Seeder
+  end
+
+  # Proactive body-fetch metronome. Off in :test; outside :test honour :fetch_bodies (default
+  # true) so a deployment can run headers-only by setting it false.
+  defp body_fetcher do
+    cond do
+      Application.get_env(:cardamom, :env) == :test -> nil
+      Application.get_env(:cardamom, :fetch_bodies, true) == false -> nil
+      true -> Cardamom.BodyFetcher
+    end
+  end
+
   # The network magic is known at BOOT (config: CARDAMOM_CONFIG file, else default =
   # Preview/2) — the SAME value we send in the handshake on connect. Bind the durable
   # store to its magic-tagged file from that one value: data/forest-<magic>.db. So
@@ -94,6 +129,10 @@ defmodule Cardamom.Application do
     # data_dir from the params file (if set) wins — so one -p file fully locates the DB.
     if cfg.data_dir, do: Application.put_env(:cardamom, :data_dir, cfg.data_dir)
 
+    # Surface the params-file `fetch_bodies` toggle as app env so body_fetcher/0 (which builds
+    # the child spec just after this runs) sees it. Defaults true.
+    Application.put_env(:cardamom, :fetch_bodies, cfg.fetch_bodies != false)
+
     path = Cardamom.Store.Repo.db_path(cfg.network)
     repo_cfg = Application.get_env(:cardamom, Cardamom.Store.Repo, [])
     Application.put_env(:cardamom, Cardamom.Store.Repo, Keyword.put(repo_cfg, :database, path))
@@ -102,18 +141,26 @@ defmodule Cardamom.Application do
     path
   end
 
-  # UI port precedence: params-file `port` > CARDAMOM_PORT env > 4001. (In :test we keep
-  # the env/default to avoid a file resolve during the test run.)
+  # UI port precedence (most specific first): app-env :ui_port (test sets 0 = ephemeral, never
+  # clashes) > CARDAMOM_PORT env (the -P/--port CLI flag sets this — an explicit per-run override)
+  # > params-file `port` > 4001. The env-over-file order lets `bin/cardamom-run -P 4002` run a
+  # second instance without editing the file; the app-env override lets `mix test` run alongside
+  # a live node.
   defp ui_port do
-    from_file =
-      if Application.get_env(:cardamom, :env) != :test do
-        case Cardamom.Config.resolve(config_opts()) do
-          {:ok, %{port: p}} when is_integer(p) -> p
-          _ -> nil
-        end
-      end
+    cond do
+      is_integer(Application.get_env(:cardamom, :ui_port)) -> Application.get_env(:cardamom, :ui_port)
+      env_port = System.get_env("CARDAMOM_PORT") -> String.to_integer(env_port)
+      true -> port_from_file() || 4001
+    end
+  end
 
-    from_file || String.to_integer(System.get_env("CARDAMOM_PORT", "4001"))
+  defp port_from_file do
+    if Application.get_env(:cardamom, :env) != :test do
+      case Cardamom.Config.resolve(config_opts()) do
+        {:ok, %{port: p}} when is_integer(p) -> p
+        _ -> nil
+      end
+    end
   end
 
   defp config_opts do

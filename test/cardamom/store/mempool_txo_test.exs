@@ -54,7 +54,7 @@ defmodule Cardamom.Store.MempoolTxoTest do
 
   test "JOIN: a pending tx spending a CONFIRMED utxo can be validated against the chain" do
     # Confirm block 3 → its output 0 is a real on-chain UTXO.
-    :ok = ChainStore.process_block(fixture(3))
+    _ = ChainStore.process_block(fixture(3))
     t3 = tx(3)
 
     # Block 16's tx is "pending" in the mempool; it spends t3#0 (a confirmed UTXO).
@@ -103,7 +103,7 @@ defmodule Cardamom.Store.MempoolTxoTest do
 
     # The tx lands in a block (here, block 16 IS that block) → process_block promotes it
     # into the confirmed txos table. The mempool entry can then be dropped (confirmed).
-    :ok = ChainStore.process_block(fixture(16))
+    _ = ChainStore.process_block(fixture(16))
     assert %{spent_by: nil} = ChainStore.txo(t.txid, 0), "now confirmed on chain"
 
     :ok = ChainStore.drop_mempool_tx(t.txid, :confirmed)

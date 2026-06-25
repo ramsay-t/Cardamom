@@ -51,8 +51,8 @@ defmodule Cardamom.Ledger.Conway.Block do
   """
   @spec decode(binary()) :: {:ok, t()} | {:error, term()}
   def decode(raw) when is_binary(raw) do
-    with {:ok, [hdr_bytes, bodies_b, _wits_b, _aux_b, _invalid_b]} <- segments(raw),
-         {:ok, header} <- Header.decode(hdr_bytes),
+    with {:ok, era, [hdr_bytes, bodies_b, _wits_b, _aux_b, _invalid_b]} <- segments(raw),
+         {:ok, header} <- Cardamom.Ledger.Header.decode(era, hdr_bytes),
          {:ok, tx_count} <- count_txs(bodies_b) do
       {:ok,
        %__MODULE__{
@@ -73,7 +73,7 @@ defmodule Cardamom.Ledger.Conway.Block do
   """
   @spec verify_body(t()) :: :ok | {:error, term()}
   def verify_body(%__MODULE__{raw: raw, header: header}) do
-    with {:ok, [_hdr, bodies_b, wits_b, aux_b, invalid_b]} <- segments(raw) do
+    with {:ok, _era, [_hdr, bodies_b, wits_b, aux_b, invalid_b]} <- segments(raw) do
       computed =
         Crypto.blake2b_256(
           Crypto.blake2b_256(bodies_b) <>
@@ -100,14 +100,14 @@ defmodule Cardamom.Ledger.Conway.Block do
   # segments (the era wrapper isn't part of it). Also accept a BARE inner block (no
   # era wrapper) for SimPeer/older shapes.
   defp segments(raw) do
-    with {:ok, inner} <- unwrap_era(raw),
+    with {:ok, era, inner} <- unwrap_era(raw),
          {:ok, rest0} <- array5_header(inner),
          {hdr, rest1} <- take(rest0),
          {bodies, rest2} <- take(rest1),
          {wits, rest3} <- take(rest2),
          {aux, rest4} <- take(rest3),
          {invalid, _rest5} <- take(rest4) do
-      {:ok, [hdr, bodies, wits, aux, invalid]}
+      {:ok, era, [hdr, bodies, wits, aux, invalid]}
     else
       _ -> {:error, :bad_block_structure}
     end
@@ -115,15 +115,16 @@ defmodule Cardamom.Ledger.Conway.Block do
     _ -> {:error, :bad_block_structure}
   end
 
-  # Strip the `[era, inner_block]` envelope, returning the inner block's ORIGINAL
-  # bytes. `82` = array(2): era int, then the inner block. If it's already a bare
-  # array(5) (`85...`), pass it through unchanged.
-  defp unwrap_era(<<0x85, _::binary>> = bare), do: {:ok, bare}
+  # Strip the `[era, inner_block]` envelope, returning `{era_tag, inner block ORIGINAL bytes}`.
+  # `82` = array(2): era int, then the inner block. A bare array(5) (`85...`, SimPeer/older
+  # shape) has no era tag — default to 4 (Alonzo/TPraos, the flat-15 header HeaderBuilder makes).
+  # The era tag selects which era's HEADER decoder runs on the inner header (Praos vs TPraos),
+  # which is what lets Praos-era blocks (5/6/7) be decoded + body-verified, not just TPraos ones.
+  defp unwrap_era(<<0x85, _::binary>> = bare), do: {:ok, 4, bare}
 
   defp unwrap_era(<<0x82, _::binary>> = wrapped) do
-    # [era, inner] — skip the array header + the era int, return the inner bytes.
-    {_inner_term, after_era} = era_skip(wrapped)
-    {:ok, after_era}
+    {era, after_era} = era_skip(wrapped)
+    {:ok, era, after_era}
   end
 
   defp unwrap_era(_), do: {:error, :not_block_envelope}

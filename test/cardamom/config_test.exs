@@ -96,6 +96,36 @@ defmodule Cardamom.ConfigTest do
     end
   end
 
+  describe "genesis file paths (seed the initial UTxO set)" do
+    test "default genesis is both eras nil (nothing seeded unless configured)" do
+      {:ok, cfg} = Config.resolve([])
+      assert cfg.genesis == %{shelley: nil, byron: nil}
+    end
+
+    test "a params file sets the genesis era paths" do
+      path = Path.join(System.tmp_dir!(), "cardamom_gen_#{System.unique_integer([:positive])}.json")
+
+      File.write!(
+        path,
+        ~s({"genesis": {"shelley": "/g/shelley-genesis.json", "byron": "/g/byron-genesis.json"}})
+      )
+
+      on_exit(fn -> File.rm(path) end)
+
+      {:ok, cfg} = Config.resolve(config_file: path)
+      assert cfg.genesis == %{shelley: "/g/shelley-genesis.json", byron: "/g/byron-genesis.json"}
+    end
+
+    test "a partial genesis (one era) keeps the other era's default (deep merge)" do
+      path = Path.join(System.tmp_dir!(), "cardamom_gen2_#{System.unique_integer([:positive])}.json")
+      File.write!(path, ~s({"genesis": {"byron": "/g/byron-genesis.json"}}))
+      on_exit(fn -> File.rm(path) end)
+
+      {:ok, cfg} = Config.resolve(config_file: path)
+      assert cfg.genesis == %{shelley: nil, byron: "/g/byron-genesis.json"}
+    end
+  end
+
   test "mainnet magic is refused even via config (safety rail)" do
     assert {:error, {:refused_mainnet, 764_824_073}} = Config.resolve(network: 764_824_073)
   end

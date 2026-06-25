@@ -112,6 +112,12 @@ defmodule Cardamom.ChainSync.Client do
 
   defp handle_msg({:roll_backward, point, tip}, state) do
     emit("RollBackward", %{point: describe(point), tip: describe(tip)}, state)
+    # A reorg: the relay told us to roll back to `point`. APPLY it — rewind both the forest (tip
+    # pointer) and the confirmed UTxO set (resurrect spends + delete outputs above the point, and
+    # graveyard the orphaned blocks). Without this we'd silently diverge from consensus at the tip
+    # (we'd keep state from blocks that are no longer on the winning chain). Best-effort: a missing
+    # store/forest (bare tests) is a no-op.
+    apply_rollback(point)
     request_next(state)
     state
   end
@@ -142,6 +148,22 @@ defmodule Cardamom.ChainSync.Client do
     emit("ChainSync", %{msg: inspect(other)}, state)
     state
   end
+
+  # Roll back the forest tip and the confirmed UTxO set to `point`'s slot. `point` is `[slot, hash]`
+  # (or origin = genesis). Resilient: each side guarded by whether its process is up.
+  defp apply_rollback(point) do
+    slot = rollback_slot(point)
+
+    if Process.whereis(Cardamom.Forest.Server), do: Cardamom.Forest.Server.rollback(point)
+    if slot && Process.whereis(Cardamom.ChainStore), do: Cardamom.ChainStore.rollback(slot)
+    :ok
+  rescue
+    e -> Logger.warning("rollback failed: #{inspect(e)}")
+  end
+
+  # Slot to roll the UTxO set back to. `[slot, _hash]` → slot; origin/genesis → 0 (roll back all).
+  defp rollback_slot([slot | _]) when is_integer(slot), do: slot
+  defp rollback_slot(_), do: 0
 
   defp request_next(state),
     do: Cardamom.Connection.send_frame(state.conn, @chain_sync, ChainSync.encode(:request_next))

@@ -67,4 +67,9 @@ if config_env() == :test do
     journal_mode: :wal,
     busy_timeout: 5_000,
     pool_size: 1
+
+  # UI port 0 = OS-assigned ephemeral, so the test app's Bandit NEVER clashes with a running
+  # node (which holds 4001) or a parallel test run — `mix test` can run alongside a live
+  # `bin/cardamom-run` instead of failing with :eaddrinuse. ui_port/0 reads this app env.
+  config :cardamom, :ui_port, 0
 end
