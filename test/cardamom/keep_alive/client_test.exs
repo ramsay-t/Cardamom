@@ -20,10 +20,10 @@ defmodule Cardamom.KeepAlive.ClientTest do
     :ok
   end
 
-  defp start_stack(interval_ms) do
+  defp start_stack(interval_ms, opts \\ []) do
     {client_end, peer_end} = Channel.Test.pair()
     {:ok, conn} = Connection.start_link(channel: client_end, peer: "scripted")
-    {:ok, ka} = KeepAlive.Client.start_link(conn: conn, interval_ms: interval_ms)
+    {:ok, ka} = KeepAlive.Client.start_link([conn: conn, interval_ms: interval_ms] ++ opts)
     {conn, ka, peer_end}
   end
 
@@ -72,5 +72,28 @@ defmodule Cardamom.KeepAlive.ClientTest do
     GenServer.stop(conn, :shutdown)
 
     assert_receive {:DOWN, ^ref, :process, ^ka, _reason}, 2_000
+  end
+
+  test "declares the peer DEAD after max_unacked unanswered pings (dead-air detection)" do
+    # Short interval, max_unacked 2: send NO responses → after 2 pings + the 3rd tick it stops.
+    {_conn, ka, _peer_end} = start_stack(30, max_unacked: 2)
+    ref = Process.monitor(ka)
+
+    # It pings, pings (unacked=2), then on the next tick (unacked >= max) declares death.
+    assert_receive {:DOWN, ^ref, :process, ^ka, {:shutdown, :keepalive_timeout}}, 2_000
+  end
+
+  test "a relay response RESETS the dead-peer counter (a recovering peer survives)" do
+    # max_unacked 2, but we keep answering, so it never trips.
+    {_conn, ka, peer_end} = start_stack(40, max_unacked: 2)
+
+    # Answer several pings: for each [0, c] we receive, the relay would respond [1, c].
+    for _ <- 1..5 do
+      assert [0, c] = recv_keepalive(peer_end)
+      :ok = Frame.send_msg(peer_end, @keep_alive, CBOR.encode([1, c]))
+    end
+
+    # Still alive — the responses kept unacked at 0.
+    assert Process.alive?(ka)
   end
 end
