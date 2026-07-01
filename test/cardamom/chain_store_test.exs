@@ -88,4 +88,24 @@ defmodule Cardamom.ChainStoreTest do
 
     assert ours == [9_000_001, 9_000_002, 9_000_003], "our headers come back slot-ordered"
   end
+
+  test "resume_point returns the HIGHEST stored header, not a stale kv tip" do
+    # The bug: on boot we resumed from the forest's kv tip, which could lag the stored headers
+    # (stale at block 492 while headers reached 208k) → chain-sync re-streamed from near genesis.
+    # resume_point must return the high-water header regardless of the kv tip.
+    low = hdr(%{slot: 100, block_no: 5})
+    high = hdr(%{slot: 5000, block_no: 205})
+    {:ok, _} = ChainStore.put_header(low)
+    {:ok, _} = ChainStore.put_header(high)
+
+    # A STALE kv tip pointing at the LOW header (simulating an interrupted earlier run).
+    :ok = ChainStore.put_tip(low.hash)
+
+    assert [5000, hash] = ChainStore.resume_point()
+    assert hash == high.hash, "resume from the highest stored header, ignoring the stale tip"
+  end
+
+  test "resume_point is nil with no stored headers (cold start → genesis)" do
+    assert ChainStore.resume_point() == nil
+  end
 end

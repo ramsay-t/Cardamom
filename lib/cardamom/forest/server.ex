@@ -81,15 +81,18 @@ defmodule Cardamom.Forest.Server do
     {:ok, %{forest: forest, last_tip: last_tip}}
   end
 
-  # The durable resume anchor as `{hex_hash, height}`, or nil for a cold start / no
-  # store. The resume tip is NOT genesis — it's block N — so we seed it at its real
-  # height (the stored header's block_no), NOT 0, else the forest forgets the chain's
-  # height and the next block connects at 1. Best-effort: absent in bare unit tests.
+  # The durable resume anchor as `{hex_hash, height}`, or nil for a cold start / no store.
+  # Anchored at the HIGHEST STORED HEADER — the SAME source chain-sync resumes from
+  # (ChainStore.resume_point), so the forest anchor and the FindIntersect point AGREE and the
+  # next header connects (not floats). Using the forest's kv tip here instead would leave the
+  # anchor stale (the block-492 bug) while chain-sync intersects at the real high-water header →
+  # mismatch → floating. Seed at the header's real height (block_no), not 0. Best-effort.
   defp boot_tip do
     with true <- Process.whereis(Cardamom.Store.Repo) != nil,
-         hash when is_binary(hash) <- Cardamom.ChainStore.get_tip(),
+         [slot, hash] when is_binary(hash) <- Cardamom.ChainStore.resume_point(),
          %Cardamom.Store.Header{block_no: h} when is_integer(h) <-
            Cardamom.ChainStore.get_header(hash) do
+      _ = slot
       {Base.encode16(hash, case: :lower), h}
     else
       _ -> nil

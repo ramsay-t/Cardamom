@@ -402,15 +402,21 @@ defmodule Cardamom.ChainStore do
   end
 
   @doc """
-  The resume point for chain-sync `FindIntersect`, as `[slot, hash]`, or nil if we
-  have no stored tip (cold start → sync from genesis). The tip hash is the forest's
-  judged best tip (`get_tip/0`); we join to its stored header for the slot.
+  The resume point for chain-sync `FindIntersect`, as `[slot, hash]`, or nil if we have no
+  stored headers (cold start → sync from genesis).
+
+  We resume from the HIGHEST STORED HEADER — the true high-water mark of what we've synced —
+  NOT the forest's judged `kv` tip. The kv tip can lag the stored headers (it's updated as the
+  forest connects blocks and can be left stale by a short/interrupted run), which would make us
+  re-stream headers we already have from near genesis (the block-492-stale-tip bug). The stored
+  headers are the authoritative record; FindIntersect from the highest one lets the relay roll us
+  back safely if it happens to be off a fork.
   """
   def resume_point do
-    with hash when is_binary(hash) <- get_tip(),
-         %Header{slot: slot} <- get_header(hash) do
-      [slot, hash]
-    else
+    import Ecto.Query
+
+    case Repo.one(from h in Header, order_by: [desc: h.slot], limit: 1, select: {h.slot, h.hash}) do
+      {slot, hash} when is_integer(slot) and is_binary(hash) -> [slot, hash]
       _ -> nil
     end
   end
