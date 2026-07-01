@@ -77,7 +77,6 @@ defmodule Cardamom.Store.CachedTest do
     end
 
     test "get_list read-through caches the list; invalidate_key re-reads" do
-      import Ecto.Query
       s = by_value_store()
       {:ok, _} = Repo.insert(%Txo{txid: <<10::256>>, ix: 0, value: 100})
 

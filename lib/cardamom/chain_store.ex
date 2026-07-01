@@ -550,7 +550,7 @@ defmodule Cardamom.ChainStore do
   end
 
   # PHASE 1 — outputs. Valid tx: its normal outputs become unspent TXOs. Invalid tx
-  # (phase-2 fail, Agda ~503): only its collateral_return is created (NOT normal outputs).
+  # (phase-2 fail): its NORMAL outputs are NOT created; only its collateral_return is.
   # `slot` is the block's slot, stamped as created_slot for rollback.
   defp create_outputs(%{valid: true, txid: txid, outputs: outputs}, slot) do
     outputs
@@ -558,8 +558,13 @@ defmodule Cardamom.ChainStore do
     |> Enum.each(fn {out, ix} -> insert_txo(txid, ix, out, slot) end)
   end
 
-  defp create_outputs(%{valid: false, txid: txid, collateral_return: ret}, slot) do
-    if ret, do: insert_txo(txid, 0, ret, slot)
+  defp create_outputs(%{valid: false, txid: txid, collateral_return: ret, outputs: outputs}, slot) do
+    # The collateral-return UTxO's index is `length(outputs)` — the count of the tx's DECLARED
+    # normal outputs (which aren't created for an invalid tx, but still consume index space).
+    # SPEC: Babbage/Collateral.hs collOuts → `txIxFromIntegral (length (outputs))`. We previously
+    # hardcoded index 0, so a later tx spending collateral-return at index N found nothing and its
+    # block stuck pending forever (found via Cardanoscan: an invalid tx's #1 = the 7₳ coll-return).
+    if ret, do: insert_txo(txid, length(outputs), ret, slot)
   end
 
   # PHASE 2 — spends. Valid tx (Agda ~488): its normal inputs are spent, spent_how

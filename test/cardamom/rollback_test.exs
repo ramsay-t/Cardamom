@@ -29,7 +29,7 @@ defmodule Cardamom.RollbackTest do
 
   test "rollback RESURRECTS a UTXO spent by an orphaned block" do
     # PRODUCER at slot 100: creates output (p_txid, 0).
-    {p_raw, p_txid, _} = producer = block_at(100, [], 7)
+    {_p_raw, p_txid, _} = producer = block_at(100, [], 7)
     extract(producer)
     assert %{spent_by: nil} = Repo.get_by(Txo, txid: p_txid, ix: 0), "producer output starts unspent"
 
