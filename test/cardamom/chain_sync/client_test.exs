@@ -101,6 +101,32 @@ defmodule Cardamom.ChainSync.ClientTest do
                     %{msg: "RollBackward", point: %{slot: 50}}}, 1_000
   end
 
+  test "the FIRST RollBackward is the cursor-set (NOT a reorg wipe); a later one IS a reorg" do
+    # REGRESSION: on resume/cold-start the producer's first RollBackward establishes the read
+    # cursor at the intersection — it must NOT trigger a UTxO rollback (that deleted all state
+    # above the intersection: the 136k-block wipe). The event tags the first one cursor_set:true.
+    capture_events("cs-cursorset")
+    {_conn, _cs, peer_end} = start_stack()
+    assert_receive {:telemetry, [:cardamom, :peer, :connected], _, %{peer: "scripted"}}, 1_000
+    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+
+    # 1st RollBackward → cursor-set (no reorg).
+    :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode({:roll_backward, [50, <<1::256>>], [123, <<2::256>>]}))
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _,
+                    %{msg: "RollBackward", cursor_set: true}}, 1_000
+    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+
+    # A RollForward advances us into streaming.
+    :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode({:roll_forward, :crypto.strong_rand_bytes(16), [124, <<0::256>>]}))
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollForward"}}, 1_000
+    {:ok, _, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
+
+    # 2nd RollBackward → a genuine reorg (NOT tagged cursor_set).
+    :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode({:roll_backward, [60, <<3::256>>], [124, <<4::256>>]}))
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollBackward"} = m}, 1_000
+    refute Map.get(m, :cursor_set), "a mid-stream RollBackward is a real reorg, not a cursor-set"
+  end
+
   test "handles AwaitReply without crashing or re-requesting" do
     capture_events("cs-await")
     {_conn, cs, peer_end} = start_stack()

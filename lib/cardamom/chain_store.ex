@@ -499,6 +499,20 @@ defmodule Cardamom.ChainStore do
   end
 
   @doc """
+  Reset a stored block's txo_processed flag so the reconciler RE-EXTRACTS it. Called when a
+  header (re)streams past (RollForward): the header is the source of truth, so a re-seen header
+  invalidates any stale "done" state — a block whose txos were wiped (bad rollback) rebuilds. If
+  we don't have the block yet, update_all matches nothing (a no-op) and the metronome fetches it
+  normally. Re-extraction is idempotent (insert_txo on_conflict: :nothing preserves spend state).
+  """
+  def mark_block_unprocessed(hash) when is_binary(hash) do
+    import Ecto.Query
+    Repo.update_all(from(b in BlockRow, where: b.hash == ^hash), set: [txo_processed: false])
+    Cache.delete({:block, hash})
+    :ok
+  end
+
+  @doc """
   Re-process every stored block whose TXOs were NOT fully extracted (txo_processed = false):
   blocks interrupted by a crash mid-process, or pre-migration rows. Idempotent — process_block
   is UPSERT outputs + fail-fast spends — so re-running a partially-done block just fills the
@@ -663,24 +677,35 @@ defmodule Cardamom.ChainStore do
   defp mints_ada?(_other), do: false
 
   defp insert_txo(txid, ix, out, slot) do
-    {:ok, row} =
-      %Txo{}
-      |> Txo.changeset(%{
-        txid: txid,
-        ix: ix,
-        address: out.address,
-        value: out.value,
-        datum_hash: out.datum_hash,
-        datum: encode_datum(out.datum),
-        raw: out.raw,
-        created_txid: txid,
-        created_slot: slot,
-        spent_by: nil
-      })
-      |> Repo.insert(on_conflict: :replace_all, conflict_target: [:txid, :ix])
+    attrs = %{
+      txid: txid,
+      ix: ix,
+      address: out.address,
+      value: out.value,
+      datum_hash: out.datum_hash,
+      datum: encode_datum(out.datum),
+      raw: out.raw,
+      created_txid: txid,
+      created_slot: slot,
+      spent_by: nil
+    }
 
-    Cache.put({:txo, txid, ix}, row)
-    {:ok, row}
+    # On conflict, DO NOTHING — insert the output if it's not already there; if it is, leave the
+    # existing row completely untouched. A UTxO's creation fields (address/value/datum/raw) are
+    # IMMUTABLE — the block that created it always creates the same output — so there's nothing to
+    # update. Critically this means re-extracting a block (header-triggered re-load) can NEVER
+    # clobber an already-SPENT output's spend state: :replace_all would reset spent_by → nil and
+    # silently un-spend it (data corruption); :nothing can't touch it. This is "insert, ignore if
+    # it exists" — the honest expression of "creation is idempotent, spends are separate".
+    {:ok, _} =
+      %Txo{}
+      |> Txo.changeset(attrs)
+      |> Repo.insert(on_conflict: :nothing, conflict_target: [:txid, :ix])
+
+    # on_conflict: :nothing returns a struct WITHOUT the DB row's real state on a conflict, so
+    # don't trust its :spent_by etc. — just invalidate the cache so the next read re-reads SQLite.
+    Cache.delete({:txo, txid, ix})
+    :ok
   end
 
   @doc """

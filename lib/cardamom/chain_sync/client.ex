@@ -52,20 +52,38 @@ defmodule Cardamom.ChainSync.Client do
 
     # `reasm` carries the partial tail of a message split across SDU boundaries (a ~1KB
     # header), via the generic Cardamom.Mux.Reassembler. Empty between whole messages.
-    state = %{conn: conn, peer: peer, headers_seen: 0, ledger: ledger, reasm: Reassembler.new()}
+    # `awaiting_intersect?`: after a FindIntersect, the producer's FIRST RollBackward is the
+    # protocol CURSOR-SET to the intersection point — NOT a chain reorg. We must NOT apply a UTxO
+    # rollback for it (that would delete everything above the intersection — the 136k-block wipe
+    # bug: on resume the intersection is far behind our accumulated txos, so a blind rollback
+    # nukes them). We set this true when we resume-via-FindIntersect, and clear it on the first
+    # RollBackward (treated as the cursor-set). Only RollBackwards received while actively
+    # streaming (awaiting_intersect? false) are real reorgs that rewind confirmed state.
+    state = %{
+      conn: conn,
+      peer: peer,
+      headers_seen: 0,
+      ledger: ledger,
+      reasm: Reassembler.new(),
+      awaiting_intersect?: false
+    }
 
-    # RESUME (reverse direction): before demanding from genesis, ask ChainStore where
-    # we left off. If we have a durable tip, FindIntersect from it — the peer rolls us
-    # back to the most recent SHARED point (the fork, not genesis) and forward through
-    # the real chain. Cold start (no tip) → request_next from origin as before.
-    case resume? && resume_point() do
-      [_slot, _hash] = point ->
-        Logger.info("chain_sync peer=#{peer}: resuming from stored tip — FindIntersect")
-        find_intersect(state, [point])
+    # RESUME (reverse direction): before demanding from genesis, ask ChainStore where we left
+    # off. If we have durable headers, FindIntersect from the highest — the peer rolls us back to
+    # the most recent SHARED point and forward through the real chain. Cold start → origin.
+    state =
+      case resume? && resume_point() do
+        [_slot, _hash] = point ->
+          Logger.info("chain_sync peer=#{peer}: resuming from stored tip — FindIntersect")
+          find_intersect(state, [point])
+          %{state | awaiting_intersect?: true}
 
-      _ ->
-        request_next(state)
-    end
+        _ ->
+          # Cold start from origin: the producer's first reply is also a RollBackward (to origin)
+          # establishing the cursor — same cursor-set semantics, so guard it too.
+          request_next(state)
+          %{state | awaiting_intersect?: true}
+      end
 
     {:ok, state}
   end
@@ -105,18 +123,35 @@ defmodule Cardamom.ChainSync.Client do
     # header means). The full raw header hex is logged at lazy :debug inside
     # header_meta/1 — that IS our capture mechanism (no separate capture flag).
     meta = header_meta(header) |> Map.put(:tip, describe(tip))
+
+    # A (re)seen header INVALIDATES any "done" state for its block: if we already have the block
+    # stored, reset txo_processed=false so the reconciler RE-EXTRACTS it. This makes the header
+    # the source of truth and the block's TXO extraction a derived, self-healing consequence —
+    # so a block whose txos were wiped (e.g. by a bad rollback) rebuilds the next time its header
+    # streams past, with no stale-flag bookkeeping to trust. Re-extraction is idempotent (UPSERT),
+    # so re-seeing a header whose txos are fine is a harmless no-op.
+    mark_block_for_reextract(meta[:header_hash])
+
     emit("RollForward", meta, state)
     request_next(state)
     %{state | headers_seen: state.headers_seen + 1}
   end
 
+  # The CURSOR-SET RollBackward that FOLLOWS a FindIntersect: the producer is establishing our
+  # read cursor at the intersection point, NOT reorging. We have not rolled forward past it, so
+  # there is nothing to undo — applying a UTxO rollback here would delete all state above the
+  # intersection (the 136k-block wipe). Skip the rollback; just clear the flag and start streaming.
+  defp handle_msg({:roll_backward, point, tip}, %{awaiting_intersect?: true} = state) do
+    emit("RollBackward", %{point: describe(point), tip: describe(tip), cursor_set: true}, state)
+    request_next(state)
+    %{state | awaiting_intersect?: false}
+  end
+
   defp handle_msg({:roll_backward, point, tip}, state) do
     emit("RollBackward", %{point: describe(point), tip: describe(tip)}, state)
-    # A reorg: the relay told us to roll back to `point`. APPLY it — rewind both the forest (tip
-    # pointer) and the confirmed UTxO set (resurrect spends + delete outputs above the point, and
-    # graveyard the orphaned blocks). Without this we'd silently diverge from consensus at the tip
-    # (we'd keep state from blocks that are no longer on the winning chain). Best-effort: a missing
-    # store/forest (bare tests) is a no-op.
+    # A genuine REORG while streaming: rewind the forest tip AND the confirmed UTxO set (resurrect
+    # spends + delete outputs above the point, graveyard orphaned blocks) so we don't diverge from
+    # consensus. Only reached when NOT awaiting the post-intersect cursor-set. Best-effort.
     apply_rollback(point)
     request_next(state)
     state
@@ -148,6 +183,21 @@ defmodule Cardamom.ChainSync.Client do
     emit("ChainSync", %{msg: inspect(other)}, state)
     state
   end
+
+  # Reset the stored block's txo_processed flag (if we have the block) so it gets re-extracted.
+  # hash is hex from header_meta; the store keys blocks by binary hash. Best-effort.
+  defp mark_block_for_reextract(hex) when is_binary(hex) do
+    with {:ok, bin} <- Base.decode16(hex, case: :lower),
+         true <- Process.whereis(Cardamom.ChainStore) != nil do
+      Cardamom.ChainStore.mark_block_unprocessed(bin)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp mark_block_for_reextract(_), do: :ok
 
   # Roll back the forest tip and the confirmed UTxO set to `point`'s slot. `point` is `[slot, hash]`
   # (or origin = genesis). Resilient: each side guarded by whether its process is up.

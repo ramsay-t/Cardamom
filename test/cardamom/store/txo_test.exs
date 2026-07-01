@@ -62,6 +62,23 @@ defmodule Cardamom.Store.TxoTest do
     assert ChainStore.txo(t16, 4) == nil, "block 16 created exactly 4 outputs"
   end
 
+  test "RE-EXTRACTING a block preserves an already-SPENT output (idempotent, no un-spend)" do
+    # A header (re)streaming past triggers re-extraction of its block. That must NOT clobber the
+    # spend state of an already-spent output — insert_txo uses on_conflict: :nothing so a re-insert
+    # leaves the existing (spent) row untouched. (:replace_all would reset spent_by → nil and
+    # silently un-spend it — data corruption. This pins the fix.)
+    _ = ChainStore.process_block(fixture(3))
+    _ = ChainStore.process_block(fixture(16))
+    t3 = txid(3)
+    t16 = txid(16)
+    assert %{spent_by: ^t16} = ChainStore.txo(t3, 0), "spent before re-extract"
+
+    # RE-EXTRACT block 3 (as a re-seen header would). Its output 0 is already spent by block 16.
+    _ = ChainStore.process_block(fixture(3))
+
+    assert %{spent_by: ^t16} = ChainStore.txo(t3, 0), "re-extract must NOT un-spend it"
+  end
+
   test "a valid spend records spent_how :tx_input" do
     _ = ChainStore.process_block(fixture(3))
     _ = ChainStore.process_block(fixture(16))
