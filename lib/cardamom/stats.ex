@@ -44,17 +44,26 @@ defmodule Cardamom.Stats do
 
     {:ok,
      %{
-       started_at: System.system_time(:second),
        peers_connected: 0,
        protocol_events: 0,
        recent: []
      }}
   end
 
+  # Uptime is a NODE property, not a Stats-process one: the VM's own wall_clock since boot.
+  # Resets exactly when the BEAM (re)starts, survives a Stats-process restart, and is immune to
+  # system-clock/NTP jumps — unlike `System.system_time - started_at`, which also risked reading
+  # a stale start point. (The 6-day "uptime" that looked broken was actually a stale browser tab;
+  # this makes the value robust AND the UI now polls + shows disconnected — belt and braces.)
+  defp node_uptime_seconds do
+    {total_ms, _since_last_call} = :erlang.statistics(:wall_clock)
+    div(total_ms, 1000)
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     snap = %{
-      uptime_seconds: System.system_time(:second) - state.started_at,
+      uptime_seconds: node_uptime_seconds(),
       peers_connected: state.peers_connected,
       protocol_events: state.protocol_events,
       # newest-first: state.recent is already prepended newest-first, so we

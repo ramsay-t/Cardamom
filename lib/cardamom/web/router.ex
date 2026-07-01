@@ -117,10 +117,15 @@ defmodule Cardamom.Web.Router do
         #forest { max-height:70vh; overflow:auto; }
         .bar { background:#222; border:1px solid #333; height:10px; margin:.3rem 0 .8rem; border-radius:3px; overflow:hidden; }
         .bar-fill { background:#8fd; height:100%; width:0%; transition:width .5s; }
+        /* Connection status: green = live, red = the node poll failed (stale values). */
+        .conn { font-size:0.9rem; padding:2px 8px; border-radius:4px; vertical-align:middle; }
+        .conn.live { background:#173; color:#8fd; }
+        .conn.dead { background:#711; color:#fbb; }
+        body.stale .num { opacity:0.4; }  /* grey the numbers so stale can't look live */
       </style>
     </head>
     <body>
-      <h1>Cardamom</h1>
+      <h1>Cardamom <span id="conn" class="conn">connecting…</span></h1>
       <div>
         <span class="stat">uptime <span class="num" id="uptime">-</span>s</span>
         <span class="stat">peers <span class="num" id="peercount">-</span></span>
@@ -193,6 +198,17 @@ defmodule Cardamom.Web.Router do
           return out;
         }
 
+        // Reflect whether the last poll reached the node. On failure we mark the page STALE so
+        // frozen numbers can't masquerade as live (the 6-day-uptime confusion — it was a dead
+        // tab showing its last value). Uptime is the node's OWN wall_clock, polled like any other
+        // datum, so a live tab always shows the real node age and a dead one says so.
+        function setConn(live) {
+          const c = document.getElementById('conn');
+          c.textContent = live ? 'live' : 'disconnected — stale';
+          c.className = 'conn ' + (live ? 'live' : 'dead');
+          document.body.classList.toggle('stale', !live);
+        }
+
         async function tick() {
           try {
             const s = await (await fetch('/stats.json')).json();
@@ -261,7 +277,11 @@ defmodule Cardamom.Web.Router do
                      '</td><td>' + Math.round(p.memory_bytes/1024) + '</td><td>' + p.reductions +
                      '</td><td class="meta">' + esc(p.current_function || '') + '</td></tr>';
             }).join('');
-          } catch (e) {}
+            setConn(true);
+          } catch (e) {
+            // A failed poll = the node is unreachable (stopped, or this tab outlived it).
+            setConn(false);
+          }
         }
         setInterval(tick, 1000); tick();
       </script>
