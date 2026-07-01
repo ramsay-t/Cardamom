@@ -21,7 +21,10 @@ defmodule Cardamom.BodyFetcher do
   require Logger
 
   @default_interval_ms 5_000
-  @default_batch 500
+  # Blocks per range-fetch tick. 1000 = bigger chunks, fewer ticks; the relay serves partial
+  # batches and byte-caps a RequestRange anyway, so this is an upper bound per tick, not a
+  # guarantee. Tunable via the `body_batch` param (get_blocks range-fetches the consecutive run).
+  @default_batch 1_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -29,7 +32,7 @@ defmodule Cardamom.BodyFetcher do
   def init(opts) do
     state = %{
       interval: Keyword.get(opts, :interval_ms, @default_interval_ms),
-      batch: Keyword.get(opts, :batch, @default_batch)
+      batch: Keyword.get(opts, :batch, Application.get_env(:cardamom, :body_batch, @default_batch))
     }
 
     {:ok, state, {:continue, :tick}}

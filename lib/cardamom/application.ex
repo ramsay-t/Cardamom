@@ -132,6 +132,8 @@ defmodule Cardamom.Application do
     # Surface the params-file `fetch_bodies` toggle as app env so body_fetcher/0 (which builds
     # the child spec just after this runs) sees it. Defaults true.
     Application.put_env(:cardamom, :fetch_bodies, cfg.fetch_bodies != false)
+    # Same for the metronome batch size (blocks per fetch tick); BodyFetcher.init reads :body_batch.
+    if cfg.body_batch, do: Application.put_env(:cardamom, :body_batch, cfg.body_batch)
 
     path = Cardamom.Store.Repo.db_path(cfg.network)
     repo_cfg = Application.get_env(:cardamom, Cardamom.Store.Repo, [])

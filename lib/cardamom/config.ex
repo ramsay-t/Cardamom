@@ -49,6 +49,9 @@ defmodule Cardamom.Config do
     # fetch_bodies: proactively fetch block BODIES to catch up with headers (the metronome),
     # building the full UTxO set. Default true. Set false for a headers-only / store-light boot.
     fetch_bodies: true,
+    # body_batch: max blocks the metronome range-fetches per tick (default 1000). Bigger = fewer
+    # ticks; the relay serves partial batches + byte-caps a range anyway, so it's an upper bound.
+    body_batch: 1_000,
     # genesis: paths to the network's genesis files, whose initial funds seed the UTxO set
     # BEFORE block ingestion (chain blocks spend genesis UTXOs that no block produces — see
     # Cardamom.Genesis). Both eras optional/nil: a network may have only one era's funds, or
@@ -67,6 +70,7 @@ defmodule Cardamom.Config do
           connect: boolean(),
           debug_raw_bytes: boolean(),
           fetch_bodies: boolean(),
+          body_batch: pos_integer(),
           genesis: %{shelley: String.t() | nil, byron: String.t() | nil},
           handshake: %{initiator_only: boolean(), peer_sharing: 0..1, query: boolean()},
           protocols: [atom()]
@@ -105,6 +109,7 @@ defmodule Cardamom.Config do
     |> put_if(json, "connect", :connect)
     |> put_if(json, "debug_raw_bytes", :debug_raw_bytes)
     |> put_if(json, "fetch_bodies", :fetch_bodies)
+    |> put_if(json, "body_batch", :body_batch)
     |> put_genesis(json["genesis"])
     |> put_handshake(json["handshake"])
     |> put_peer(json["first_peer"])
@@ -167,7 +172,7 @@ defmodule Cardamom.Config do
 
   # opts (keyword) → only the config keys we recognise.
   defp opts_map(opts) do
-    Map.new(Keyword.take(opts, [:network, :first_peer, :db, :data_dir, :port, :log_tag, :log_dir, :connect, :debug_raw_bytes, :fetch_bodies, :genesis, :handshake, :protocols]))
+    Map.new(Keyword.take(opts, [:network, :first_peer, :db, :data_dir, :port, :log_tag, :log_dir, :connect, :debug_raw_bytes, :fetch_bodies, :body_batch, :genesis, :handshake, :protocols]))
   end
 
   # Merge override onto base, deep-merging the nested :handshake map so a partial file
