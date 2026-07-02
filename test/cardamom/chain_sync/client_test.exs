@@ -42,7 +42,10 @@ defmodule Cardamom.ChainSync.ClientTest do
   # Returns {conn, chain_sync, peer_end}. start_supervised! tears them (and their
   # reader process) down cleanly before the next test — good hygiene so no stack
   # lingers between tests.
-  defp start_stack(peer_label \\ "scripted") do
+  # Default pipeline_depth: 1 keeps these behaviour tests in strict single-in-flight mode
+  # (request→reply→request), so "asks again" means exactly one re-request. The pipelining
+  # test overrides depth explicitly.
+  defp start_stack(peer_label \\ "scripted", depth \\ 1) do
     {client_end, peer_end} = Channel.Test.pair()
 
     conn =
@@ -53,11 +56,20 @@ defmodule Cardamom.ChainSync.ClientTest do
 
     cs =
       start_supervised!(
-        {ChainSync.Client, [conn: conn, peer: peer_label, resume: false]},
+        {ChainSync.Client, [conn: conn, peer: peer_label, resume: false, pipeline_depth: depth]},
         id: :chain_sync
       )
 
     {conn, cs, peer_end}
+  end
+
+  # Drain exactly one RequestNext (StIdle demand) off the peer end, asserting it decodes. Threads
+  # the leftover buffer: send_frame may coalesce several SDUs into one channel read, so recv_msg's
+  # `rest` must be carried into the next call or trailing frames are silently dropped.
+  defp assert_request_next(peer_end, buf \\ <<>>) do
+    assert {:ok, payload, _, rest} = Frame.recv_msg(peer_end, buf, 1_000)
+    assert {:ok, :request_next, ""} = CSCodec.decode(payload)
+    rest
   end
 
   test "sends an initial RequestNext on start (client holds StIdle agency)" do
@@ -176,6 +188,62 @@ defmodule Cardamom.ChainSync.ClientTest do
     :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode({:roll_forward, <<0>>, [9, <<0::256>>]}))
 
     assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollForward"}}, 1_000
+    assert Process.alive?(cs)
+  end
+
+  # PIPELINING: chain-sync is a single ORDERED channel — replies come back in chain order, so we
+  # can keep N MsgRequestNext in flight to hide the per-header round-trip (the RTT-bound ~4/s was
+  # the cost of strict request→reply→request). depth N ⇒ up to N outstanding requests. We do NOT
+  # pipeline during the resume/intersect phase (single-in-flight until the cursor is set); the
+  # pipeline fills to N on the cursor-set RollBackward, then tops back up to N after each reply.
+  test "with pipeline_depth N, fills the pipeline to N in-flight requests once streaming" do
+    depth = 5
+    capture_events("cs-pipeline")
+    # Cold start (resume: false) fires ONE initial request; pipelining begins at the cursor-set.
+    {_conn, cs, peer_end} = start_stack("scripted", depth)
+    assert_receive {:telemetry, [:cardamom, :peer, :connected], _, %{peer: "scripted"}}, 1_000
+
+    # The single cold-start RequestNext.
+    buf = assert_request_next(peer_end)
+
+    # The cursor-set RollBackward (first after cold start): consumes that one in-flight request,
+    # then fills the pipeline to `depth`. So the peer now sees exactly `depth` RequestNexts.
+    :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode({:roll_backward, [50, <<1::256>>], [123, <<2::256>>]}))
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollBackward", cursor_set: true}}, 1_000
+
+    buf = Enum.reduce(1..depth, buf, fn _, b -> assert_request_next(peer_end, b) end)
+
+    # Now at N in-flight. One RollForward reply consumes one and tops back up by exactly one — the
+    # pipeline stays saturated at N (steady state), not growing unboundedly.
+    :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode({:roll_forward, :crypto.strong_rand_bytes(16), [124, <<0::256>>]}))
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollForward"}}, 1_000
+    buf = assert_request_next(peer_end, buf)
+
+    # And no SECOND request from that single reply (top-up is one-for-one). A stray extra request
+    # would show up here; assert the channel has nothing more queued right now.
+    assert {:error, :timeout} = Frame.recv_msg(peer_end, buf, 200)
+    assert Process.alive?(cs)
+  end
+
+  # At the TIP the server answers a pipelined request with AwaitReply (no block yet). We must
+  # consume it but NOT top up — otherwise we'd spam requests into the tip. The pipeline drains and
+  # we sit waiting; the next real RollForward (a freshly minted block) refills it.
+  test "AwaitReply drains an in-flight request WITHOUT re-requesting (no tip spam)" do
+    depth = 3
+    capture_events("cs-await-drain")
+    {_conn, cs, peer_end} = start_stack("scripted", depth)
+    assert_receive {:telemetry, [:cardamom, :peer, :connected], _, %{peer: "scripted"}}, 1_000
+    buf = assert_request_next(peer_end)
+
+    # Reach streaming + fill to depth.
+    :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode({:roll_backward, [50, <<1::256>>], [123, <<2::256>>]}))
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollBackward", cursor_set: true}}, 1_000
+    buf = Enum.reduce(1..depth, buf, fn _, b -> assert_request_next(peer_end, b) end)
+
+    # AwaitReply consumes one in-flight request and must NOT trigger a new one.
+    :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode(:await_reply))
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "AwaitReply"}}, 1_000
+    assert {:error, :timeout} = Frame.recv_msg(peer_end, buf, 200), "AwaitReply must not re-request (tip spam)"
     assert Process.alive?(cs)
   end
 end

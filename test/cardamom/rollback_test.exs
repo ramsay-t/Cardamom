@@ -23,8 +23,10 @@ defmodule Cardamom.RollbackTest do
     {raw, tx.txid, slot}
   end
 
+  # Await completion — extraction is async (a supervised BlockHandler + per-tx retriers), so tests
+  # that assert on TXO state immediately after must wait for the handler to mark done.
   defp extract(hash \\ nil, {raw, _txid, slot}) do
-    ChainStore.extract_block(hash || :crypto.strong_rand_bytes(32), raw, slot)
+    ChainStore.extract_block_sync(hash || :crypto.strong_rand_bytes(32), raw, slot)
   end
 
   test "rollback RESURRECTS a UTXO spent by an orphaned block" do
@@ -87,5 +89,47 @@ defmodule Cardamom.RollbackTest do
     {:ok, _} = ChainStore.rollback(450)
     {:ok, summary2} = ChainStore.rollback(450)
     assert summary2 == %{resurrected: 0, deleted: 0, graveyarded: 0}
+  end
+
+  test "rollback CANCELS a live handler (absent-producer block) and cleans its outputs" do
+    # A block whose spend references a producer we never load → its BlockHandler stays LIVE, its
+    # retrier retrying forever. This is the case the supervision tree exists for: rollback must
+    # terminate that handler (killing the retrier, confirming it dead) THEN clean the block's
+    # outputs — not leave a retrier writing after cleanup.
+    hash = :crypto.strong_rand_bytes(32)
+    absent = :crypto.strong_rand_bytes(32)
+    {raw, out_txid, slot} = blk = block_at(600, [{absent, 0}], 8)
+    # Store the block row (so rollback's orphan lookup finds it) and spawn the ASYNC handler.
+    {:ok, _} =
+      %Block{}
+      |> Block.changeset(%{hash: hash, slot: slot, block_no: 600, tx_count: 1, raw: raw, txo_processed: false})
+      |> Repo.insert()
+
+    :ok = ChainStore.extract_block(hash, raw, slot)
+
+    # The handler creates its OUTPUT (phase 1) but can never resolve its spend → stays live.
+    :ok = wait_until(fn -> Repo.get_by(Txo, txid: out_txid, ix: 0) != nil end)
+    assert [{handler_pid, _}] = Registry.lookup(Cardamom.Ledger.BlockRegistry, hash)
+    assert Process.alive?(handler_pid), "handler stays live retrying the unresolvable spend"
+
+    # ROLLBACK past the block's slot: terminate the handler (kill retrier, confirm dead), clean.
+    {:ok, _summary} = ChainStore.rollback(550)
+
+    refute Process.alive?(handler_pid), "rollback terminated the live handler"
+    refute Repo.get_by(Txo, txid: out_txid, ix: 0), "the orphaned block's output was cleaned up"
+    assert Registry.lookup(Cardamom.Ledger.BlockRegistry, hash) == [], "handler deregistered"
+  end
+
+  defp wait_until(check, timeout \\ 3_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn -> :ok end)
+    |> Enum.reduce_while(nil, fn _, _ ->
+      cond do
+        check.() -> {:halt, :ok}
+        System.monotonic_time(:millisecond) >= deadline -> {:halt, :timeout}
+        true -> Process.sleep(20); {:cont, nil}
+      end
+    end)
   end
 end

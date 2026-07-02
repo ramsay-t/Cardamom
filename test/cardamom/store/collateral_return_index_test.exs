@@ -17,6 +17,20 @@ defmodule Cardamom.Store.CollateralReturnIndexTest do
 
   @fixture Path.join([__DIR__, "..", "..", "fixtures", "preview_block_invalid_tx.hex"])
 
+  # Extraction is async (BlockHandler + per-tx retriers); wait for `check` or the deadline.
+  defp eventually(check, timeout \\ 3_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_eventually(check, deadline)
+  end
+
+  defp do_eventually(check, deadline) do
+    cond do
+      check.() -> :ok
+      System.monotonic_time(:millisecond) >= deadline -> :timeout
+      true -> Process.sleep(20); do_eventually(check, deadline)
+    end
+  end
+
   test "invalid tx's collateral return lands at index length(outputs), not 0" do
     raw = @fixture |> File.read!() |> String.trim() |> Base.decode16!(case: :lower)
 
@@ -27,7 +41,13 @@ defmodule Cardamom.Store.CollateralReturnIndexTest do
     n = length(invalid.outputs)
     assert n == 1, "the real tx declares 1 normal output (so coll-return index must be 1)"
 
+    # Extract async: this block's invalid tx spends collateral from a producer NOT in this test's
+    # store, so its retrier retries forever (the block never fully completes here — correct new
+    # behaviour). We only care that PHASE 1 created the collateral-return OUTPUT, so wait for that
+    # output to appear rather than for the whole block to finish.
     :ok = ChainStore.extract_block(:crypto.strong_rand_bytes(32), raw, 52578)
+
+    :ok = eventually(fn -> Repo.get_by(Txo, txid: invalid.txid, ix: n) != nil end)
 
     # The collateral-return TXO must be at index n (= 1 here), the index the spender references.
     assert Repo.get_by(Txo, txid: invalid.txid, ix: n),

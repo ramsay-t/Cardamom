@@ -17,6 +17,22 @@ defmodule Cardamom.BlockFetch.LiveTxoWiringTest do
     |> Base.decode16!(case: :lower)
   end
 
+  # TXO extraction is ASYNC behind the fetch (get_blocks stores the block row + spawns a
+  # BlockHandler; its per-tx retriers write the TXOs shortly after). Block until `check` holds or
+  # the deadline — the test-side wait for the handler to finish, matching production's async path.
+  defp eventually(check, timeout \\ 3_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_eventually(check, deadline)
+  end
+
+  defp do_eventually(check, deadline) do
+    cond do
+      check.() -> :ok
+      System.monotonic_time(:millisecond) >= deadline -> :timeout
+      true -> Process.sleep(20); do_eventually(check, deadline)
+    end
+  end
+
   test "fetching a real tx-bearing block via get_blocks populates its TXOs (not just the block row)" do
     raw = fixture(16)
     {:ok, blk} = Block.decode(raw)
@@ -37,6 +53,9 @@ defmodule Cardamom.BlockFetch.LiveTxoWiringTest do
     assert ChainStore.stored_block(blk.header.hash) != nil
 
     # ...AND its TXOs were extracted (the wiring this test pins). Block 16 has 4 outputs.
+    # Extraction is async behind the fetch, so wait for it to settle.
+    :ok = eventually(fn -> ChainStore.txo(tx.txid, 3) != nil end)
+
     for ix <- 0..3 do
       assert %{spent_by: nil} = ChainStore.txo(tx.txid, ix),
              "output #{ix} of the fetched block must be a TXO in the store"
@@ -67,6 +86,8 @@ defmodule Cardamom.BlockFetch.LiveTxoWiringTest do
     [{:ok, _}] = ChainStore.get_blocks([[blk.header.slot, blk.header.hash]])
 
     # The cascade fired on the live path: the out-competed pending tx is gone, graveyarded.
+    # The cascade runs in the async BlockHandler, so wait for it to settle.
+    :ok = eventually(fn -> ChainStore.mempool_txo(pending.txid, 0) == nil end)
     assert ChainStore.mempool_txo(pending.txid, 0) == nil, "live block must cascade-evict the conflicting pending tx"
     assert [%{reason: "inputs_spent"}] = ChainStore.mempool_graveyard(pending.txid) |> Enum.filter(&(&1.ix == 0))
   end

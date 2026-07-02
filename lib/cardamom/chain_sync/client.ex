@@ -43,6 +43,12 @@ defmodule Cardamom.ChainSync.Client do
     # Resume from the stored tip by default; tests of pure message-handling pass
     # resume: false to force the cold-start (genesis) path regardless of store state.
     resume? = Keyword.get(opts, :resume, true)
+    # PIPELINE DEPTH: how many MsgRequestNext we keep in flight. Chain-sync is a single ordered
+    # channel (replies come back IN chain order, not raced), so pipelining hides the per-header
+    # round-trip latency WITHOUT changing delivery order — headers still arrive parent→child.
+    # depth 1 = the old strict request→reply→request (RTT-bound, ~4/s on Preview). Higher fills
+    # the RTT gap. Param so it's tunable; default 10.
+    depth = Keyword.get(opts, :pipeline_depth, Application.get_env(:cardamom, :chainsync_depth, 10))
 
     # Reflect the bearer's fate; trap exits so terminate/2 can send a polite MsgDone.
     Process.link(conn)
@@ -65,7 +71,12 @@ defmodule Cardamom.ChainSync.Client do
       headers_seen: 0,
       ledger: ledger,
       reasm: Reassembler.new(),
-      awaiting_intersect?: false
+      awaiting_intersect?: false,
+      # Pipelining: `depth` is the target in-flight RequestNext count; `in_flight` the current.
+      # We only pipeline while STREAMING (after the cursor-set); the resume/intersect phase stays
+      # single-in-flight (request one, wait) so we don't fire requests before the cursor exists.
+      depth: depth,
+      in_flight: 0
     }
 
     # RESUME (reverse direction): before demanding from genesis, ask ChainStore where we left
@@ -76,13 +87,15 @@ defmodule Cardamom.ChainSync.Client do
         [_slot, _hash] = point ->
           Logger.info("chain_sync peer=#{peer}: resuming from stored tip — FindIntersect")
           find_intersect(state, [point])
+          # FindIntersect isn't a RequestNext; in_flight stays 0. The cursor-set RollBackward
+          # arrives, then we start pipelining. awaiting_intersect? guards until then.
           %{state | awaiting_intersect?: true}
 
         _ ->
-          # Cold start from origin: the producer's first reply is also a RollBackward (to origin)
-          # establishing the cursor — same cursor-set semantics, so guard it too.
+          # Cold start from origin: send ONE request; its first reply is the cursor-set
+          # RollBackward. Pipelining begins after that.
           request_next(state)
-          %{state | awaiting_intersect?: true}
+          %{state | awaiting_intersect?: true, in_flight: 1}
       end
 
     {:ok, state}
@@ -133,18 +146,25 @@ defmodule Cardamom.ChainSync.Client do
     mark_block_for_reextract(meta[:header_hash])
 
     emit("RollForward", meta, state)
-    request_next(state)
+    # A header is a reply to one in-flight RequestNext: consume it, clear awaiting_intersect? (the
+    # first reply — fwd OR back — means the cursor is set and we're streaming), then refill the
+    # pipeline to `depth` so we always have up to N requests outstanding, hiding the round-trip.
+    # (A RollForward as the FIRST reply happens when there's nothing to roll back to — the
+    # intersection is at/ahead of our tip; the producer just streams forward.)
+    state = %{reply_received(state) | awaiting_intersect?: false} |> fill_pipeline()
     %{state | headers_seen: state.headers_seen + 1}
   end
 
   # The CURSOR-SET RollBackward that FOLLOWS a FindIntersect: the producer is establishing our
   # read cursor at the intersection point, NOT reorging. We have not rolled forward past it, so
   # there is nothing to undo — applying a UTxO rollback here would delete all state above the
-  # intersection (the 136k-block wipe). Skip the rollback; just clear the flag and start streaming.
+  # intersection (the 136k-block wipe). Skip the rollback; NOW start pipelining the stream.
   defp handle_msg({:roll_backward, point, tip}, %{awaiting_intersect?: true} = state) do
     emit("RollBackward", %{point: describe(point), tip: describe(tip), cursor_set: true}, state)
-    request_next(state)
-    %{state | awaiting_intersect?: false}
+    # The cursor is established; begin streaming with the full pipeline. (This RollBackward was
+    # the reply to our single resume/cold-start request, so consume it first.)
+    state = %{reply_received(state) | awaiting_intersect?: false}
+    fill_pipeline(state)
   end
 
   defp handle_msg({:roll_backward, point, tip}, state) do
@@ -153,30 +173,35 @@ defmodule Cardamom.ChainSync.Client do
     # spends + delete outputs above the point, graveyard orphaned blocks) so we don't diverge from
     # consensus. Only reached when NOT awaiting the post-intersect cursor-set. Best-effort.
     apply_rollback(point)
-    request_next(state)
-    state
+    state |> reply_received() |> fill_pipeline()
   end
 
-  # Resume handshake responses: the peer told us the most recent shared point (or
-  # that we share none). Either way, start streaming from there with request_next.
+  # Reply to our FindIntersect. Per the ChainSync protocol, IntersectFound returns agency to the
+  # CLIENT at StIdle: we send ONE MsgRequestNext, and THAT request's reply is the cursor-set
+  # RollBackward (the producer sets our read pointer to the intersection). So we stay single-in-
+  # flight (in_flight: 1) through the intersect phase; pipelining only begins after the cursor-set
+  # (awaiting_intersect? still guards it). We DON'T fill_pipeline here — the cursor isn't set yet.
   defp handle_msg({:intersect_found, point, tip}, state) do
     emit("IntersectFound", %{point: describe(point), tip: describe(tip)}, state)
     request_next(state)
-    state
+    %{state | in_flight: 1}
   end
 
   defp handle_msg({:intersect_not_found, tip}, state) do
-    # No shared point — we'll sync from where the peer starts us (effectively genesis
-    # for this peer). Our stored fork was unknown to it; not an error.
+    # No shared point — sync from where the peer starts us. Same as IntersectFound: send one
+    # request; its reply is the cursor-set RollBackward, after which pipelining begins.
     emit("IntersectNotFound", %{tip: describe(tip)}, state)
     request_next(state)
-    state
+    %{state | in_flight: 1}
   end
 
   defp handle_msg(:await_reply, state) do
     emit("AwaitReply", %{}, state)
-    # Stay in receive; the server will follow with a roll fwd/back.
-    state
+    # We're at the TIP — a pipelined request had no header to serve yet. Consume the reply but do
+    # NOT refill (that would spam requests into the tip). The next RollForward/Backward the server
+    # sends when a block is minted refills the pipeline. So near the tip the pipeline drains to 0
+    # and we sit waiting, which is correct.
+    reply_received(state)
   end
 
   defp handle_msg(other, state) do
@@ -215,8 +240,24 @@ defmodule Cardamom.ChainSync.Client do
   defp rollback_slot([slot | _]) when is_integer(slot), do: slot
   defp rollback_slot(_), do: 0
 
+  # Send ONE MsgRequestNext (used by init's single resume/cold-start request). Returns :ok; the
+  # caller sets in_flight explicitly. Streaming handlers use fill_pipeline/1 instead.
   defp request_next(state),
     do: Cardamom.Connection.send_frame(state.conn, @chain_sync, ChainSync.encode(:request_next))
+
+  # A reply (RollForward/RollBackward/AwaitReply) consumed one outstanding request.
+  defp reply_received(%{in_flight: n} = state), do: %{state | in_flight: max(n - 1, 0)}
+
+  # Top the pipeline back up to `depth` outstanding RequestNexts. Sends (depth - in_flight)
+  # requests back-to-back — the relay streams the replies in chain order, hiding the round-trip.
+  # No-op once we're at depth. Not used while awaiting the intersect cursor-set (single-in-flight).
+  defp fill_pipeline(%{depth: depth, in_flight: in_flight} = state) when in_flight < depth do
+    to_send = depth - in_flight
+    Enum.each(1..to_send, fn _ -> request_next(state) end)
+    %{state | in_flight: in_flight + to_send}
+  end
+
+  defp fill_pipeline(state), do: state
 
   defp find_intersect(state, points),
     do: Cardamom.Connection.send_frame(state.conn, @chain_sync, ChainSync.encode({:find_intersect, points}))

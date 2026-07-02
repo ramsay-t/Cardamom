@@ -25,6 +25,11 @@ defmodule Cardamom.DataCase do
   end
 
   setup do
+    # DRAIN live block handlers FIRST — a continuous-retry handler for an absent-producer block
+    # from a prior test would otherwise keep retrying and write into the tables we're about to
+    # truncate (a cross-test leak). terminate_all kills each handler (cascading its tx retriers).
+    if Process.whereis(Cardamom.Ledger.BlockSupervisor), do: Cardamom.Ledger.BlockSupervisor.terminate_all()
+
     # Clean slate: truncate every store table and clear the cache. Each test thus
     # begins with an empty store, regardless of what ran before.
     Repo.delete_all(Header)

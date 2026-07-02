@@ -39,7 +39,6 @@ defmodule Cardamom.ChainStore do
   alias Cardamom.Store.{Cache, Header, Kv, Repo}
   alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput, Peer, BlockGraveyard}
   alias Cardamom.Store.Cached
-  alias Cardamom.Ledger.Block
   import Ecto.Query
 
   # Cached store for the mempool spend-graph edge index, the HOTTEST read (the per-block
@@ -444,49 +443,57 @@ defmodule Cardamom.ChainStore do
   that's correct and converges as more blocks are processed.
   """
   def process_block(raw, slot \\ nil) when is_binary(raw) do
-    # Route by era: the `[era, inner]` envelope carries the tag, so Block.txs_in/1 reads it and
-    # dispatches Byron (era 0) vs the Shelley-family decoder (eras 1-7). Both normalise to the
-    # same tx/output shape, so the two-phase UTxO update below is era-uniform. `slot` is the
-    # block's slot, stamped onto each txo (created_slot / spent_slot) so a reorg can roll it back.
-    with {:ok, txs} <- Block.txs_in(raw) do
-      # TWO PHASES, matching the Agda block-level rule newUtxo = (utxo ∣ ins ᶜ) ∪ outs
-      # computed over the WHOLE block: union ALL this block's outputs FIRST, then apply
-      # ALL spends. This is what makes intra-block output→input chains correct — a tx can
-      # spend an earlier tx's output because all of the block's outputs are present before
-      # any spend is resolved. They are "concurrent by virtue of being in this block"
-      # (Ramsay's separation sense), so the two phases may each run in any order/parallel;
-      # only the phase BOUNDARY (outputs-before-spends) is ordered.
-      Enum.each(txs, &create_outputs(&1, slot))
-      # Phase 2 spends. After phase 1, intra-block producers all exist, so a leftover :no_target
-      # is a CROSS-block reference to a block we haven't ingested yet — NOT an error, just a spend
-      # we can't apply until backfill reaches the producer. We DON'T spawn anything per-spend: the
-      # block simply isn't fully extracted, so the caller leaves txo_processed=0 and the periodic
-      # RECONCILER re-runs process_block (idempotent) until the producer arrives and the spend
-      # lands. One retry loop (the reconciler's 30s sweep), not a pile of 1Hz per-block watchers.
-      deferred = Enum.flat_map(txs, &apply_spends(&1, slot))
+    # A block is a CONTAINER of txs, extracted by a supervised BlockHandler (one retrier process
+    # per tx; see extract_block/3 and Cardamom.Ledger.{BlockHandler,TxRetrier}). This entry keeps a
+    # SYNCHRONOUS contract (mempool tests + callers that lack a real block hash assert immediately),
+    # so it derives a content hash for handler keying and awaits completion via extract_block_sync.
+    # Returns :ok (fully extracted) | :deferred (a tx still awaits an unstored producer → the
+    # handler stays live retrying) | {:error, _} on decode failure.
+    hash = :crypto.hash(:sha256, raw)
 
-      # MEMPOOL CASCADE: a block changes the UTxO set, so pending txs may now be unviable.
-      # Idempotent + monotone (evictions only push toward terminal states), so this is
-      # order-independent — safe under fully-parallel apply (the mailbox can pick any order).
-      Enum.each(txs, &cascade_mempool/1)
-
-      # :ok = fully extracted (caller marks done). :deferred = some cross-block spend still awaits
-      # its producer → caller leaves the block txo_processed=0 for the reconciler to retry.
-      if deferred == [], do: :ok, else: :deferred
+    case extract_block_sync(hash, raw, slot) do
+      :ok -> :ok
+      :timeout -> :deferred
+      {:error, {:decode_failed, reason}} -> {:error, reason}
+      {:error, _other} -> :deferred
     end
   end
 
   @doc """
-  Extract a block's TXOs AND drive completion: run process_block, then mark the block done — but
-  ONLY if fully resolved. If a cross-block spend is still deferred, leave txo_processed=0 so the
-  periodic reconciler re-runs it once backfill reaches the producer (idempotent replay: outputs
-  UPSERT, already-applied spends no-op). The single "process + complete" entry used by the live
-  ingest path, the reconciler, and tests. `hash` is the block's (header) hash; `raw` its bytes.
+  Extract a block's TXOs ASYNCHRONOUSLY: spawn a supervised, hash-registered
+  `Cardamom.Ledger.BlockHandler` that owns one retrier process per tx (create outputs, then apply
+  spends, RETRYING continuously until any not-yet-stored producer arrives). The handler marks the
+  block `txo_processed=true` itself ONLY when EVERY tx completes — a continuous-retry block can
+  never complete synchronously, so this returns `:ok` immediately. The block BYTES are already
+  durable (put_block, called by verify_and_store BEFORE this), so a crash simply leaves
+  txo_processed=false and the reconciler re-spawns the handler on boot. Dedupes by hash: re-calling
+  for a block whose handler is still live is a no-op. Used by the live ingest path, the reconciler,
+  and tests (via extract_block_sync/4 to await completion). `hash` is the block's (header) hash.
   """
   def extract_block(hash, raw, slot \\ nil) when is_binary(hash) and is_binary(raw) do
-    case process_block(raw, slot) do
-      :ok -> mark_txo_processed(hash)
-      :deferred -> :ok
+    {:ok, _pid} = Cardamom.Ledger.BlockSupervisor.start_block(hash, raw, slot)
+    :ok
+  end
+
+  @doc """
+  TEST/synchronous helper: extract a block and BLOCK until its handler finishes. Monitors the
+  handler pid — it exits :normal only AFTER mark_txo_processed (fully done), so a `:DOWN :normal`
+  means "every tx resolved". Returns `:ok` (done), `{:error, reason}` (handler crashed), or
+  `:timeout` (still retrying an absent producer — correct production behaviour, but bounded here so
+  a test can't hang on a continuous retrier). NOT used on the live async path.
+  """
+  def extract_block_sync(hash, raw, slot \\ nil, timeout \\ 5_000)
+      when is_binary(hash) and is_binary(raw) do
+    {:ok, pid} = Cardamom.Ledger.BlockSupervisor.start_block(hash, raw, slot)
+    ref = Process.monitor(pid)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, :normal} -> :ok
+      {:DOWN, ^ref, :process, ^pid, reason} -> {:error, reason}
+    after
+      timeout ->
+        Process.demonitor(ref, [:flush])
+        :timeout
     end
   end
 
@@ -513,13 +520,12 @@ defmodule Cardamom.ChainStore do
   end
 
   @doc """
-  Re-process every stored block whose TXOs were NOT fully extracted (txo_processed = false):
-  blocks interrupted by a crash mid-process, or pre-migration rows. Idempotent — process_block
-  is UPSERT outputs + fail-fast spends — so re-running a partially-done block just fills the
-  gaps and re-spawns any still-needed deferred-spend retriers. Returns the count re-processed.
-
-  This is the self-heal for dangling spends WITHOUT a durable pending table: the block's `raw`
-  is already stored, so re-processing is a free idempotent replay. Run on boot AND periodically.
+  CRASH/RESTART BACKSTOP: re-SPAWN a BlockHandler for every stored block still txo_processed=false
+  (a handler that died with the VM, or a block interrupted mid-extraction). This is NOT the
+  steady-state retry — a live handler retries its own deferred spends continuously; this only
+  re-establishes handlers lost to a crash. extract_block dedupes by hash, so re-spawning a block
+  whose handler is still live is a harmless no-op. The block's `raw` is already durable, so this is
+  a free idempotent replay. Run on boot AND periodically. Returns the count re-spawned.
   """
   def reconcile_unprocessed_blocks(limit \\ 1_000) do
     import Ecto.Query
@@ -534,19 +540,21 @@ defmodule Cardamom.ChainStore do
       )
 
     Enum.each(pending, fn {hash, raw, slot} ->
-      # Same "process + complete" as the live path (slot stamped for rollback). Re-processing is
-      # an idempotent replay (UPSERT outputs + fail-fast spends), so already-applied spends no-op;
-      # marks done only when fully resolved, else stays pending for the next reconcile tick.
+      # Ensure a handler exists for this pending block (no-op if one is already live). ASYNC — the
+      # handler marks done when its txs all resolve; the reconciler doesn't wait.
       extract_block(hash, raw, slot)
     end)
 
     length(pending)
   end
 
-  # For one confirmed block tx: (1) if it was itself PENDING, it just confirmed → evict
-  # :in_block; (2) every UTxO it spent invalidates the pending txs that depended on that
-  # UTxO — a spender is out-competed (:inputs_spent), a referencer can no longer read it.
-  defp cascade_mempool(%{txid: txid, valid: valid} = tx) do
+  @doc """
+  Mempool cascade for one confirmed block tx (called by BlockHandler at spawn time): (1) if it was
+  itself PENDING, it just confirmed → evict :in_block; (2) every UTxO it spent invalidates the
+  pending txs that depended on that UTxO — a spender is out-competed (:inputs_spent), a referencer
+  can no longer read it. Idempotent + monotone → order-independent, safe to run before spends resolve.
+  """
+  def cascade_mempool(%{txid: txid, valid: valid} = tx) do
     # The tx confirmed (promoted out of the mempool, if it was there).
     if mempool_present?(txid), do: drop_mempool_tx(txid, :in_block)
 
@@ -569,48 +577,9 @@ defmodule Cardamom.ChainStore do
     Repo.exists?(from m in MempoolTxo, where: m.txid == ^txid)
   end
 
-  # PHASE 1 — outputs. Valid tx: its normal outputs become unspent TXOs. Invalid tx
-  # (phase-2 fail): its NORMAL outputs are NOT created; only its collateral_return is.
-  # `slot` is the block's slot, stamped as created_slot for rollback.
-  defp create_outputs(%{valid: true, txid: txid, outputs: outputs}, slot) do
-    outputs
-    |> Enum.with_index()
-    |> Enum.each(fn {out, ix} -> insert_txo(txid, ix, out, slot) end)
-  end
-
-  defp create_outputs(%{valid: false, txid: txid, collateral_return: ret, outputs: outputs}, slot) do
-    # The collateral-return UTxO's index is `length(outputs)` — the count of the tx's DECLARED
-    # normal outputs (which aren't created for an invalid tx, but still consume index space).
-    # SPEC: Babbage/Collateral.hs collOuts → `txIxFromIntegral (length (outputs))`. We previously
-    # hardcoded index 0, so a later tx spending collateral-return at index N found nothing and its
-    # block stuck pending forever (found via Cardanoscan: an invalid tx's #1 = the 7₳ coll-return).
-    if ret, do: insert_txo(txid, length(outputs), ret, slot)
-  end
-
-  # PHASE 2 — spends. Valid tx (Agda ~488): its normal inputs are spent, spent_how
-  # :tx_input. Invalid tx (~503): ONLY collateral is consumed, spent_how :collateral;
-  # normal inputs are NOT spent. `slot` stamped as spent_slot for rollback.
-  defp apply_spends(%{valid: true, txid: txid, inputs: inputs}, slot) do
-    spend_each(inputs, txid, :tx_input, slot)
-  end
-
-  defp apply_spends(%{valid: false, txid: txid, collateral_inputs: collat}, slot) do
-    spend_each(collat, txid, :collateral, slot)
-  end
-
-  # Apply each spend; RETURN the ones that couldn't apply (target not yet in store). A
-  # {:error, :no_target} is NOT an error for a confirmed block — the input MUST exist in a block
-  # we haven't ingested yet (cross-block / out-of-order backfill). The caller (process_block)
-  # treats a non-empty return as "deferred" → leaves the block txo_processed=0 → the periodic
-  # reconciler re-runs it until the producer arrives. mark_spent stays a dumb fail-fast store op.
-  defp spend_each(inputs, txid, how, slot) do
-    Enum.flat_map(inputs, fn {src_txid, src_ix} ->
-      case mark_spent(src_txid, src_ix, txid, how, slot) do
-        :ok -> []
-        {:error, :no_target} -> [{src_txid, src_ix}]
-      end
-    end)
-  end
+  # NOTE: the per-tx UTxO logic (create outputs / apply spends, incl. the collateral-return-at-
+  # index-length(outputs) rule) now lives in Cardamom.Ledger.TxHandler, driven per-tx by
+  # Cardamom.Ledger.Container. insert_txo/mark_spent below are the storage primitives it calls.
 
   @doc "Resolve a TXO by its (txid, ix) reference: cache → SQLite read-through, or nil."
   def txo(txid, ix) when is_binary(txid) and is_integer(ix) do
@@ -676,7 +645,11 @@ defmodule Cardamom.ChainStore do
   defp mints_ada?(n) when is_integer(n), do: n != 0
   defp mints_ada?(_other), do: false
 
-  defp insert_txo(txid, ix, out, slot) do
+  @doc """
+  Storage primitive: create one TXO (txid, ix) as unspent. on_conflict: :nothing preserves an
+  existing row's spend state (re-extraction is idempotent). Called by Cardamom.Ledger.TxHandler.
+  """
+  def insert_txo(txid, ix, out, slot) do
     attrs = %{
       txid: txid,
       ix: ix,
@@ -791,6 +764,14 @@ defmodule Cardamom.ChainStore do
   no-op (nothing left above it). Returns the count of {resurrected, deleted, graveyarded}.
   """
   def rollback(slot) when is_integer(slot) do
+    # 0. TERMINATE live BlockHandlers for orphaned blocks (slot > point) FIRST. Each handler's
+    #    ordered shutdown kills its tx retriers, CONFIRMS them dead, then cleans its own block's
+    #    UTXOs (kill-confirm-then-clean — see Cardamom.Ledger.BlockHandler). terminate_block is
+    #    SYNCHRONOUS, so on return every orphaned handler's per-block cleanup has committed and NO
+    #    retrier can still be writing. The bulk sweep below is then a safe idempotent backstop for
+    #    orphaned blocks that had no live handler (already-completed ones).
+    terminate_orphaned_handlers(slot)
+
     # 1. RESURRECT: un-spend UTXOs whose spend was in a rolled-back block.
     {resurrected, _} =
       Repo.update_all(
@@ -830,6 +811,50 @@ defmodule Cardamom.ChainStore do
     Logger.info("rollback to slot #{slot}: resurrected #{resurrected}, deleted #{deleted}, graveyarded #{graveyarded} block(s)")
     {:ok, %{resurrected: resurrected, deleted: deleted, graveyarded: graveyarded}}
   end
+
+  # Terminate every live BlockHandler whose block is orphaned (slot > point). Each termination is
+  # synchronous and runs that handler's own kill-confirm-then-clean. Blocks with no live handler
+  # (already-completed) are left to the bulk sweep in rollback/1.
+  defp terminate_orphaned_handlers(slot) do
+    import Ecto.Query
+
+    Repo.all(from b in BlockRow, where: b.slot > ^slot, select: b.hash)
+    |> Enum.each(&Cardamom.Ledger.BlockSupervisor.terminate_block/1)
+  rescue
+    _ -> :ok
+  end
+
+  @doc """
+  Clean ONE block's DB effects — called by a `Cardamom.Ledger.BlockHandler` in its terminate/2
+  AFTER it has killed and CONFIRMED-DEAD its tx retriers (so no retrier can still write). Resurrect
+  the UTXOs this block spent (spent_slot == slot → nil) and delete the outputs it created
+  (created_slot == slot). All writes go through the single-connection Ecto pool, which serialises
+  this cleanup after any write a now-dead retrier already enqueued. Scoped by slot (a block's txos
+  all carry its slot); the block's hash is logged for traceability.
+  """
+  def rollback_block(hash, slot) when is_binary(hash) and is_integer(slot) do
+    import Ecto.Query
+
+    {resurrected, _} =
+      Repo.update_all(
+        from(t in Txo, where: t.spent_slot == ^slot),
+        set: [spent_by: nil, spent_how: nil, spent_slot: nil]
+      )
+
+    {deleted, _} = Repo.delete_all(from t in Txo, where: t.created_slot == ^slot)
+    Cache.delete_all()
+
+    require Logger
+    Logger.info("rollback_block #{Base.encode16(hash, case: :lower) |> binary_part(0, 8)} slot=#{slot}: resurrected #{resurrected}, deleted #{deleted}")
+    :ok
+  rescue
+    e ->
+      require Logger
+      Logger.warning("rollback_block failed: #{inspect(e)}")
+      :ok
+  end
+
+  def rollback_block(_hash, nil), do: :ok
 
   # Datums are arbitrary CBOR terms; persist as bytes (re-encode the decoded term). nil
   # stays nil (no inline datum / hash-only output).

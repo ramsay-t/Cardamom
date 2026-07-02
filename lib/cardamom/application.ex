@@ -25,6 +25,12 @@ defmodule Cardamom.Application do
         # The store's fetch-coordinator process (owns the round-robin block-fetch
         # channel list). Pure store ops don't need it; get_blocks coordination does.
         Cardamom.ChainStore,
+        # Block-as-container extraction: a Registry (hash -> handler pid) + a DynamicSupervisor of
+        # per-block handlers, each owning one retrier process per tx. NOT skipped in :test —
+        # extract_block spawns into these, and tests await handler completion. After ChainStore
+        # (handlers/retriers write through it) and before anything that ingests blocks.
+        Cardamom.Ledger.BlockRegistry,
+        Cardamom.Ledger.BlockSupervisor,
         # Read-only observability hub (telemetry -> snapshot for the UI).
         Cardamom.Stats,
         # Read-only registry of open peer connections (network topology view).
@@ -134,6 +140,9 @@ defmodule Cardamom.Application do
     Application.put_env(:cardamom, :fetch_bodies, cfg.fetch_bodies != false)
     # Same for the metronome batch size (blocks per fetch tick); BodyFetcher.init reads :body_batch.
     if cfg.body_batch, do: Application.put_env(:cardamom, :body_batch, cfg.body_batch)
+    # And chain-sync pipeline depth (MsgRequestNext kept in flight); ChainSync.Client.init reads
+    # :chainsync_depth. Higher hides the per-header round-trip on the single ordered channel.
+    if cfg.chainsync_depth, do: Application.put_env(:cardamom, :chainsync_depth, cfg.chainsync_depth)
 
     path = Cardamom.Store.Repo.db_path(cfg.network)
     repo_cfg = Application.get_env(:cardamom, Cardamom.Store.Repo, [])
