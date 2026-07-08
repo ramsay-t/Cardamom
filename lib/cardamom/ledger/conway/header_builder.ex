@@ -31,6 +31,19 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
     slot = Keyword.get(opts, :slot, 0)
     prev_hash = Keyword.get(opts, :prev_hash, nil)
 
+    # REAL operational-cert signature so a built header PASSES the production validation gate
+    # (Praos.Validation.verify_ocert). Generate an Ed25519 COLD keypair; the cold vkey goes at the
+    # issuer position, and sigma is the cold key's genuine Ed25519 signature over the opcert signed
+    # bytes: hot_vkey || counter(be64) || kes_period(be64) (byte-exact, cardano-ledger OCert.hs).
+    # This makes synthetic headers indistinguishable from real ones to the validator — SimPeer and
+    # tests exercise the real crypto path, not a bypass. Deterministic key optional via :cold_seed.
+    {cold_pub, cold_priv} = cold_keypair(opts)
+    hot_vkey = :crypto.strong_rand_bytes(32)
+    counter = Keyword.get(opts, :ocert_counter, 0)
+    kes_period = Keyword.get(opts, :ocert_kes_period, 0)
+    signed = <<hot_vkey::binary, counter::unsigned-big-64, kes_period::unsigned-big-64>>
+    sigma = :crypto.sign(:eddsa, :none, signed, [cold_priv, :ed25519])
+
     # FLAT 15-element TPraos header body (two VRFs; OCert + ProtVer inlined as CBORGroups),
     # matching the captured era-4 Preview fixture. (This is the TPraos shape, not Praos —
     # hence @era 4 above.)
@@ -38,7 +51,7 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
       block_number,
       slot,
       prev_hash_field(prev_hash),
-      b(32),
+      %CBOR.Tag{tag: :bytes, value: cold_pub},
       b(32),
       [b(64), b(80)],
       [b(64), b(80)],
@@ -46,11 +59,11 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
       # block_body_hash: an explicit value (a real commitment, for block building) or
       # a random placeholder (header-only tests that don't verify the body).
       Keyword.get(opts, :block_body_hash, b(32)),
-      # opcert flattened: hot_vkey, n, kes_period, sigma
-      b(32),
-      0,
-      0,
-      b(64),
+      # opcert flattened: hot_vkey, n, kes_period, sigma (sigma now a REAL cold-key signature)
+      %CBOR.Tag{tag: :bytes, value: hot_vkey},
+      counter,
+      kes_period,
+      %CBOR.Tag{tag: :bytes, value: sigma},
       # protver flattened: major, minor
       10,
       0
@@ -74,4 +87,18 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
   defp prev_hash_field(h) when is_binary(h), do: %CBOR.Tag{tag: :bytes, value: h}
 
   defp b(n), do: %CBOR.Tag{tag: :bytes, value: :crypto.strong_rand_bytes(n)}
+
+  # An Ed25519 cold keypair for the opcert. Random by default; pass :cold_seed (32 bytes) for a
+  # DETERMINISTIC key (tests that want a stable issuer across builds). Returns {pub, priv}.
+  defp cold_keypair(opts) do
+    case Keyword.get(opts, :cold_seed) do
+      seed when is_binary(seed) and byte_size(seed) == 32 ->
+        {pub, priv} = :crypto.generate_key(:eddsa, :ed25519, seed)
+        {pub, priv}
+
+      _ ->
+        {pub, priv} = :crypto.generate_key(:eddsa, :ed25519)
+        {pub, priv}
+    end
+  end
 end

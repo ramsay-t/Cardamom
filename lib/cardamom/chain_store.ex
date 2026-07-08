@@ -657,14 +657,13 @@ defmodule Cardamom.ChainStore do
       value: out.value,
       datum_hash: out.datum_hash,
       datum: encode_datum(out.datum),
-      raw: out.raw,
       created_txid: txid,
       created_slot: slot,
       spent_by: nil
     }
 
     # On conflict, DO NOTHING — insert the output if it's not already there; if it is, leave the
-    # existing row completely untouched. A UTxO's creation fields (address/value/datum/raw) are
+    # existing row completely untouched. A UTxO's creation fields (address/value/datum) are
     # IMMUTABLE — the block that created it always creates the same output — so there's nothing to
     # update. Critically this means re-extracting a block (header-triggered re-load) can NEVER
     # clobber an already-SPENT output's spend state: :replace_all would reset spent_by → nil and
@@ -1011,6 +1010,8 @@ defmodule Cardamom.ChainStore do
     timeout: -5,
     sent_invalid_tx: -10,
     sent_undecodable_tx: -10,
+    sent_invalid_header: -10,
+    sent_undecodable_header: -10,
     protocol_violation: -25
   }
 

@@ -28,6 +28,9 @@ defmodule Cardamom.ChainSync.Client do
   alias Cardamom.Mux.Reassembler
 
   @chain_sync 2
+  # After this many CONSECUTIVE HeaderHandler crashes, stall the pipeline (a crash loop is a bug to
+  # surface, not to spin on — Ramsay). A clean handler completion resets the count.
+  @max_consecutive_crashes 5
   # Default era for header shapes that arrive WITHOUT an era tag (older bare-bytes fixtures).
   # 4 = Alonzo/TPraos — the 15-field shape HeaderBuilder produces. Real relays always send the
   # tag, and HeaderBuilder now tags its envelope era 4 too; this is just the no-tag fallback.
@@ -72,11 +75,17 @@ defmodule Cardamom.ChainSync.Client do
       ledger: ledger,
       reasm: Reassembler.new(),
       awaiting_intersect?: false,
-      # Pipelining: `depth` is the target in-flight RequestNext count; `in_flight` the current.
-      # We only pipeline while STREAMING (after the cursor-set); the resume/intersect phase stays
-      # single-in-flight (request one, wait) so we don't fire requests before the cursor exists.
+      # Pipelining: `depth` is the target in-flight count; `in_flight` the current. A slot is held
+      # by an unanswered RequestNext OR (once a RollForward spawns one) by a live HeaderHandler —
+      # an incomplete handler counts, so we never outrun the forest. The slot frees on the handler's
+      # :DOWN. We only pipeline while STREAMING (after the cursor-set).
       depth: depth,
-      in_flight: 0
+      in_flight: 0,
+      # CRASH-LOOP circuit breaker: a handler crash (abnormal :DOWN) is a BUG on that input, not
+      # progress; freeing+refilling would auto-repeat it. Count consecutive crashes; after the cap,
+      # STALL the pipeline (stop requesting) + log loudly. A clean completion resets the count.
+      consecutive_crashes: 0,
+      stalled?: false
     }
 
     # RESUME (reverse direction): before demanding from genesis, ask ChainStore where we left
@@ -118,6 +127,34 @@ defmodule Cardamom.ChainSync.Client do
     {:noreply, reassemble(payload, state)}
   end
 
+  # A monitored HeaderHandler finished — its in-flight SLOT frees. :normal = stored/rejected
+  # (progress) → reset the crash counter and refill. Abnormal = a BUG on that input → free the slot
+  # but count it; a run of them trips the circuit breaker (stall + loud log) so we don't crash-loop
+  # the pipeline (Ramsay: repeated DOWNs may be a crashing bug we'd otherwise repeat).
+  def handle_info({:DOWN, _ref, :process, _pid, reason}, state) when reason in [:normal, :noproc] do
+    # :normal = stored/rejected; :noproc = we monitored an already-finished (deduped) handler —
+    # both are progress, not a crash.
+    state = %{reply_received(state) | consecutive_crashes: 0}
+    {:noreply, fill_pipeline(state)}
+  end
+
+  def handle_info({:DOWN, _ref, :process, _pid, reason}, state) do
+    crashes = state.consecutive_crashes + 1
+    Logger.warning("chain_sync: HeaderHandler crashed (#{crashes} in a row): #{inspect(reason)}")
+    state = %{reply_received(state) | consecutive_crashes: crashes}
+
+    if crashes >= @max_consecutive_crashes do
+      Logger.error(
+        "chain_sync: #{crashes} consecutive HeaderHandler crashes — STALLING header pipeline " <>
+          "(likely a decode/validation bug on incoming headers). Not requesting more until restart."
+      )
+
+      {:noreply, %{state | stalled?: true}}
+    else
+      {:noreply, fill_pipeline(state)}
+    end
+  end
+
   def handle_info({:EXIT, _from, reason}, state), do: {:stop, reason, state}
 
   defp reassemble(payload, %{reasm: reasm} = state) do
@@ -132,27 +169,29 @@ defmodule Cardamom.ChainSync.Client do
   end
 
   defp handle_msg({:roll_forward, header, tip}, state) do
-    # Hand the header to the LEDGER layer (the network layer is generic over what a
-    # header means). The full raw header hex is logged at lazy :debug inside
-    # header_meta/1 — that IS our capture mechanism (no separate capture flag).
-    meta = header_meta(header) |> Map.put(:tip, describe(tip))
+    # PIPELINE with HANDLER-COMPLETION BACKPRESSURE. chain-sync (NETWORK layer) strips the envelope
+    # to {era, raw} and hands the header to a supervised HeaderHandler that owns the LEDGER pipeline
+    # (decode → VALIDATE gate → store). The in-flight SLOT this reply occupied does NOT free now —
+    # it TRANSFERS to the handler: an incomplete handler still counts against the `depth` quota. We
+    # MONITOR the handler; only when it finishes (stored OR rejected → exits, any :DOWN) does the
+    # slot free and one new RequestNext go out. So we keep ≤ depth handlers working at once and
+    # never outrun the forest, WITHOUT blocking this process — any handler's completion refills.
+    # (Decoding moved to the handler, so this RollForward event is lightweight; the handler emits
+    # the rich HeaderStored/HeaderRejected detail.)
+    emit("RollForward", %{tip: describe(tip)}, state)
+    state = %{state | awaiting_intersect?: false, headers_seen: state.headers_seen + 1}
 
-    # A (re)seen header INVALIDATES any "done" state for its block: if we already have the block
-    # stored, reset txo_processed=false so the reconciler RE-EXTRACTS it. This makes the header
-    # the source of truth and the block's TXO extraction a derived, self-healing consequence —
-    # so a block whose txos were wiped (e.g. by a bad rollback) rebuilds the next time its header
-    # streams past, with no stale-flag bookkeeping to trust. Re-extraction is idempotent (UPSERT),
-    # so re-seeing a header whose txos are fine is a harmless no-op.
-    mark_block_for_reextract(meta[:header_hash])
+    case dispatch_header(header, state) do
+      {:handler, pid} ->
+        # Monitor the handler; its :DOWN frees the slot (see handle_info). in_flight unchanged —
+        # the reply's slot is now the handler's.
+        Process.monitor(pid)
+        state
 
-    emit("RollForward", meta, state)
-    # A header is a reply to one in-flight RequestNext: consume it, clear awaiting_intersect? (the
-    # first reply — fwd OR back — means the cursor is set and we're streaming), then refill the
-    # pipeline to `depth` so we always have up to N requests outstanding, hiding the round-trip.
-    # (A RollForward as the FIRST reply happens when there's nothing to roll back to — the
-    # intersection is at/ahead of our tip; the producer just streams forward.)
-    state = %{reply_received(state) | awaiting_intersect?: false} |> fill_pipeline()
-    %{state | headers_seen: state.headers_seen + 1}
+      :inline ->
+        # No HeaderSupervisor (bare unit tests): handled synchronously already, so free + refill now.
+        state |> reply_received() |> fill_pipeline()
+    end
   end
 
   # The CURSOR-SET RollBackward that FOLLOWS a FindIntersect: the producer is establishing our
@@ -248,6 +287,10 @@ defmodule Cardamom.ChainSync.Client do
   # A reply (RollForward/RollBackward/AwaitReply) consumed one outstanding request.
   defp reply_received(%{in_flight: n} = state), do: %{state | in_flight: max(n - 1, 0)}
 
+  # A STALLED pipeline (crash-loop circuit breaker tripped) sends nothing — a bug to surface, not
+  # to spin on.
+  defp fill_pipeline(%{stalled?: true} = state), do: state
+
   # Top the pipeline back up to `depth` outstanding RequestNexts. Sends (depth - in_flight)
   # requests back-to-back — the relay streams the replies in chain order, hiding the round-trip.
   # No-op once we're at depth. Not used while awaiting the intersect cursor-set (single-in-flight).
@@ -283,70 +326,55 @@ defmodule Cardamom.ChainSync.Client do
   # the era tag is what selects the right decoder. EVERY successfully-decoded era is fed to the
   # forest and persisted: that is what lets the chain advance across hard forks (the old code
   # only knew one shape and silently dropped all others). NEVER reconstruct bytes by re-encoding.
-  defp header_meta(header) do
+  # Strip the transport envelope (NETWORK concern) and hand {era, raw} to a supervised
+  # HeaderHandler, which owns the LEDGER pipeline: decode → VALIDATE (gate) → store. The handler
+  # drops an invalid/undecodable header (never persisted) and docks the peer; it also does the
+  # header-re-extract marking (it needs the decoded hash). Fallback: in bare unit tests without the
+  # HeaderSupervisor running, decode+store inline (the old path) so those tests still exercise the
+  # store. The `peer` passed for reputation is nil until host/port is plumbed through chain-sync
+  # (docking is best-effort and guarded on a real %{host, port}).
+  # Returns `{:handler, pid}` (the caller MONITORS it — the slot frees on its :DOWN) or `:inline`
+  # (handled synchronously; caller frees the slot now). An unrecognised envelope is dropped inline.
+  defp dispatch_header(header, _state) do
     case unwrap_header(header) do
       {era, raw} when is_binary(raw) ->
-        decode_and_store(era, raw)
+        if Process.whereis(Cardamom.Ledger.HeaderSupervisor) do
+          {:ok, pid} = Cardamom.Ledger.HeaderSupervisor.start_header(era, raw, nil)
+          {:handler, pid}
+        else
+          decode_store_inline(era, raw)
+          :inline
+        end
 
       _ ->
         Logger.warning("chain_sync: header did not match the [era, #6.24(bytes)] envelope")
-        %{header_raw_term: inspect(header)}
+        :inline
     end
   end
 
-  defp decode_and_store(era, raw) do
+  # Fallback for bare unit tests (no HeaderSupervisor): the old inline decode → forest → persist,
+  # plus the re-extract marking. NOT used in the running node (the handler does this).
+  defp decode_store_inline(era, raw) do
     case Cardamom.Ledger.Header.decode(era, raw) do
       {:ok, h} ->
-        feed_forest(h.hash_hex, prev_hex(h.prev_hash))
-        persist_header(h, raw)
+        mark_block_for_reextract(h.hash_hex)
+        if Process.whereis(Cardamom.Forest.Server),
+          do: Cardamom.Forest.Server.add_header(h.hash_hex, prev_hex(h.prev_hash))
 
-        %{
-          header_era: era,
-          header_hash: h.hash_hex,
-          header_slot: h.slot,
-          header_block: h.block_number,
-          header_prev: prev_hex(h.prev_hash),
-          header_bytes: byte_size(raw)
-        }
+        if Process.whereis(Cardamom.Store.Repo),
+          do: Cardamom.ChainStore.put_decoded_header(h, raw)
 
       {:error, reason} ->
-        # A genuine decode failure — log it LOUDLY with the era so shape drift (e.g. a new hard
-        # fork we don't yet decode) is visible, not silently swallowed like the pre-fix bug.
         Logger.warning("chain_sync: header decode FAILED era=#{era} reason=#{inspect(reason)}")
-        %{header_era: era, header_decode_error: inspect(reason), header_bytes: byte_size(raw)}
-    end
-  end
-
-  defp prev_hex(nil), do: nil
-  defp prev_hex(bin) when is_binary(bin), do: Base.encode16(bin, case: :lower)
-
-  # Feed the forest if one is running (best-effort; absent in unit tests).
-  defp feed_forest(hash_hex, parent_hex) do
-    if Process.whereis(Cardamom.Forest.Server) do
-      Cardamom.Forest.Server.add_header(hash_hex, parent_hex)
-    end
-
-    :ok
-  end
-
-  # Persist the decoded header (+ verbatim raw bytes) to the durable store, if it's
-  # running (best-effort; absent in bare unit tests). This is the forward/write half:
-  # everything chain-sync sees lands in SQLite so a restart can resume from it.
-  # Store EVERYTHING that arrives, verdict-free — orphans, fork losers, and (once we
-  # validate) invalid headers all get a durable row. The header table is forensic
-  # truth, NOT a set of trusted headers. So we do NOT write a "tip" here: the latest
-  # RollForward is just "the last thing this relay sent", not our believed tip. The
-  # tip / resume points are the FOREST's judgement (its connected — later, valid —
-  # leaves), recorded at shutdown / on demand, not from this linear stream.
-  defp persist_header(h, raw) do
-    if Process.whereis(Cardamom.Store.Repo) do
-      Cardamom.ChainStore.put_decoded_header(h, raw)
     end
 
     :ok
   rescue
-    e -> Logger.warning("chain_store put_header failed: #{inspect(e)}")
+    e -> Logger.warning("chain_sync inline header store failed: #{inspect(e)}")
   end
+
+  defp prev_hex(nil), do: nil
+  defp prev_hex(bin) when is_binary(bin), do: Base.encode16(bin, case: :lower)
 
   # Strip the transport envelope to `{era_tag, raw header bytes}`. CONFIRMED from real Preview:
   # `[era, #6.24(bytes)]` — era tag, then CBOR tag-24 (wrapCBORinCBOR) wrapping the header byte

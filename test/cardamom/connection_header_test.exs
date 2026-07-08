@@ -1,9 +1,11 @@
 defmodule Cardamom.ConnectionHeaderTest do
   @moduledoc """
-  RollForward header handling: the network layer strips the transport envelope
-  (wrapCBORinCBOR + era tag) to raw header bytes, fully decodes them via the
-  Conway header decoder, emits the real point (hash, slot, block, prev), and
-  feeds the forest. Tested with STRUCTURALLY-REAL headers from HeaderBuilder.
+  RollForward header handling: chain-sync strips the transport envelope (wrapCBORinCBOR + era tag)
+  to raw header bytes and hands them to a supervised HeaderHandler, which decodes → VALIDATES →
+  stores and emits the rich "HeaderStored" event (hash, slot, block, prev) — or "HeaderRejected"
+  for an undecodable/invalid header. Tested with STRUCTURALLY-REAL, VALIDLY-SIGNED headers from
+  HeaderBuilder (so they pass the opcert gate). The decode+emit moved from chain-sync into the
+  HeaderHandler; these tests now assert on the handler's HeaderStored/HeaderRejected event.
   """
   use ExUnit.Case, async: false
   @moduletag :capture_log
@@ -53,12 +55,10 @@ defmodule Cardamom.ConnectionHeaderTest do
     tip = [[hdr.slot, %CBOR.Tag{tag: :bytes, value: hdr.hash}], hdr.block_number]
     :ok = Frame.send_msg(pe, @chain_sync, CS.encode({:roll_forward, envelope, tip}))
 
-    # Match the event for THIS header specifically (slot 9999) — not merely the first
-    # {:event,_} in the mailbox, which under a full-suite run can be a stale/other event.
+    # Match the HeaderHandler's HeaderStored event for THIS header specifically (slot 9999).
     expected = Base.encode16(hdr.hash, case: :lower)
-    assert_receive {:event, %{header_slot: 9999} = meta}, 1000
+    assert_receive {:event, %{msg: "HeaderStored", header_slot: 9999} = meta}, 1000
     assert meta.header_hash == expected
-    refute Map.has_key?(meta, :header_raw_term), "must decode, not fall back"
   end
 
   test "a real era-wrapped header is unwrapped, decoded, and its real fields emitted",
@@ -66,10 +66,8 @@ defmodule Cardamom.ConnectionHeaderTest do
     hdr = HeaderBuilder.build(block_number: 42, slot: 4242)
     :ok = roll_forward(pe, hdr)
 
-    assert_receive {:event, meta}, 1000
-    assert meta.msg == "RollForward"
+    assert_receive {:event, %{msg: "HeaderStored", header_slot: 4242} = meta}, 1000
     assert meta.header_hash == Base.encode16(hdr.hash, case: :lower)
-    assert meta.header_slot == 4242
     assert meta.header_block == 42
     assert meta.header_bytes == byte_size(hdr.raw)
   end
@@ -79,7 +77,7 @@ defmodule Cardamom.ConnectionHeaderTest do
     hdr = HeaderBuilder.build(block_number: 2, slot: 2, prev_hash: parent_hash)
     :ok = roll_forward(pe, hdr)
 
-    assert_receive {:event, meta}, 1000
+    assert_receive {:event, %{msg: "HeaderStored", header_slot: 2} = meta}, 1000
     assert meta.header_prev == Base.encode16(parent_hash, case: :lower)
   end
 
@@ -87,27 +85,34 @@ defmodule Cardamom.ConnectionHeaderTest do
     hdr = HeaderBuilder.build(block_number: 0, slot: 0, prev_hash: nil)
     :ok = roll_forward(pe, hdr)
 
-    assert_receive {:event, meta}, 1000
+    assert_receive {:event, %{msg: "HeaderStored", header_slot: 0} = meta}, 1000
     assert meta.header_prev == nil
   end
 
-  test "an unrecognised / undecodable header logs the raw term, never invents fields",
+  test "an undecodable header (garbage bytes in a valid envelope) is REJECTED by the handler",
        %{peer_end: pe} do
-    # A non-header CBOR structure in the header slot.
-    :ok = Frame.send_msg(pe, @chain_sync, CS.encode({:roll_forward, [1, 2, 3], [1, <<0::256>>]}))
+    # Well-formed transport envelope [era, tag24(bytes)] but the BYTES aren't a decodable header →
+    # the handler reaches decode, fails, emits HeaderRejected (undecodable), and does NOT persist
+    # it (the gate). (A non-envelope term like [1,2,3] is dropped earlier, at the network unwrap,
+    # before a handler is even spawned — that's a different, chain-sync-level path.)
+    garbage = <<0xA1, 0x01, 0x02>>
+    env = [4, %CBOR.Tag{tag: 24, value: %CBOR.Tag{tag: :bytes, value: garbage}}]
+    :ok = Frame.send_msg(pe, @chain_sync, CS.encode({:roll_forward, env, [1, <<0::256>>]}))
 
-    assert_receive {:event, meta}, 1000
+    assert_receive {:event, %{msg: "HeaderRejected", rejected: :undecodable} = meta}, 1000
     refute Map.has_key?(meta, :header_hash)
-    assert Map.has_key?(meta, :header_raw_term)
   end
 
   test "identical real headers produce identical hashes over the wire", %{peer_end: pe} do
     hdr = HeaderBuilder.build(block_number: 5, slot: 5)
     :ok = roll_forward(pe, hdr)
-    assert_receive {:event, m1}, 1000
+    assert_receive {:event, %{msg: "HeaderStored", header_slot: 5} = m1}, 1000
+    # Re-send the SAME bytes; the prior handler has exited so a fresh one spawns and re-emits.
+    # Identical raw bytes → identical blake2b hash.
     :ok = roll_forward(pe, hdr)
-    assert_receive {:event, m2}, 1000
+    assert_receive {:event, %{msg: "HeaderStored", header_slot: 5} = m2}, 1000
     assert m1.header_hash == m2.header_hash
+    assert m1.header_hash == Base.encode16(hdr.hash, case: :lower)
   end
 
   # MC/DC for unwrap_header/1 (per the pattern-matching paper): the transport envelope
@@ -122,9 +127,8 @@ defmodule Cardamom.ConnectionHeaderTest do
       tip = [[hdr.slot, %CBOR.Tag{tag: :bytes, value: hdr.hash}], hdr.block_number]
       :ok = Frame.send_msg(pe, @chain_sync, CS.encode({:roll_forward, env, tip}))
 
-      assert_receive {:event, meta}, 1000
+      assert_receive {:event, %{msg: "HeaderStored", header_slot: 70} = meta}, 1000
       assert meta.header_hash == Base.encode16(hdr.hash, case: :lower)
-      refute Map.has_key?(meta, :header_raw_term), "must decode via this clause, not fall back"
     end
 
     test "bare tag(:bytes) (no era wrapper) decodes", %{peer_end: pe} do
@@ -133,9 +137,8 @@ defmodule Cardamom.ConnectionHeaderTest do
       tip = [[hdr.slot, %CBOR.Tag{tag: :bytes, value: hdr.hash}], hdr.block_number]
       :ok = Frame.send_msg(pe, @chain_sync, CS.encode({:roll_forward, env, tip}))
 
-      assert_receive {:event, meta}, 1000
+      assert_receive {:event, %{msg: "HeaderStored", header_slot: 80} = meta}, 1000
       assert meta.header_hash == Base.encode16(hdr.hash, case: :lower)
-      refute Map.has_key?(meta, :header_raw_term)
     end
   end
 end

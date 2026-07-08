@@ -31,6 +31,11 @@ defmodule Cardamom.Application do
         # (handlers/retriers write through it) and before anything that ingests blocks.
         Cardamom.Ledger.BlockRegistry,
         Cardamom.Ledger.BlockSupervisor,
+        # Header pipeline (receive → decode → VALIDATE → store), one handler per header. Mirrors
+        # the Block trio. The validate stage is the GATE: an invalid/undecodable header is dropped
+        # (never persisted) and the peer docked. NOT :test-skipped — chain-sync spawns into these.
+        Cardamom.Ledger.HeaderRegistry,
+        Cardamom.Ledger.HeaderSupervisor,
         # Read-only observability hub (telemetry -> snapshot for the UI).
         Cardamom.Stats,
         # Read-only registry of open peer connections (network topology view).
@@ -207,6 +212,10 @@ defmodule Cardamom.Application do
     path = session_log_path(dir)
 
     :logger.add_handler(:cardamom_file, :logger_std_h, file_handler_config(path))
+
+    # Stash the resolved session tag so the UI can show WHICH instance it is (several may run at
+    # once). Same value as the log filename's tag (session_name/0). nil when untagged.
+    Application.put_env(:cardamom, :session_tag, session_name())
 
     # Pull the params-file `debug_raw_bytes` into app env so Cardamom.Debug sees it, THEN install
     # the :raw_bytes category filter (drops the huge raw-wire hex dumps unless switched on; see

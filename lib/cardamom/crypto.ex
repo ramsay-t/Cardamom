@@ -17,4 +17,21 @@ defmodule Cardamom.Crypto do
   """
   @spec blake2b_256(iodata()) :: <<_::256>>
   def blake2b_256(data), do: Blake2.hash2b(data, 32)
+
+  @doc """
+  Ed25519 signature verification — Cardano's DSIGN. Returns true iff `sig` (64 bytes) is a valid
+  Ed25519 signature over `msg` by the public key `vkey` (32 bytes). Cardano signs the RAW message
+  bytes (no pre-hash) — Ed25519 hashes internally (SHA-512) — so we pass the message straight to
+  :crypto with no digest step. Any malformed key/sig → false (never raises), so a lying header is
+  rejected, not a crash.
+  """
+  @spec ed25519_verify(binary(), binary(), binary()) :: boolean()
+  def ed25519_verify(msg, sig, vkey)
+      when is_binary(msg) and byte_size(sig) == 64 and byte_size(vkey) == 32 do
+    :crypto.verify(:eddsa, :none, msg, sig, [vkey, :ed25519])
+  rescue
+    _ -> false
+  end
+
+  def ed25519_verify(_msg, _sig, _vkey), do: false
 end

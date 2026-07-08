@@ -93,8 +93,10 @@ defmodule Cardamom.ChainSync.ClientTest do
     msg = {:roll_forward, header, [123, <<0::256>>]}
     :ok = Frame.send_msg(peer_end, @chain_sync, CSCodec.encode(msg))
 
+    # chain-sync emits a lightweight RollForward (decode/store moved to the HeaderHandler); the
+    # header content is incidental here — the point is the client processes the reply and asks again.
     assert_receive {:telemetry, [:cardamom, :protocol, :event], %{count: 1},
-                    %{msg: "RollForward", header_bytes: 16, tip: %{slot: 123}}}, 1_000
+                    %{msg: "RollForward", tip: %{slot: 123}}}, 1_000
 
     assert {:ok, payload, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
     assert {:ok, :request_next, ""} = CSCodec.decode(payload)
@@ -171,8 +173,10 @@ defmodule Cardamom.ChainSync.ClientTest do
     :ok = Frame.send_msg(peer_end, @chain_sync, tail)
 
     # The reassembled RollForward must produce exactly one protocol event (and the
-    # client must then ask for the next — proving it processed the whole message).
-    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollForward", header_bytes: 1200}}, 1_000
+    # client must then ask for the next — proving it processed the whole message). The event is the
+    # lightweight RollForward (decode moved to the HeaderHandler); size fidelity is what matters —
+    # a mis-reassembled message wouldn't decode as a RollForward at all.
+    assert_receive {:telemetry, [:cardamom, :protocol, :event], _, %{msg: "RollForward", tip: %{slot: 123}}}, 1_000
     assert {:ok, payload, _, _} = Frame.recv_msg(peer_end, <<>>, 1_000)
     assert {:ok, :request_next, ""} = CSCodec.decode(payload)
     assert Process.alive?(cs)

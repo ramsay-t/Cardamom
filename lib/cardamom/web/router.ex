@@ -81,13 +81,18 @@ defmodule Cardamom.Web.Router do
   # Chain-data view: the body-backfill progress (headers vs bodies gap) + UTXO-set totals +
   # the recent tx-bearing blocks. Empty view if the store isn't up (e.g. early boot).
   defp chaindata_view do
-    if Process.whereis(Cardamom.ChainStore) do
-      Map.put(Cardamom.ChainStore.chain_summary(), :recent_txs, Cardamom.ChainStore.recent_tx_blocks(10))
-    else
-      %{headers: 0, bodies: 0, gap: 0, pending: 0, txos: 0, unspent: 0, spent: 0, recent_txs: []}
-    end
+    base =
+      if Process.whereis(Cardamom.ChainStore) do
+        Map.put(Cardamom.ChainStore.chain_summary(), :recent_txs, Cardamom.ChainStore.recent_tx_blocks(10))
+      else
+        %{headers: 0, bodies: 0, gap: 0, pending: 0, txos: 0, unspent: 0, spent: 0, recent_txs: []}
+      end
+
+    # The session tag (which instance is this?) — shown next to the live badge so several
+    # concurrently-running nodes are distinguishable. nil when untagged.
+    Map.put(base, :tag, Application.get_env(:cardamom, :session_tag))
   rescue
-    _ -> %{headers: 0, bodies: 0, gap: 0, pending: 0, txos: 0, unspent: 0, spent: 0, recent_txs: []}
+    _ -> %{headers: 0, bodies: 0, gap: 0, pending: 0, txos: 0, unspent: 0, spent: 0, recent_txs: [], tag: nil}
   end
 
   defp page do
@@ -202,9 +207,12 @@ defmodule Cardamom.Web.Router do
         // frozen numbers can't masquerade as live (the 6-day-uptime confusion — it was a dead
         // tab showing its last value). Uptime is the node's OWN wall_clock, polled like any other
         // datum, so a live tab always shows the real node age and a dead one says so.
-        function setConn(live) {
+        function setConn(live, tag) {
           const c = document.getElementById('conn');
-          c.textContent = live ? 'live' : 'disconnected — stale';
+          // Show the session tag next to the badge so several concurrently-running instances are
+          // distinguishable (e.g. "live · parallel"). Only when live and a tag is set.
+          const suffix = (live && tag) ? ' \\u00b7 ' + tag : '';
+          c.textContent = (live ? 'live' : 'disconnected — stale') + suffix;
           c.className = 'conn ' + (live ? 'live' : 'dead');
           document.body.classList.toggle('stale', !live);
         }
@@ -277,7 +285,7 @@ defmodule Cardamom.Web.Router do
                      '</td><td>' + Math.round(p.memory_bytes/1024) + '</td><td>' + p.reductions +
                      '</td><td class="meta">' + esc(p.current_function || '') + '</td></tr>';
             }).join('');
-            setConn(true);
+            setConn(true, cd.tag);
           } catch (e) {
             // A failed poll = the node is unreachable (stopped, or this tab outlived it).
             setConn(false);

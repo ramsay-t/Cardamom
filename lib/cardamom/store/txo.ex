@@ -4,9 +4,10 @@ defmodule Cardamom.Store.Txo do
   the exact reference a spending tx's input carries. `spent_by` is null while UNSPENT
   (a UTXO) and the spending txid once consumed; the UTXO set is `WHERE spent_by IS NULL`.
 
-  `datum`/`datum_hash` are the goal-(b) payload (a contract's current state). `raw` is
-  the verbatim output bytes (forensic). The full tx isn't stored here — it lives in the
-  block raw (Blocks table); only the OUTPUTS, the thing that gets spent, live as rows.
+  `datum`/`datum_hash` are the goal-(b) payload (a contract's current state). The output's
+  verbatim BYTES are NOT stored here — they're redundant (wholly contained in the creating
+  block's blocks.raw, which we keep) and recoverable via Conway.Tx.txs_in(blocks.raw). Only the
+  OUTPUTS, the thing that gets spent, live as rows — with the fields queries actually need.
   """
   use Ecto.Schema
   import Ecto.Changeset
@@ -19,7 +20,6 @@ defmodule Cardamom.Store.Txo do
     field :value, :integer
     field :datum_hash, :binary
     field :datum, :binary
-    field :raw, :binary
     field :created_txid, :binary
     field :spent_by, :binary
     # How it was consumed: "tx_input" (normal) | "collateral" (phase-2 penalty). null = unspent.
@@ -32,7 +32,7 @@ defmodule Cardamom.Store.Txo do
   end
 
   @fields [
-    :txid, :ix, :address, :value, :datum_hash, :datum, :raw,
+    :txid, :ix, :address, :value, :datum_hash, :datum,
     :created_txid, :spent_by, :spent_how, :created_slot, :spent_slot
   ]
   @required [:txid, :ix]
