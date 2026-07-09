@@ -28,7 +28,11 @@ defmodule Cardamom.Ledger.TxRetrier do
   defp apply_until_done(parent, tx, slot) do
     case TxHandler.apply_spends(tx, slot) do
       {:ok, []} ->
-        # Genuinely done — every spend applied. Report and return (exit :normal).
+        # Genuinely done — every spend applied, so this tx's inputs are all resolvable in the UTxO
+        # set. Run the value-conservation CONFORMANCE oracle now (a divergence signal only — never
+        # affects the outcome; an observer doesn't reject a tx the network accepted). Best-effort.
+        _ = safe_conformance(tx)
+        # Report and return (exit :normal).
         send(parent, {:tx_done, self()})
 
       {:ok, _unresolved} ->
@@ -37,5 +41,12 @@ defmodule Cardamom.Ledger.TxRetrier do
         Process.sleep(@retry_ms)
         apply_until_done(parent, tx, slot)
     end
+  end
+
+  # Run the conformance oracle without ever affecting ingest — a check crash must not fail the tx.
+  defp safe_conformance(tx) do
+    Cardamom.Ledger.Conformance.check_value_conservation(tx)
+  rescue
+    _ -> :skip
   end
 end

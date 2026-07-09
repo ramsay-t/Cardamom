@@ -38,6 +38,7 @@ defmodule Cardamom.ChainStore do
 
   alias Cardamom.Store.{Cache, Header, Kv, Repo}
   alias Cardamom.Store.{Txo, MempoolTxo, MempoolGraveyard, MempoolTxInput, Peer, BlockGraveyard}
+  alias Cardamom.Store.{LedgerState, LedgerDelta}
   alias Cardamom.Store.Cached
   import Ecto.Query
 
@@ -771,6 +772,10 @@ defmodule Cardamom.ChainStore do
     #    orphaned blocks that had no live handler (already-completed ones).
     terminate_orphaned_handlers(slot)
 
+    # 0b. LEDGER STATE: roll the non-UTxO accounting state back too, via its invertible per-block
+    #     delta journal (undo each orphaned block's cert delta). Same rollback point as the UTxO set.
+    ledger_rollback(slot)
+
     # 1. RESURRECT: un-spend UTXOs whose spend was in a rolled-back block.
     {resurrected, _} =
       Repo.update_all(
@@ -1062,4 +1067,109 @@ defmodule Cardamom.ChainStore do
         val
     end
   end
+
+  # ---- LEDGER STATE (non-UTxO accounting): generic domain/key -> value, driven by the invertible
+  # ---- delta journal. key/value are OUR term_to_binary blobs (read [:safe]). See
+  # ---- Cardamom.Ledger.{Delta, CertEffects}. ----
+
+  @doc "Read a ledger-state value by (domain, key), or nil. key is any Elixir term."
+  def ledger_read(domain, key) when is_atom(domain) do
+    dk = enc(key)
+    case Repo.get_by(LedgerState, domain: Atom.to_string(domain), key: dk) do
+      %{value: v} when is_binary(v) -> dec(v)
+      _ -> nil
+    end
+  end
+
+  @doc "Set (insert/overwrite) a ledger-state value. Used by :put and :set delta ops."
+  def ledger_put(domain, key, value), do: ledger_set(domain, key, value)
+
+  # A nil value means ABSENT — deleting the row, not storing a nil. This is what makes an overwrite
+  # whose captured old value was nil invert correctly (set-to-nil ≡ remove), so rollback restores
+  # true absence, not a lingering nil row.
+  def ledger_set(domain, key, nil) when is_atom(domain), do: ledger_del(domain, key)
+
+  def ledger_set(domain, key, value) when is_atom(domain) do
+    Repo.insert(
+      %LedgerState{domain: Atom.to_string(domain), key: enc(key), value: enc(value)},
+      on_conflict: [set: [value: enc(value)]],
+      conflict_target: [:domain, :key]
+    )
+
+    :ok
+  end
+
+  @doc "Delete a ledger-state entry (:del op / register-inverse)."
+  def ledger_del(domain, key) when is_atom(domain) do
+    import Ecto.Query
+    Repo.delete_all(from l in LedgerState, where: l.domain == ^Atom.to_string(domain) and l.key == ^enc(key))
+    :ok
+  end
+
+  @doc "Scalar add: value += n (fees/pots/deposit coins). Absent key starts at 0. :add op."
+  def ledger_add(domain, key, n) when is_atom(domain) and is_integer(n) do
+    current = ledger_read(domain, key) || 0
+    ledger_set(domain, key, current + n)
+  end
+
+  @doc """
+  Apply a block's ledger delta (list of Delta ops) AND journal it for rollback. Persists the
+  op-list keyed by slot so a later rollback can invert it, then applies the ops to the state.
+  Prunes journal entries older than the rollback-depth window.
+  """
+  def ledger_apply_block(block_hash, slot, ops) when is_list(ops) do
+    Repo.insert(
+      %LedgerDelta{slot: slot, block_hash: block_hash, ops: :erlang.term_to_binary(ops)},
+      on_conflict: :nothing,
+      conflict_target: [:slot]
+    )
+
+    Cardamom.Ledger.Delta.apply_forward(ops)
+    prune_ledger_deltas(slot)
+    :ok
+  end
+
+  @doc """
+  Roll the ledger state back to `slot`: for every journalled block above it (descending), apply the
+  INVERSE of its ops, then drop the journal row. Mirrors the UTxO rollback but via invertible deltas.
+  """
+  def ledger_rollback(slot) when is_integer(slot) do
+    import Ecto.Query
+
+    Repo.all(from d in LedgerDelta, where: d.slot > ^slot, order_by: [desc: d.slot])
+    |> Enum.each(fn d ->
+      ops = :erlang.binary_to_term(d.ops, [:safe])
+      Cardamom.Ledger.Delta.apply_inverse(ops)
+      Repo.delete_all(from x in LedgerDelta, where: x.slot == ^d.slot)
+    end)
+
+    :ok
+  end
+
+  # Keep only the last @rollback_depth blocks of journal (no honest rollback goes deeper — k).
+  @rollback_depth 2160
+  defp prune_ledger_deltas(current_slot) do
+    import Ecto.Query
+    cutoff = current_slot - @rollback_depth
+    if cutoff > 0, do: Repo.delete_all(from d in LedgerDelta, where: d.slot < ^cutoff)
+    :ok
+  end
+
+  @doc """
+  The deposit protocol params used by cert effects: %{key_deposit, pool_deposit, drep_deposit}.
+  TODO: read from the ENACTED protocol params (Tier-a param tracking) rather than these constants —
+  and key off PROTOCOL MAJOR (version-axes caveat). For now the standard values; a param-update
+  governance action would change them, which we don't yet track. Overridable via app env for tests.
+  """
+  def protocol_deposits do
+    Application.get_env(:cardamom, :protocol_deposits, %{
+      key_deposit: 2_000_000,
+      pool_deposit: 500_000_000,
+      drep_deposit: 500_000_000
+    })
+  end
+
+  # Our-own-data serialisation (never wire-sourced; [:safe] guards corrupt rows). See design memory.
+  defp enc(term), do: :erlang.term_to_binary(term)
+  defp dec(bin), do: :erlang.binary_to_term(bin, [:safe])
 end

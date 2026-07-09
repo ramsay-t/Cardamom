@@ -60,12 +60,37 @@ defmodule Cardamom.Ledger.BlockHandler do
         # at spawn time regardless of whether every UTxO chain has resolved yet.
         Enum.each(txs, &ChainStore.cascade_mempool/1)
 
+        # LEDGER STATE (non-UTxO accounting): apply this block's CERT effects once, as a single
+        # invertible per-block delta (journalled for rollback). Block-level (not per-tx) because the
+        # journal entry is per-block; ops are built in tx order so overwrite-captures see the right
+        # prior state. Best-effort, never fails ingest. See Cardamom.Ledger.{Cert,CertEffects,Delta}.
+        apply_cert_deltas(hash, slot, txs)
+
         {:noreply, %{st | pending: pending}}
 
       {:error, reason} ->
         # Undecodable body — leave txo_processed=false; don't loop. Stop non-normal (no cleanup).
         {:stop, {:decode_failed, reason}, st}
     end
+  end
+
+  # Build + journal + apply this block's cert delta (once). Certs decode from each tx's :certs;
+  # ops are built in tx order so an overwrite-op captures the state left by earlier ops in the
+  # SAME block. ledger_apply_block dedupes by slot (on_conflict :nothing), so a re-extracted block
+  # doesn't re-journal. Best-effort — a ledger-state hiccup must not fail block ingest.
+  defp apply_cert_deltas(hash, slot, txs) do
+    read = fn dom, key -> ChainStore.ledger_read(dom, key) end
+    pp = ChainStore.protocol_deposits()
+
+    ops =
+      txs
+      |> Enum.flat_map(fn tx -> Cardamom.Ledger.Conway.Cert.decode_all(Map.get(tx, :certs)) end)
+      |> Enum.flat_map(fn cert -> Cardamom.Ledger.CertEffects.effects(cert, read, pp) end)
+
+    if ops != [], do: ChainStore.ledger_apply_block(hash, slot, ops)
+    :ok
+  rescue
+    e -> Logger.warning("block #{short(hash)}: cert-delta apply failed: #{inspect(e)}")
   end
 
   @impl true

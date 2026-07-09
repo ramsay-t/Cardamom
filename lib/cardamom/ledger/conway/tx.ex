@@ -105,19 +105,46 @@ defmodule Cardamom.Ledger.Conway.Tx do
       collateral_return: decode_collateral_return(Map.get(body, 16)),
       # fee (key 2) and mint (key 9) — kept raw for phase-1 checks (mint must contain no ADA).
       fee: Map.get(body, 2),
-      mint: Map.get(body, 9)
+      mint: Map.get(body, 9),
+      # LEDGER-STATE / value-conservation terms:
+      #   withdrawals (key 5): reward-account drains, `RewardAddress ⇀ Coin` — a SOURCE of value
+      #     in `consumed` (Utxo.lagda.md:437). Decoded to [{reward_addr_bytes, coin}].
+      #   certs (key 4): kept RAW here (presence + count matters for the deposit/refund terms and
+      #     for safely skipping the conservation check until cert decoding lands).
+      #   donation (key 22): a treasury donation, part of `produced`.
+      withdrawals: decode_withdrawals(Map.get(body, 5)),
+      certs: Map.get(body, 4),
+      donation: Map.get(body, 22)
     }
   end
 
   defp decode_collateral_return(nil), do: nil
   defp decode_collateral_return(out), do: decode_output(out)
 
-  # inputs (key 0): a set/array of [tx_hash(bytes), index].
+  # inputs (key 0): Conway encodes these as a CBOR SET (#6.258([...])), earlier eras as a bare
+  # array. Handle BOTH: unwrap the set tag to its list, then map. (Missing the set clause crashed
+  # decode_inputs with a FunctionClauseError on real Conway inputs — an untested-clause gap the
+  # coverage/MC/DC pass surfaced. conway.cddl: `transaction_inputs = set<transaction_input>`.)
   defp decode_inputs(nil), do: []
+  defp decode_inputs(%CBOR.Tag{tag: 258, value: inputs}), do: decode_inputs(inputs)
 
   defp decode_inputs(inputs) when is_list(inputs) do
     Enum.map(inputs, fn [%CBOR.Tag{tag: :bytes, value: h}, ix] -> {h, ix} end)
   end
+
+  # withdrawals (key 5): CBOR map `reward_address(bytes) ⇀ coin(uint)`. A withdrawal DRAINS a
+  # reward account into the tx's value flow (a SOURCE in `consumed`). Returns [{addr_bytes, coin}];
+  # empty for none. The reward_address key is a bytes blob (header byte + stake credential).
+  defp decode_withdrawals(nil), do: []
+
+  defp decode_withdrawals(m) when is_map(m) do
+    Enum.map(m, fn
+      {%CBOR.Tag{tag: :bytes, value: addr}, coin} when is_integer(coin) -> {addr, coin}
+      {addr, coin} when is_binary(addr) and is_integer(coin) -> {addr, coin}
+    end)
+  end
+
+  defp decode_withdrawals(_), do: []
 
   # outputs (key 1): array of transaction_output. Carve byte spans so each output's raw
   # is preserved verbatim (forensic), then decode each shape.
