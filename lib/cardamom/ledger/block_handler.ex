@@ -42,7 +42,9 @@ defmodule Cardamom.Ledger.BlockHandler do
   def handle_continue(:spawn_children, %{hash: hash, raw: raw, slot: slot} = st) do
     case Cardamom.Ledger.Block.txs_in(raw) do
       {:ok, []} ->
-        # Empty block: trivially all-done.
+        # Empty block: no txs to extract — but it can still CROSS AN EPOCH BOUNDARY (boundary
+        # blocks are often empty), so the ledger delta (epoch transition) must run regardless.
+        apply_ledger_deltas(hash, slot, [])
         ChainStore.mark_txo_processed(hash)
         {:stop, :normal, st}
 
@@ -60,11 +62,11 @@ defmodule Cardamom.Ledger.BlockHandler do
         # at spawn time regardless of whether every UTxO chain has resolved yet.
         Enum.each(txs, &ChainStore.cascade_mempool/1)
 
-        # LEDGER STATE (non-UTxO accounting): apply this block's CERT effects once, as a single
-        # invertible per-block delta (journalled for rollback). Block-level (not per-tx) because the
-        # journal entry is per-block; ops are built in tx order so overwrite-captures see the right
-        # prior state. Best-effort, never fails ingest. See Cardamom.Ledger.{Cert,CertEffects,Delta}.
-        apply_cert_deltas(hash, slot, txs)
+        # LEDGER STATE (non-UTxO accounting): apply this block's ledger effects once, as a single
+        # invertible per-block delta (journalled for rollback): the EPOCH TRANSITION if this block
+        # crosses a boundary, then the block's fee accrual, then its CERT effects. Best-effort,
+        # never fails ingest. See Cardamom.Ledger.{Cert,CertEffects,Delta,EpochTransition}.
+        apply_ledger_deltas(hash, slot, txs)
 
         {:noreply, %{st | pending: pending}}
 
@@ -74,23 +76,84 @@ defmodule Cardamom.Ledger.BlockHandler do
     end
   end
 
-  # Build + journal + apply this block's cert delta (once). Certs decode from each tx's :certs;
-  # ops are built in tx order so an overwrite-op captures the state left by earlier ops in the
-  # SAME block. ledger_apply_block dedupes by slot (on_conflict :nothing), so a re-extracted block
-  # doesn't re-journal. Best-effort — a ledger-state hiccup must not fail block ingest.
-  defp apply_cert_deltas(hash, slot, txs) do
-    read = fn dom, key -> ChainStore.ledger_read(dom, key) end
+  # Build + journal + apply this block's ledger delta (once), in order:
+  #
+  #   1. EPOCH TRANSITION ops, when this block's epoch is beyond :epoch/:last_epoch — the spec's
+  #      NEWEPOCH fires on the first block of the new epoch BEFORE that block's own effects, and
+  #      it must read the PRE-block state (feeSS = fees before this block's fees accrue).
+  #   2. This block's FEE accrual (Σ tx fees into the :fees pot — the reward pot's fee half).
+  #   3. This block's CERT effects, in tx order.
+  #
+  # Every op after the first is built over Delta.read_through of the ops before it, so a captured
+  # `old` reflects the same block's earlier ops (epoch ops, or an earlier cert touching the same
+  # key) — reading the store directly here would capture stale values and break the journal's
+  # invertibility. ledger_apply_block dedupes by slot (on_conflict :nothing), so a re-extracted
+  # block doesn't re-journal. Best-effort — a ledger-state hiccup must not fail block ingest.
+  #
+  # ORDERING ASSUMPTION (recorded, not enforced): deltas assume blocks apply in slot order. Live
+  # chain-sync delivers in order; body BACKFILL can extract out of order, where a cert/epoch op
+  # could capture a wrong old value. The conformance oracles are the drift alarm for this.
+  defp apply_ledger_deltas(hash, slot, txs) do
+    base_read = fn dom, key -> ChainStore.ledger_read(dom, key) end
     pp = ChainStore.protocol_deposits()
+
+    epoch_ops = epoch_transition_ops(hash, slot, base_read)
+
+    fee_ops =
+      case Enum.reduce(txs, 0, fn tx, acc -> acc + tx_fee(tx) end) do
+        0 -> []
+        fees -> [{:add, :fees, :pot, fees}]
+      end
 
     ops =
       txs
       |> Enum.flat_map(fn tx -> Cardamom.Ledger.Conway.Cert.decode_all(Map.get(tx, :certs)) end)
-      |> Enum.flat_map(fn cert -> Cardamom.Ledger.CertEffects.effects(cert, read, pp) end)
+      |> Enum.reduce(epoch_ops ++ fee_ops, fn cert, acc ->
+        read = Cardamom.Ledger.Delta.read_through(acc, base_read)
+        acc ++ Cardamom.Ledger.CertEffects.effects(cert, read, pp)
+      end)
 
     if ops != [], do: ChainStore.ledger_apply_block(hash, slot, ops)
     :ok
   rescue
-    e -> Logger.warning("block #{short(hash)}: cert-delta apply failed: #{inspect(e)}")
+    e -> Logger.warning("block #{short(hash)}: ledger-delta apply failed: #{inspect(e)}")
+  end
+
+  # NEWEPOCH check, cheap path first: one :epoch/:last_epoch read per block; the full ledger
+  # image + UTxO fold load only when a boundary is actually crossed (or on the very first block).
+  # A slot-less block (test/mempool callers) can't be placed in an epoch — no transition.
+  defp epoch_transition_ops(_hash, nil, _read), do: []
+
+  defp epoch_transition_ops(hash, slot, read) do
+    epoch = Cardamom.Ledger.Epoch.of(slot)
+
+    case read.(:epoch, :last_epoch) do
+      # First block ever: just record the epoch — no prior epoch to close, no loads needed.
+      nil ->
+        [{:set, :epoch, :last_epoch, nil, epoch}]
+
+      last when epoch > last ->
+        {ops, _state} =
+          Cardamom.Ledger.EpochTransition.ops(
+            ChainStore.epoch_ledger_state(),
+            epoch,
+            Cardamom.Ledger.EpochTransition.live_deps(hash)
+          )
+
+        ops
+
+      _same_or_behind ->
+        []
+    end
+  end
+
+  # A decoded tx's fee (body key 2) — nil/malformed counts 0 (fee is also cross-checked by the
+  # value-conservation oracle, so a silently-wrong fee shows up as divergence, not nothing).
+  defp tx_fee(tx) do
+    case Map.get(tx, :fee) do
+      f when is_integer(f) and f >= 0 -> f
+      _ -> 0
+    end
   end
 
   @impl true

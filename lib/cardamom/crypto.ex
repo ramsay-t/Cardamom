@@ -19,6 +19,15 @@ defmodule Cardamom.Crypto do
   def blake2b_256(data), do: Blake2.hash2b(data, 32)
 
   @doc """
+  BLAKE2b-224 — Cardano's hash for KEY HASHES: pool ids (hash of the cold issuer vkey),
+  payment/stake credential hashes (the 28-byte hashes in addresses). Like blake2b-256 it is the
+  native 28-byte-parameterised algorithm, not a truncation. Pinned by the known Preview pool-id
+  vector in crypto_test.exs.
+  """
+  @spec blake2b_224(iodata()) :: <<_::224>>
+  def blake2b_224(data), do: Blake2.hash2b(data, 28)
+
+  @doc """
   Ed25519 signature verification — Cardano's DSIGN. Returns true iff `sig` (64 bytes) is a valid
   Ed25519 signature over `msg` by the public key `vkey` (32 bytes). Cardano signs the RAW message
   bytes (no pre-hash) — Ed25519 hashes internally (SHA-512) — so we pass the message straight to

@@ -22,12 +22,14 @@ defmodule Cardamom.Ledger.Delta do
     {:del,  domain, key, old_value}      -- remove, capturing old ; inverse :put old_value
     {:set,  domain, key, old, new}       -- OVERWRITE, captures old ; inverse :set new→old
   `domain` names the state map (a closed atom set): :fees | :pot | :deposit | :stake_deleg |
-    :vote_deleg | :pool | :pool_retiring | :drep | :cc_hot | :reward.
+    :vote_deleg | :pool | :pool_retiring | :drep | :cc_hot | :reward | :snapshot | :epoch.
+  (:snapshot holds the mark/set/go stake snapshots + fee_ss; :epoch holds :last_epoch — both
+  written only by the epoch transition, both :set ops so a boundary rolls back like any block.)
   """
 
   alias Cardamom.ChainStore
 
-  @domains ~w(fees pot deposit stake_deleg vote_deleg pool pool_retiring drep cc_hot reward)a
+  @domains ~w(fees pot deposit stake_deleg vote_deleg pool pool_retiring drep cc_hot reward snapshot epoch)a
 
   @doc "Is this a known state domain? (closed set — guards against bad ops.)"
   def domain?(d), do: d in @domains
@@ -51,4 +53,23 @@ defmodule Cardamom.Ledger.Delta do
   def apply_inverse(ops) when is_list(ops) do
     ops |> Enum.reverse() |> Enum.each(fn op -> apply_op(invert(op)) end)
   end
+
+  @doc """
+  A read fun that sees `ops` AS IF APPLIED on top of `read` — the overlay for building one
+  block's ops incrementally. Ops within a block are built BEFORE any is applied to the store, so
+  a later op's captured `old` must read through the earlier ops of the SAME block (a second cert
+  touching the same key, a cert on the heels of the epoch transition) or it captures a stale
+  value and the block's rollback un-applies the wrong thing.
+  """
+  def read_through(ops, read) when is_list(ops) and is_function(read, 2) do
+    fn domain, key ->
+      Enum.reduce(ops, read.(domain, key), fn op, acc -> overlay(op, domain, key, acc) end)
+    end
+  end
+
+  defp overlay({:add, dom, key, n}, dom, key, acc), do: (acc || 0) + n
+  defp overlay({:put, dom, key, value}, dom, key, _acc), do: value
+  defp overlay({:del, dom, key, _old}, dom, key, _acc), do: nil
+  defp overlay({:set, dom, key, _old, new}, dom, key, _acc), do: new
+  defp overlay(_op, _dom, _key, acc), do: acc
 end

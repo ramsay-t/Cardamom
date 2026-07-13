@@ -68,11 +68,39 @@ defmodule Cardamom.Genesis do
         {:ok, _} = ChainStore.insert_genesis_utxo(txid, ix, addr, value)
       end)
 
+      seed_pots(shelley, utxos)
+
       count = length(utxos)
       if count > 0, do: Logger.info("genesis: seeded #{count} initial UTXO(s)")
       {:ok, count}
     end
   end
+
+  # Initial accounting POTS (the reward engine's other genesis state): everything not issued as
+  # initial UTxO starts in the RESERVES — reserves₀ = maxLovelaceSupply − Σ initial funds — and
+  # the treasury starts empty (Shelley genesis has no treasury field). Set ONCE, only when absent
+  # (a synced store already has evolved pots; genesis reseeding must not reset them). Direct sets,
+  # not journalled ops: genesis precedes every block, so no rollback can cross it.
+  defp seed_pots(shelley_path, utxos) do
+    if ChainStore.ledger_read(:pot, :reserves) == nil do
+      max_supply = max_lovelace_supply(shelley_path)
+      issued = Enum.reduce(utxos, 0, fn {_txid, _ix, _addr, value}, acc -> acc + value end)
+      ChainStore.ledger_set(:pot, :reserves, max_supply - issued)
+      ChainStore.ledger_set(:pot, :treasury, 0)
+      Logger.info("genesis: pots seeded — reserves = #{max_supply} - #{issued} (issued)")
+    end
+
+    :ok
+  end
+
+  defp max_lovelace_supply(shelley_path) when is_binary(shelley_path) do
+    case read_json(shelley_path) do
+      {:ok, %{"maxLovelaceSupply" => n} = _json} when is_integer(n) -> n
+      _ -> Cardamom.Ledger.Epoch.params().max_lovelace_supply
+    end
+  end
+
+  defp max_lovelace_supply(_), do: Cardamom.Ledger.Epoch.params().max_lovelace_supply
 
   # ---- Shelley initialFunds ----
 

@@ -1146,13 +1146,111 @@ defmodule Cardamom.ChainStore do
     :ok
   end
 
-  # Keep only the last @rollback_depth blocks of journal (no honest rollback goes deeper — k).
-  @rollback_depth 2160
+  # Keep enough journal to invert any honest rollback. The bound k is in BLOCKS (Preview k=432);
+  # the journal is keyed by SLOT, and blocks land ~1/f slots apart (f = activeSlotsCoeff, Preview
+  # 1/20), so k blocks span ~k/f slots. We keep 3k/f (the Praos stability window) for margin —
+  # the previous constant here (2160) was k-blocks-worth of *mainnet* misread as slots, ~4× too
+  # shallow to invert a maximal Preview rollback.
   defp prune_ledger_deltas(current_slot) do
     import Ecto.Query
-    cutoff = current_slot - @rollback_depth
+
+    %{security_param: k, active_slots_coeff: f} = Cardamom.Ledger.Epoch.params()
+    {fn_, fd} = f
+    cutoff = current_slot - Kernel.div(3 * k * fd, fn_)
     if cutoff > 0, do: Repo.delete_all(from d in LedgerDelta, where: d.slot < ^cutoff)
     :ok
+  end
+
+  @doc "Unspent (address, value) pairs — the raw input to the stake distribution. Only these two columns."
+  def unspent_stake_rows do
+    import Ecto.Query
+    Repo.all(from t in Txo, where: is_nil(t.spent_by), select: {t.address, t.value})
+  end
+
+  @doc "The stake-delegation map: credential => pool_hash, from the :stake_deleg ledger domain."
+  def stake_delegations, do: ledger_domain(:stake_deleg)
+
+  @doc "Reward-account balances: credential => lovelace, from the :reward ledger domain."
+  def reward_balances, do: ledger_domain(:reward)
+
+  @doc "A whole ledger-state domain as a decoded key => value map (keys/values are our term blobs)."
+  def ledger_domain(domain) when is_atom(domain) do
+    import Ecto.Query
+
+    Repo.all(from l in LedgerState, where: l.domain == ^Atom.to_string(domain), select: {l.key, l.value})
+    |> Map.new(fn {k, v} -> {dec(k), dec(v)} end)
+  end
+
+  @doc """
+  The in-memory ledger image the epoch transition works over (see
+  `Cardamom.Ledger.EpochTransition.ops/3`). Loaded ONCE at a boundary — never per block (the
+  caller checks `:epoch/:last_epoch` first).
+  """
+  def epoch_ledger_state do
+    %{
+      last_epoch: ledger_read(:epoch, :last_epoch),
+      rewards: ledger_domain(:reward),
+      delegations: ledger_domain(:stake_deleg),
+      pools: ledger_domain(:pool),
+      retiring: ledger_domain(:pool_retiring),
+      deposits: ledger_domain(:deposit),
+      treasury: ledger_read(:pot, :treasury) || 0,
+      reserves: ledger_read(:pot, :reserves) || 0,
+      fees: ledger_read(:fees, :pot) || 0,
+      snapshots: %{
+        mark: ledger_read(:snapshot, :mark),
+        set: ledger_read(:snapshot, :set),
+        go: ledger_read(:snapshot, :go),
+        fee_ss: ledger_read(:snapshot, :fee_ss)
+      }
+    }
+  end
+
+  @doc """
+  BlocksMade (Rewards.lagda.md:421-422) for `epoch`: `pool_keyhash => blocks produced`, where the
+  pool keyhash is blake2b-224 of the header's cold issuer vkey. FORK-SAFE by construction: counts
+  only headers ON THE CHAIN reached by walking `prev_hash` links back from `from_hash` (the block
+  whose processing triggered the boundary) — the headers table also holds fork headers that must
+  NOT be counted. Loads the candidate span (slot ≥ the epoch's first slot) into memory and walks;
+  ~2 epochs of headers at a boundary, once per epoch.
+  """
+  def blocks_made(epoch, from_hash, epoch_length)
+      when is_integer(epoch) and epoch >= 0 and is_binary(from_hash) do
+    import Ecto.Query
+    first = epoch * epoch_length
+    next = first + epoch_length
+
+    span =
+      Repo.all(
+        from h in Header,
+          where: h.slot >= ^first,
+          select: {h.hash, {h.prev_hash, h.slot, h.issuer_vkey}}
+      )
+      |> Map.new()
+
+    walk_blocks_made(from_hash, span, first, next, %{})
+  end
+
+  defp walk_blocks_made(hash, span, first, next, acc) do
+    case Map.get(span, hash) do
+      # Off the loaded span: either the genesis edge or a header below the epoch — done.
+      nil ->
+        acc
+
+      {prev, slot, _issuer} when slot >= next ->
+        walk_blocks_made(prev, span, first, next, acc)
+
+      {_prev, slot, _issuer} when slot < first ->
+        acc
+
+      {prev, _slot, issuer} ->
+        acc =
+          if is_binary(issuer),
+            do: Map.update(acc, Cardamom.Crypto.blake2b_224(issuer), 1, &(&1 + 1)),
+            else: acc
+
+        walk_blocks_made(prev, span, first, next, acc)
+    end
   end
 
   @doc """

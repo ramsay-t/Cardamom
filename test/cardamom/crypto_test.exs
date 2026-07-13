@@ -22,4 +22,14 @@ defmodule Cardamom.CryptoTest do
   test "is deterministic" do
     assert Crypto.blake2b_256("x") == Crypto.blake2b_256("x")
   end
+  test "blake2b_224('abc') matches the canonical vector (pool-id hash)" do
+    assert Base.encode16(Crypto.blake2b_224("abc"), case: :lower) ==
+             "9bd237b02a29e43bdd6738afa5b53ff0eee178d6210b618e4511aec8"
+  end
+
+  test "blake2b_224 produces 28 bytes and is NOT a truncation of blake2b_256" do
+    assert byte_size(Crypto.blake2b_224("abc")) == 28
+    refute Crypto.blake2b_224("abc") == binary_part(Crypto.blake2b_256("abc"), 0, 28)
+  end
+
 end
