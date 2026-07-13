@@ -105,12 +105,20 @@ defmodule Cardamom.Ledger.BlockHandler do
         fees -> [{:add, :fees, :pot, fees}]
       end
 
+    # Per tx, spec order (CERTS = PRE-CERT then the cert list, Certs.lagda.md:632-633):
+    # withdrawals zero their reward accounts BEFORE the tx's certs apply.
     ops =
-      txs
-      |> Enum.flat_map(fn tx -> Cardamom.Ledger.Conway.Cert.decode_all(Map.get(tx, :certs)) end)
-      |> Enum.reduce(epoch_ops ++ fee_ops, fn cert, acc ->
+      Enum.reduce(txs, epoch_ops ++ fee_ops, fn tx, acc ->
         read = Cardamom.Ledger.Delta.read_through(acc, base_read)
-        acc ++ Cardamom.Ledger.CertEffects.effects(cert, read, pp)
+        acc = acc ++ Cardamom.Ledger.WithdrawalEffects.effects(Map.get(tx, :withdrawals, []), read)
+
+        tx
+        |> Map.get(:certs)
+        |> Cardamom.Ledger.Conway.Cert.decode_all()
+        |> Enum.reduce(acc, fn cert, acc2 ->
+          read2 = Cardamom.Ledger.Delta.read_through(acc2, base_read)
+          acc2 ++ Cardamom.Ledger.CertEffects.effects(cert, read2, pp)
+        end)
       end)
 
     if ops != [], do: ChainStore.ledger_apply_block(hash, slot, ops)
