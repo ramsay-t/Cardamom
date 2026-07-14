@@ -15,16 +15,28 @@ defmodule Cardamom.Ledger.Conformance do
   ALSO self-checks our UTxO tracking: if a stored output's value is wrong, or an input we can't
   resolve, the equation won't balance.
 
-  HONESTY / STAGED: `depositsMade`/`depositRefunds` need CERTIFICATE decoding (Tier a, not yet),
-  and `mint` non-ADA / multi-asset balancing is out of scope for the ADA-coin equation. So we only
-  ASSERT on txs where the equation is COMPLETE with what we have — a simple value-moving tx (all
-  inputs resolvable, no certs, ADA-only). Anything else returns `{:skip, reason}` so we never
-  false-alarm on an equation we can't yet fully compute. As Tier (a) lands, the skip conditions
-  shrink and coverage grows.
+  CERT DEPOSIT TERMS: `depositsMade`/`depositRefunds` are costed from the DECODED certs
+  (`Cardamom.Ledger.Conway.Cert`): Conway certs carry their deposit/refund coin EXPLICITLY
+  (tags 7/8/11/12/13/16/17 — and the ledger rules require the stated coin to equal the recorded
+  deposit, so the cert IS the amount); the deprecated no-coin forms (tags 0/1) are costed at the
+  protocol's keyDeposit. CAVEAT (recorded, accepted): a tag-1 refund is really the amount
+  RECORDED at registration — costing it at the current keyDeposit is exact unless keyDeposit
+  changed in between (it never has on Preview); a drift here surfaces as divergence, which is
+  the point.
+
+  HONESTY / STAGED — the remaining skips, each an equation term we can't yet compute:
+    * pool_registration cert — the deposit is charged ONLY if the pool is new (state- and
+      same-block-order-dependent; not derivable from the cert alone),
+    * governance proposals (body key 20) — each carries a govActionDeposit (gov tracking TODO),
+    * unknown/undecodable cert types,
+    * multi-asset outputs (the ADA-coin equation can't balance assets),
+    * an unresolved input (its block not processed yet).
+  Anything else is ASSERTED. A skip returns `{:skip, reason}` so we never false-alarm.
   """
 
   require Logger
   alias Cardamom.ChainStore
+  alias Cardamom.Ledger.Conway.Cert
 
   @doc """
   Check value conservation for one decoded tx. Returns:
@@ -40,24 +52,69 @@ defmodule Cardamom.Ledger.Conformance do
 
   def check_value_conservation(%{valid: true} = tx) do
     cond do
-      has_certs?(tx) ->
-        # certs carry deposit/refund terms we don't decode yet → equation incomplete.
-        {:skip, :has_certs}
+      has_proposals?(tx) ->
+        # each proposal carries a govActionDeposit (produced term) — gov decoding TODO.
+        {:skip, :has_gov_proposals}
 
       multiasset_present?(tx) ->
         {:skip, :multiasset_not_balanced}
 
       true ->
-        balance_simple(tx)
+        case cert_deposit_terms(Cert.decode_all(Map.get(tx, :certs)), ChainStore.protocol_deposits()) do
+          {:ok, made, refunds} -> balance(tx, made, refunds)
+          {:skip, reason} -> {:skip, reason}
+        end
     end
   end
 
   def check_value_conservation(_), do: {:skip, :not_a_tx}
 
-  # The ADA-coin equation for a simple value-moving tx:
-  #   Σ input_values + Σ withdrawals  ==  Σ output_values + fee + donation
-  # (no certs ⇒ no deposits/refunds; ADA-only ⇒ no asset terms).
-  defp balance_simple(%{inputs: inputs, outputs: outputs} = tx) do
+  @doc """
+  The tx's deposit terms for the conservation equation, from its decoded certs:
+  `{:ok, depositsMade, depositRefunds}` or `{:skip, reason}` when a cert's term isn't derivable
+  from the cert alone. Explicit-coin certs state their amount (the ledger rules require it to
+  match the recorded deposit); deprecated no-coin stake reg/dereg cost the protocol keyDeposit.
+  """
+  def cert_deposit_terms(certs, pp) do
+    Enum.reduce_while(certs, {:ok, 0, 0}, fn cert, {:ok, made, refunds} ->
+      case deposit_term(cert, pp) do
+        {:made, n} -> {:cont, {:ok, made + n, refunds}}
+        {:refund, n} -> {:cont, {:ok, made, refunds + n}}
+        :none -> {:cont, {:ok, made, refunds}}
+        {:skip, reason} -> {:halt, {:skip, reason}}
+      end
+    end)
+  end
+
+  # Explicit-coin Conway forms — the cert states the amount.
+  defp deposit_term(%{type: :stake_registration, deposit: n}, _pp), do: {:made, n}
+  defp deposit_term(%{type: :stake_deregistration, refund: n}, _pp), do: {:refund, n}
+  defp deposit_term(%{type: :stake_registration_and_delegation, deposit: n}, _pp), do: {:made, n}
+  defp deposit_term(%{type: :vote_registration_and_delegation, deposit: n}, _pp), do: {:made, n}
+  defp deposit_term(%{type: :stake_vote_registration_and_delegation, deposit: n}, _pp), do: {:made, n}
+  defp deposit_term(%{type: :drep_registration, deposit: n}, _pp), do: {:made, n}
+  defp deposit_term(%{type: :drep_deregistration, refund: n}, _pp), do: {:refund, n}
+
+  # Deprecated no-coin stake reg/dereg (tags 0/1): the protocol keyDeposit (see moduledoc caveat).
+  defp deposit_term(%{type: :stake_registration}, pp), do: {:made, pp.key_deposit}
+  defp deposit_term(%{type: :stake_deregistration}, pp), do: {:refund, pp.key_deposit}
+
+  # No value flow: delegations, pool retirement (refund happens at POOLREAP, not in a tx),
+  # DRep update, committee certs.
+  defp deposit_term(%{type: t}, _pp)
+       when t in ~w(stake_delegation vote_delegation stake_and_vote_delegation pool_retirement
+                    drep_update committee_hot_auth committee_resignation)a,
+       do: :none
+
+  # Pool registration: deposit charged ONLY if the pool is NEW — not derivable from the cert.
+  defp deposit_term(%{type: :pool_registration}, _pp), do: {:skip, :pool_reg_deposit_state_dependent}
+
+  defp deposit_term(%{type: :unknown} = c, _pp), do: {:skip, {:unknown_cert, Map.get(c, :tag)}}
+  defp deposit_term(_other, _pp), do: {:skip, :undecodable_cert}
+
+  # The ADA-coin conservation equation (Utxo.lagda.md:437-449):
+  #   Σ input_values + Σ withdrawals + depositRefunds == Σ output_values + fee + depositsMade + donation
+  defp balance(%{inputs: inputs, outputs: outputs} = tx, deposits_made, deposit_refunds) do
     case resolve_inputs(inputs) do
       {:ok, in_sum} ->
         withdrawals = tx |> Map.get(:withdrawals, []) |> Enum.reduce(0, fn {_a, c}, s -> s + c end)
@@ -65,8 +122,8 @@ defmodule Cardamom.Ledger.Conformance do
         fee = Map.get(tx, :fee) || 0
         donation = Map.get(tx, :donation) || 0
 
-        consumed = in_sum + withdrawals
-        produced = out_sum + fee + donation
+        consumed = in_sum + withdrawals + deposit_refunds
+        produced = out_sum + fee + deposits_made + donation
 
         if consumed == produced do
           :ok
@@ -78,8 +135,10 @@ defmodule Cardamom.Ledger.Conformance do
             diff: consumed - produced,
             inputs: in_sum,
             withdrawals: withdrawals,
+            deposit_refunds: deposit_refunds,
             outputs: out_sum,
             fee: fee,
+            deposits_made: deposits_made,
             donation: donation
           }
 
@@ -110,8 +169,9 @@ defmodule Cardamom.Ledger.Conformance do
     end)
   end
 
-  defp has_certs?(%{certs: c}) when is_list(c) and c != [], do: true
-  defp has_certs?(_), do: false
+  defp has_proposals?(%{proposals: p}) when is_list(p) and p != [], do: true
+  defp has_proposals?(%{proposals: %CBOR.Tag{tag: 258, value: p}}) when is_list(p) and p != [], do: true
+  defp has_proposals?(_), do: false
 
   # ADA-only if every output's value is a bare integer (coin/1); a multiasset output decodes with
   # a non-nil multiasset map and can't be balanced by the ADA equation alone.

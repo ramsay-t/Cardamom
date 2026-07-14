@@ -109,12 +109,17 @@ defmodule Cardamom.Ledger.Conway.Tx do
       # LEDGER-STATE / value-conservation terms:
       #   withdrawals (key 5): reward-account drains, `RewardAddress ⇀ Coin` — a SOURCE of value
       #     in `consumed` (Utxo.lagda.md:437). Decoded to [{reward_addr_bytes, coin}].
-      #   certs (key 4): kept RAW here (presence + count matters for the deposit/refund terms and
-      #     for safely skipping the conservation check until cert decoding lands).
+      #   certs (key 4): kept RAW here; decoded by Cardamom.Ledger.Conway.Cert where needed
+      #     (cert effects, conservation deposit/refund terms).
       #   donation (key 22): a treasury donation, part of `produced`.
       withdrawals: decode_withdrawals(Map.get(body, 5)),
       certs: Map.get(body, 4),
-      donation: Map.get(body, 22)
+      donation: Map.get(body, 22),
+      # governance (kept RAW until gov-action tracking lands): voting_procedures (key 19),
+      # proposal_procedures (key 20). Proposal PRESENCE matters now — each proposal carries a
+      # govActionDeposit (a `produced` term), so conservation must skip proposal txs honestly.
+      votes: Map.get(body, 19),
+      proposals: Map.get(body, 20)
     }
   end
 
