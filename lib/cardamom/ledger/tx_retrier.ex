@@ -29,11 +29,10 @@ defmodule Cardamom.Ledger.TxRetrier do
     case TxHandler.apply_spends(tx, slot) do
       {:ok, []} ->
         # Genuinely done — every spend applied, so this tx's inputs are all resolvable in the UTxO
-        # set. Run the value-conservation CONFORMANCE oracle now (a divergence signal only — never
-        # affects the outcome; an observer doesn't reject a tx the network accepted). Best-effort.
-        _ = safe_conformance(tx)
-        # Report and return (exit :normal).
-        send(parent, {:tx_done, self()})
+        # set. Run the value-conservation check now (it CAN'T run at the block's validation gate —
+        # it needs every input resolved) and report the result up with the completion: the
+        # BlockHandler folds it into the block VERDICT, where a violation rejects the block.
+        send(parent, {:tx_done, self(), Map.get(tx, :txid), safe_conformance(tx)})
 
       {:ok, _unresolved} ->
         # A spend's producer isn't stored yet. NOT an error — wait and retry (the retry is the
@@ -43,10 +42,11 @@ defmodule Cardamom.Ledger.TxRetrier do
     end
   end
 
-  # Run the conformance oracle without ever affecting ingest — a check crash must not fail the tx.
+  # Run the conservation check without ever crashing the tx — a check crash is an honest skip
+  # (visible in the verdict), not a violation and not a failed extraction.
   defp safe_conformance(tx) do
     Cardamom.Ledger.Conformance.check_value_conservation(tx)
   rescue
-    _ -> :skip
+    e -> {:skip, {:conformance_crashed, inspect(e)}}
   end
 end

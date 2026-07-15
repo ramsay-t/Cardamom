@@ -456,6 +456,10 @@ defmodule Cardamom.ChainStore do
       :ok -> :ok
       :timeout -> :deferred
       {:error, {:decode_failed, reason}} -> {:error, reason}
+      # The block VALIDATION GATE rejected (see Cardamom.Ledger.Verdict): surface the verdict —
+      # on chain data this is an assertion failure (stop and fix our code), and the replay
+      # driver's halt condition.
+      {:error, {:validation_rejected, _summary} = rejection} -> {:error, rejection}
       {:error, _other} -> :deferred
     end
   end

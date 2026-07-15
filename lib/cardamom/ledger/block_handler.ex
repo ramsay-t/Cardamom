@@ -4,11 +4,28 @@ defmodule Cardamom.Ledger.BlockHandler do
   GenServer that traps exits, registered by block hash in `Cardamom.Ledger.BlockRegistry`, owning
   one `Cardamom.Ledger.TxRetrier` process per tx.
 
-  DONE = every tx retrier reported done. Only THEN do we `mark_txo_processed` and stop :normal.
-  A retrier crash (non-:normal :DOWN) stops us non-normally, leaving txo_processed=false for the
-  reconciler crash-backstop to re-spawn us later. A retrier retries CONTINUOUSLY (no timeout), so a
-  handler for a block with a not-yet-ingested producer stays alive, retrying, until the producer
-  arrives — or until a rollback terminates us.
+  THE BLOCK VALIDATION GATE (mirrors `Cardamom.Ledger.HeaderHandler`'s decode → VALIDATE → store):
+  the pipeline is decode → BUILD delta + check results → VERDICT → commit. The block's ledger ops
+  and their check results are built FIRST; `Cardamom.Ledger.Verdict` renders the decision; only
+  an ACCEPT commits (apply the delta, spawn the tx retriers, and eventually mark_txo_processed).
+  A REJECT stops `{:validation_rejected, summary}` — nothing committed, `txo_processed` stays
+  false (the reconciler re-hits it and re-alarms: a self-announcing stop point), and a sync
+  caller (`extract_block_sync` — the replay driver) receives the rejection as its error. On real
+  chain data a reject is an ASSERTION FAILURE — expected never to fire; when it fires we stop and
+  fix our code, or we've found a spec divergence. See `Cardamom.Ledger.Verdict` for the policy.
+
+  Value conservation is the one check that CANNOT run at the gate: it needs every input resolved,
+  which cross-block/out-of-order arrival only guarantees after the retriers finish. So each
+  retrier reports its tx's conservation result with `{:tx_done, pid, txid, result}`; the verdict
+  is finalised when the LAST tx completes, and a conservation violation rejects the block THERE —
+  after its spent-markers landed (those are verdict-free graph facts, idempotent under
+  re-extraction) but before the block is marked processed.
+
+  DONE = every tx retrier reported done AND the final verdict accepts. Only THEN do we
+  `mark_txo_processed` and stop :normal. A retrier crash (non-:normal :DOWN) stops us non-normally,
+  leaving txo_processed=false for the reconciler crash-backstop to re-spawn us later. A retrier
+  retries CONTINUOUSLY (no timeout), so a handler for a block with a not-yet-ingested producer
+  stays alive, retrying, until the producer arrives — or until a rollback terminates us.
 
   ROLLBACK / CANCELLATION (the invariant this module exists to get right): when the owning block is
   orphaned, `ChainStore.rollback/1` terminates us. Our `terminate/2` then, IN ORDER:
@@ -22,7 +39,7 @@ defmodule Cardamom.Ledger.BlockHandler do
   use GenServer
   require Logger
 
-  alias Cardamom.Ledger.{BlockRegistry, TxRetrier}
+  alias Cardamom.Ledger.{BlockRegistry, TxRetrier, Verdict}
   alias Cardamom.ChainStore
 
   # Bound on await_all_down so a wedged kill can't hang rollback (child shutdown budget is 10s).
@@ -35,40 +52,28 @@ defmodule Cardamom.Ledger.BlockHandler do
   @impl true
   def init({hash, raw, slot}) do
     Process.flag(:trap_exit, true)
-    {:ok, %{hash: hash, raw: raw, slot: slot, pending: %{}}, {:continue, :spawn_children}}
+    {:ok, %{hash: hash, raw: raw, slot: slot, pending: %{}, verdict: nil}, {:continue, :spawn_children}}
   end
 
   @impl true
   def handle_continue(:spawn_children, %{hash: hash, raw: raw, slot: slot} = st) do
     case Cardamom.Ledger.Block.txs_in(raw) do
-      {:ok, []} ->
-        # Empty block: no txs to extract — but it can still CROSS AN EPOCH BOUNDARY (boundary
-        # blocks are often empty), so the ledger delta (epoch transition) must run regardless.
-        apply_ledger_deltas(hash, slot, [])
-        ChainStore.mark_txo_processed(hash)
-        {:stop, :normal, st}
-
       {:ok, txs} ->
-        me = self()
+        # THE GATE: build this block's ledger delta AND its check results, render the verdict,
+        # and only apply on accept. (Empty blocks go through too — they can still cross an epoch
+        # boundary, and boundary blocks are often empty.)
+        {ops, results} = build_ledger_delta(hash, slot, txs)
+        verdict = Verdict.add_all(Verdict.new(hash, slot), results)
 
-        pending =
-          Map.new(txs, fn tx ->
-            {pid, ref} = spawn_monitor(fn -> TxRetrier.run(me, tx, slot) end)
-            {pid, ref}
-          end)
+        case Verdict.decision(verdict) do
+          :reject ->
+            Verdict.emit(verdict)
+            {:stop, {:validation_rejected, Verdict.summary(verdict)}, st}
 
-        # MEMPOOL CASCADE: a confirmed block evicts pending mempool txs it out-competes. Idempotent
-        # + monotone (evictions only push toward terminal states), order-independent — safe to run
-        # at spawn time regardless of whether every UTxO chain has resolved yet.
-        Enum.each(txs, &ChainStore.cascade_mempool/1)
-
-        # LEDGER STATE (non-UTxO accounting): apply this block's ledger effects once, as a single
-        # invertible per-block delta (journalled for rollback): the EPOCH TRANSITION if this block
-        # crosses a boundary, then the block's fee accrual, then its CERT effects. Best-effort,
-        # never fails ingest. See Cardamom.Ledger.{Cert,CertEffects,Delta,EpochTransition}.
-        apply_ledger_deltas(hash, slot, txs)
-
-        {:noreply, %{st | pending: pending}}
+          :accept ->
+            apply_ledger_delta(hash, slot, ops)
+            continue_extraction(txs, %{st | verdict: verdict})
+        end
 
       {:error, reason} ->
         # Undecodable body — leave txo_processed=false; don't loop. Stop non-normal (no cleanup).
@@ -76,24 +81,64 @@ defmodule Cardamom.Ledger.BlockHandler do
     end
   end
 
-  # Build + journal + apply this block's ledger delta (once), in order:
+  # Empty block: no txs to extract and no conservation to await — the verdict is already final.
+  defp continue_extraction([], st) do
+    finish(st)
+  end
+
+  defp continue_extraction(txs, st) do
+    me = self()
+
+    pending =
+      Map.new(txs, fn tx ->
+        {pid, ref} = spawn_monitor(fn -> TxRetrier.run(me, tx, st.slot) end)
+        {pid, ref}
+      end)
+
+    # MEMPOOL CASCADE: a confirmed block evicts pending mempool txs it out-competes. Idempotent
+    # + monotone (evictions only push toward terminal states), order-independent — safe to run
+    # at spawn time regardless of whether every UTxO chain has resolved yet.
+    Enum.each(txs, &ChainStore.cascade_mempool/1)
+
+    {:noreply, %{st | pending: pending}}
+  end
+
+  # The final decision point, once every check result is in: accept commits the processed flag;
+  # reject parks the block unprocessed and surfaces the verdict as the exit reason.
+  defp finish(%{verdict: verdict} = st) do
+    case Verdict.decision(verdict) do
+      :accept ->
+        ChainStore.mark_txo_processed(st.hash)
+        Verdict.emit(verdict)
+        {:stop, :normal, st}
+
+      :reject ->
+        Verdict.emit(verdict)
+        {:stop, {:validation_rejected, Verdict.summary(verdict)}, st}
+    end
+  end
+
+  # Build this block's ledger delta (once) as `{ops, results}`, in order:
   #
   #   1. EPOCH TRANSITION ops, when this block's epoch is beyond :epoch/:last_epoch — the spec's
   #      NEWEPOCH fires on the first block of the new epoch BEFORE that block's own effects, and
   #      it must read the PRE-block state (feeSS = fees before this block's fees accrue).
   #   2. This block's FEE accrual (Σ tx fees into the :fees pot — the reward pot's fee half).
-  #   3. This block's CERT effects, in tx order.
+  #   3. Per tx, spec order (CERTS = PRE-CERT then the cert list, Certs.lagda.md:632-633):
+  #      withdrawals (checked + zeroed, results collected) BEFORE that tx's certs.
   #
   # Every op after the first is built over Delta.read_through of the ops before it, so a captured
   # `old` reflects the same block's earlier ops (epoch ops, or an earlier cert touching the same
   # key) — reading the store directly here would capture stale values and break the journal's
-  # invertibility. ledger_apply_block dedupes by slot (on_conflict :nothing), so a re-extracted
-  # block doesn't re-journal. Best-effort — a ledger-state hiccup must not fail block ingest.
+  # invertibility.
+  #
+  # A CRASH in delta building must not fail block ingest (best-effort as ever): it degrades to
+  # {no ops, one :ledger_delta_build SKIP result} — visible in the verdict, never a reject.
   #
   # ORDERING ASSUMPTION (recorded, not enforced): deltas assume blocks apply in slot order. Live
   # chain-sync delivers in order; body BACKFILL can extract out of order, where a cert/epoch op
-  # could capture a wrong old value. The conformance oracles are the drift alarm for this.
-  defp apply_ledger_deltas(hash, slot, txs) do
+  # could capture a wrong old value. The conformance checks are the drift alarm for this.
+  defp build_ledger_delta(hash, slot, txs) do
     base_read = fn dom, key -> ChainStore.ledger_read(dom, key) end
     pp = ChainStore.protocol_deposits()
 
@@ -105,23 +150,42 @@ defmodule Cardamom.Ledger.BlockHandler do
         fees -> [{:add, :fees, :pot, fees}]
       end
 
-    # Per tx, spec order (CERTS = PRE-CERT then the cert list, Certs.lagda.md:632-633):
-    # withdrawals zero their reward accounts BEFORE the tx's certs apply.
-    ops =
-      Enum.reduce(txs, epoch_ops ++ fee_ops, fn tx, acc ->
-        read = Cardamom.Ledger.Delta.read_through(acc, base_read)
-        acc = acc ++ Cardamom.Ledger.WithdrawalEffects.effects(Map.get(tx, :withdrawals, []), read)
+    Enum.reduce(txs, {epoch_ops ++ fee_ops, []}, fn tx, {ops, results} ->
+      read = Cardamom.Ledger.Delta.read_through(ops, base_read)
 
+      {w_ops, w_results} =
+        Cardamom.Ledger.WithdrawalEffects.effects(Map.get(tx, :withdrawals, []), read)
+
+      w_results = Enum.map(w_results, fn {rule, outcome, opts} ->
+        {rule, outcome, Keyword.put(opts, :txid, Map.get(tx, :txid))}
+      end)
+
+      ops = ops ++ w_ops
+
+      cert_ops =
         tx
         |> Map.get(:certs)
         |> Cardamom.Ledger.Conway.Cert.decode_all()
-        |> Enum.reduce(acc, fn cert, acc2 ->
-          read2 = Cardamom.Ledger.Delta.read_through(acc2, base_read)
-          acc2 ++ Cardamom.Ledger.CertEffects.effects(cert, read2, pp)
+        |> Enum.reduce(ops, fn cert, acc ->
+          read2 = Cardamom.Ledger.Delta.read_through(acc, base_read)
+          acc ++ Cardamom.Ledger.CertEffects.effects(cert, read2, pp)
         end)
-      end)
 
-    if ops != [], do: ChainStore.ledger_apply_block(hash, slot, ops)
+      {cert_ops, results ++ w_results}
+    end)
+  rescue
+    e ->
+      Logger.warning("block #{short(hash)}: ledger-delta build failed: #{inspect(e)}")
+      {[], [{:ledger_delta_build, {:skip, {:build_crashed, inspect(e)}}, []}]}
+  end
+
+  # Journal + apply an accepted block's delta. ledger_apply_block dedupes by slot (on_conflict
+  # :nothing), so a re-extracted block doesn't re-journal. Best-effort — a ledger-state hiccup
+  # must not fail block ingest.
+  defp apply_ledger_delta(_hash, _slot, []), do: :ok
+
+  defp apply_ledger_delta(hash, slot, ops) do
+    ChainStore.ledger_apply_block(hash, slot, ops)
     :ok
   rescue
     e -> Logger.warning("block #{short(hash)}: ledger-delta apply failed: #{inspect(e)}")
@@ -165,15 +229,14 @@ defmodule Cardamom.Ledger.BlockHandler do
   end
 
   @impl true
-  def handle_info({:tx_done, pid}, %{pending: pending} = st) do
+  def handle_info({:tx_done, pid, txid, conservation}, %{pending: pending} = st) do
     {ref, rest} = Map.pop(pending, pid)
     if ref, do: Process.demonitor(ref, [:flush])
-    st = %{st | pending: rest}
+    st = %{st | pending: rest, verdict: add_conservation(st.verdict, txid, conservation)}
 
     if map_size(rest) == 0 do
-      # EVERY tx completed → the block is genuinely, fully done.
-      ChainStore.mark_txo_processed(st.hash)
-      {:stop, :normal, st}
+      # EVERY tx completed → every check result is in → render the final verdict.
+      finish(st)
     else
       {:noreply, st}
     end
@@ -197,15 +260,30 @@ defmodule Cardamom.Ledger.BlockHandler do
     end
   end
 
+  # Fold one tx's conservation result into the verdict (the retrier's report — see moduledoc for
+  # why conservation is checked post-resolution, not at the gate).
+  defp add_conservation(verdict, txid, :ok),
+    do: Verdict.add(verdict, :value_conservation, :pass, txid: txid)
+
+  defp add_conservation(verdict, txid, {:skip, reason}),
+    do: Verdict.add(verdict, :value_conservation, {:skip, reason}, txid: txid)
+
+  defp add_conservation(verdict, txid, {:diverge, detail}),
+    do: Verdict.add(verdict, :value_conservation, {:violation, detail}, txid: txid)
+
   # ---- terminate: the ordered kill-confirm-then-clean ----
 
   # Fully done: children already gone, DB is correct — nothing to clean.
   @impl true
   def terminate(:normal, _st), do: :ok
 
-  # Decode failure / retrier crash: leave the partial (valid) state for re-extraction. NO cleanup.
+  # Decode failure / retrier crash / VALIDATION REJECT: leave the partial (valid) state for
+  # re-extraction. NO cleanup — a reject withheld the COMMIT (ledger delta at the gate, processed
+  # flag at completion); any spent-markers already applied are verdict-free graph facts, correct
+  # and idempotent under re-extraction once the code is fixed.
   def terminate({:decode_failed, _}, _st), do: :ok
   def terminate({:tx_crashed, _}, _st), do: :ok
+  def terminate({:validation_rejected, _}, _st), do: :ok
 
   # ROLLBACK / supervisor shutdown (:shutdown, :kill, etc.): the block is orphaned. STOP the
   # retriers, CONFIRM dead, THEN clean this block's UTXOs — in that exact order.

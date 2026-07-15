@@ -2,9 +2,10 @@ defmodule Cardamom.Ledger.WithdrawalEffectsTest do
   @moduledoc """
   PRE-CERT withdrawals (Certs.lagda.md:596-607): the zeroing EFFECT and the WITHDRAWAL ORACLE —
   a network-accepted withdrawal must equal our derived balance exactly, and a key-hash withdrawer
-  must have vote-delegated. Divergences are telemetry signals, never rejections; the effect
-  applies regardless (self-healing). Telemetry is captured filtered to THIS test's handler id
-  (handle the interleaving, don't serialise it).
+  must have vote-delegated. Checks RETURN results for the block verdict (the validation-gate
+  architecture): `effects/2 → {ops, results}`; a violation rejects the block upstream. The
+  per-check divergence telemetry still fires at detection; it is captured here filtered to THIS
+  test's handler id (handle the interleaving, don't serialise it).
   """
   use ExUnit.Case, async: true
 
@@ -50,48 +51,68 @@ defmodule Cardamom.Ledger.WithdrawalEffectsTest do
     end
   end
 
-  test "a full-balance withdrawal from a vote-delegated key cred: zeroing op, NO divergence" do
+  test "a full-balance withdrawal from a vote-delegated key cred: zeroing op, both checks PASS" do
     read = reader(%{reward: %{k(1) => 5_000}, vote_deleg: %{k(1) => :drep_x}})
 
     divergences =
       capture_divergences(fn ->
         assert WithdrawalEffects.effects([{key_addr(1), 5_000}], read) ==
-                 [{:set, :reward, k(1), 5_000, 0}]
+                 {[{:set, :reward, k(1), 5_000, 0}],
+                  [
+                    {:withdrawal_full_balance, :pass, []},
+                    {:withdrawal_vote_delegated, :pass, []}
+                  ]}
       end)
 
     assert divergences == []
   end
 
-  test "ORACLE: amount ≠ our balance → :withdrawal_balance_mismatch, effect still applied" do
+  test "ORACLE: amount ≠ our balance → :withdrawal_full_balance VIOLATION, op still built" do
     read = reader(%{reward: %{k(1) => 4_999}, vote_deleg: %{k(1) => :drep_x}})
+    cred = k(1)
 
     divergences =
       capture_divergences(fn ->
-        assert WithdrawalEffects.effects([{key_addr(1), 5_000}], read) ==
-                 [{:set, :reward, k(1), 4_999, 0}]
+        assert {[{:set, :reward, ^cred, 4_999, 0}], results} =
+                 WithdrawalEffects.effects([{key_addr(1), 5_000}], read)
+
+        assert [
+                 {:withdrawal_full_balance, {:violation, %{withdrawn: 5_000, our_balance: 4_999}}, []},
+                 {:withdrawal_vote_delegated, :pass, []}
+               ] = results
       end)
 
     assert [%{check: :withdrawal_balance_mismatch, withdrawn: 5_000, our_balance: 4_999}] =
              divergences
   end
 
-  test "ORACLE MC/DC: account we don't know at all → mismatch (nil balance), zeroed from nil" do
+  test "ORACLE MC/DC: account we don't know at all → violation (nil balance), zeroed from nil" do
     read = reader(%{reward: %{}, vote_deleg: %{k(1) => :drep_x}})
+    cred = k(1)
 
     divergences =
       capture_divergences(fn ->
-        assert WithdrawalEffects.effects([{key_addr(1), 5_000}], read) ==
-                 [{:set, :reward, k(1), nil, 0}]
+        assert {[{:set, :reward, ^cred, nil, 0}], results} =
+                 WithdrawalEffects.effects([{key_addr(1), 5_000}], read)
+
+        assert [{:withdrawal_full_balance, {:violation, %{our_balance: nil}}, []} | _] = results
       end)
 
     assert [%{check: :withdrawal_balance_mismatch, our_balance: nil}] = divergences
   end
 
-  test "ORACLE MC/DC: key-hash cred WITHOUT vote delegation → :withdrawal_without_vote_delegation" do
+  test "ORACLE MC/DC: key-hash cred WITHOUT vote delegation → :withdrawal_vote_delegated violation" do
     read = reader(%{reward: %{k(1) => 5_000}, vote_deleg: %{}})
 
     divergences =
-      capture_divergences(fn -> WithdrawalEffects.effects([{key_addr(1), 5_000}], read) end)
+      capture_divergences(fn ->
+        assert {_ops, results} = WithdrawalEffects.effects([{key_addr(1), 5_000}], read)
+
+        assert [
+                 {:withdrawal_full_balance, :pass, []},
+                 {:withdrawal_vote_delegated, {:violation, _}, []}
+               ] = results
+      end)
 
     assert [%{check: :withdrawal_without_vote_delegation}] = divergences
   end
@@ -102,40 +123,51 @@ defmodule Cardamom.Ledger.WithdrawalEffectsTest do
     divergences =
       capture_divergences(fn ->
         assert WithdrawalEffects.effects([{script_addr(1), 5_000}], read) ==
-                 [{:set, :reward, {:script, h(1)}, 5_000, 0}]
+                 {[{:set, :reward, {:script, h(1)}, 5_000, 0}],
+                  [
+                    {:withdrawal_full_balance, :pass, []},
+                    {:withdrawal_vote_delegated, :pass, []}
+                  ]}
       end)
 
     assert divergences == []
   end
 
-  test "MC/DC: unparseable reward address → signal, no op, no crash" do
+  test "MC/DC: unparseable reward address → :withdrawal_decodable violation, NO op, no crash" do
     read = reader(%{reward: %{}, vote_deleg: %{}})
 
     divergences =
       capture_divergences(fn ->
-        assert WithdrawalEffects.effects([{<<0xE0, 1, 2>>, 100}], read) == []
+        assert {[], [{:withdrawal_decodable, {:violation, %{address: _}}, []}]} =
+                 WithdrawalEffects.effects([{<<0xE0, 1, 2>>, 100}], read)
       end)
 
     assert [%{check: :withdrawal_address_unparseable}] = divergences
   end
 
-  test "MC/DC: malformed entry / non-list input → nothing, defensively" do
+  test "MC/DC: malformed entry → decodable violation; non-list input → nothing, defensively" do
     read = reader(%{})
-    assert WithdrawalEffects.effects([:junk], read) |> Enum.empty?()
-    assert WithdrawalEffects.effects(nil, read) == []
+
+    assert {[], [{:withdrawal_decodable, {:violation, _}, []}]} =
+             WithdrawalEffects.effects([:junk], read)
+
+    assert WithdrawalEffects.effects(nil, read) == {[], []}
   end
 
   test "same-block visibility: read through an earlier op sees the zeroed balance" do
     # After tx1 withdraws, tx2's withdrawal of the SAME account sees 0 — a second full
     # withdrawal of 0 is consistent (0 == 0), a non-zero one diverges.
     base = reader(%{reward: %{k(1) => 5_000}, vote_deleg: %{k(1) => :drep_x}})
-    ops1 = WithdrawalEffects.effects([{key_addr(1), 5_000}], base)
+    cred = k(1)
+    {ops1, _results1} = WithdrawalEffects.effects([{key_addr(1), 5_000}], base)
     overlay = Cardamom.Ledger.Delta.read_through(ops1, base)
 
     divergences =
       capture_divergences(fn ->
-        assert WithdrawalEffects.effects([{key_addr(1), 0}], overlay) ==
-                 [{:set, :reward, k(1), 0, 0}]
+        assert {[{:set, :reward, ^cred, 0, 0}], results} =
+                 WithdrawalEffects.effects([{key_addr(1), 0}], overlay)
+
+        assert [{:withdrawal_full_balance, :pass, []} | _] = results
       end)
 
     assert divergences == []

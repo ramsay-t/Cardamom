@@ -37,9 +37,13 @@ defmodule Cardamom.DeferredSpendTest do
   end
 
   # A tx body that creates one output and spends the given inputs (list of {txid, ix}).
+  # ZERO-value output: these synthetic txs must pass the block VALIDATION GATE's value-
+  # conservation check (consumed ≡ produced) — a from-nothing producer (no inputs) can only
+  # honestly produce 0, and the spender then conserves 0 → 0. Spend LINKAGE is what's under
+  # test here, not value flow.
   defp body(inputs, output_tag) do
     ins = for {t, i} <- inputs, do: [%CBOR.Tag{tag: :bytes, value: t}, i]
-    out = [%CBOR.Tag{tag: :bytes, value: <<output_tag>>}, 1_000_000]
+    out = [%CBOR.Tag{tag: :bytes, value: <<output_tag>>}, 0]
     %{0 => ins, 1 => [out]}
   end
 

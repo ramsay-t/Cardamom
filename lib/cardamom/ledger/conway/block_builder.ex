@@ -24,17 +24,24 @@ defmodule Cardamom.Ledger.Conway.BlockBuilder do
 
   @doc """
   Build a block. Opts: `:block_number`, `:slot`, `:prev_hash`, `:tx_count` (default
-  0 — an empty block; bumping it adds placeholder-but-well-formed tx bodies).
-  Returns `%{raw:, hash:, header_hash:, tx_count:, envelope:}` where `envelope` is
-  the block-fetch wire shape `#6.24(bytes)` (tag-24 wrapped, like a header).
+  0 — an empty block; bumping it adds placeholder-but-well-formed tx bodies), or
+  `:bodies` — an explicit list of tx-body maps (CBOR tx_body keys, e.g.
+  `%{2 => fee, 5 => withdrawals}`) for tests that need REAL decodable tx content
+  (overrides `:tx_count`). Returns `%{raw:, hash:, header_hash:, tx_count:,
+  envelope:}` where `envelope` is the block-fetch wire shape `#6.24(bytes)`
+  (tag-24 wrapped, like a header).
   """
   def build(opts \\ []) do
-    tx_count = Keyword.get(opts, :tx_count, 0)
-
     # The four segwit segments, encoded ONCE (these exact bytes feed both the body
-    # hash and the block). M1: bodies are placeholder maps; witnesses/aux/invalid
-    # empty. Shape need only be well-formed CBOR for block-LEVEL handling.
-    bodies = for i <- 0..(tx_count - 1)//1, do: %{0 => i}
+    # hash and the block). Default bodies are placeholder maps (block-LEVEL shape
+    # only); pass :bodies for content the tx decoder must handle.
+    bodies =
+      case Keyword.get(opts, :bodies) do
+        nil -> for i <- 0..(Keyword.get(opts, :tx_count, 0) - 1)//1, do: %{0 => i}
+        explicit when is_list(explicit) -> explicit
+      end
+
+    tx_count = length(bodies)
     bodies_bytes = CBOR.encode(bodies)
     wits_bytes = CBOR.encode(List.duplicate(%{}, tx_count))
     aux_bytes = CBOR.encode(%{})
