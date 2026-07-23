@@ -19,7 +19,11 @@ defmodule Cardamom.Ledger.Conway.BlockBuilder do
   alias Cardamom.Crypto
   alias Cardamom.Ledger.Conway.HeaderBuilder
 
-  # Conway era tag (confirmed from real Preview block-fetch: `82 05 ...`).
+  # Block-fetch era tag as observed on real Preview block-fetch (`82 05 ...`). NB the observed
+  # blocks were EARLY (Babbage-family, 15-field headers) — tag 5 is Babbage by the HardFork
+  # index, NOT Conway as this comment previously claimed; see docs/WIRE.md §9 (era numbering).
+  # Kept at 5: block-level decode routes all Shelley-family tags identically, so tests care
+  # only that the envelope shape is real.
   @era 5
 
   @doc """

@@ -3,8 +3,9 @@ defmodule Cardamom.Mux.SDU do
   Ouroboros mux Segment Data Unit (SDU): the 8-byte framing every mini-protocol
   message travels in over the single TCP bearer.
 
-  Byte-level spec (read from `network-mux/src/Network/Mux/Codec.hs`; written up in
-  `docs/wire-protocol.md` because no prose spec existed). 8-byte big-endian header
+  Byte-level spec (read from `network-mux/src/Network/Mux/Codec.hs`, later confirmed
+  against the prose spec `ouroboros-network/docs/network-spec/mux.tex`; written up in
+  `docs/wire-protocol.md` and `docs/WIRE.md` §1). 8-byte big-endian header
   then payload:
 
       bytes 0-3 : transmission time   (u32 BE, microsecond ticks)

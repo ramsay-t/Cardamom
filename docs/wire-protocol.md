@@ -283,12 +283,16 @@ is a coherent BEAM-native alternative worth demonstrating. This is an
 contact we speak the existing range-based block-fetch and SDU framing as the
 relay requires.
 
-## SDU header — byte-level spec (READ FROM SOURCE; no prose spec existed)
+## SDU header — byte-level spec (read from source)
 
 Authoritative source: `network-mux/src/Network/Mux/Codec.hs` (`encodeSDU` /
-`decodeSDU`) + `Types.hs`. Documented here because the byte-level format is
-defined in the reference implementation rather than a standalone prose spec —
-this section is that spec, written down.
+`decodeSDU`) + `Types.hs`. CORRECTION (2026-07-23): a prose spec DOES exist —
+`ouroboros-network/docs/network-spec/mux.tex` §Wire Format documents this
+header correctly (including mode bit 0 = initiator, agreeing with the code and
+contradicting only the Codec.hs source comment). We built this section from
+source before discovering it — itself a FINDABILITY finding: nothing led a
+from-scratch implementer to network-spec. See `network-specs.md` (the
+spec-landscape map written to close that gap).
 
 **8-byte header, big-endian, then payload:**
 
