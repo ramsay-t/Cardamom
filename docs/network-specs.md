@@ -54,7 +54,7 @@ precise statement that exists.)
 
 *upstream:* `github.com/input-output-hk/agda-cardano-common`, branch
 `kangfeng/itree-csp`, under `src/ITree-CSP/CSP/Examples/Cardano_network/`
-*(local clone: `~/GoogleDrive/IOHK/agda-cardano-common` @ ee1f4a2, 2026-07-06)*
+*(read at ee1f4a2, 2026-07-06)*
 
 The successor to the earlier CSPm/FDR model
 (`mini_protocols_KA_BF_CS_Tx_20260514.csp`): the N2N mini-protocols —
@@ -85,8 +85,7 @@ datatypes), `Base.agda` (protocol identities), `Network.agda`
 
 ### 2.2 The prose specification — `network-spec`
 
-*upstream:* `ouroboros-network/docs/network-spec/*.tex` *(local clone:
-`~/GoogleDrive/IOHK/ouroboros-network` @ d842a23, 2026-05-22)*
+*upstream:* `ouroboros-network/docs/network-spec/*.tex` *(read at d842a23, 2026-05-22)*
 
 The official informal specification: `miniprotocols.tex` (protocol
 descriptions, state tables, **the protocol number tables**), `mux.tex` (the
@@ -155,7 +154,7 @@ code and `mux.tex`; the source comment should be fixed upstream.
 ### 2.5 On-chain encodings the network layer must handle — `cardano-ledger`
 
 *upstream:* `intersectmbo/cardano-ledger`,
-`eras/conway/impl/cddl/data/conway.cddl` *(local @ cd8b7fab8, 2026-06-03)*
+`eras/conway/impl/cddl/data/conway.cddl` *(read at cd8b7fab8, 2026-06-03)*
 
 Chain-following forces byte-exact handling of on-chain objects: verifying
 `prevHash` links means hashing the *received header bytes* (never a
@@ -196,8 +195,7 @@ the real network.
 ### 2.7 Environment / configuration
 
 *per-network genesis + topology files* (e.g.
-`book.world.dev.cardano.org/environments/<network>/`; local:
-`~/GoogleDrive/IOHK/preview-config/`).
+`book.world.dev.cardano.org/environments/<network>/`).
 
 Supplies the facts no grammar carries: **network magic** (Preview = 2,
 mainnet = 764824073 — a wrong value is an instant handshake rejection),

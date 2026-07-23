@@ -2,7 +2,16 @@
 
 *A Cardano node reimplemented on the BEAM (Erlang VM) in Elixir.*
 
-Status: in development. Chain-sync (resumable), keep-alive, block-fetch, and the durable store are built; ledger/script validation is not yet performed.
+Status (2026-07): in development, live-following Preview for months. Built: all
+mini-protocol clients, all-era decoding with full body backfill from genesis,
+the UTxO set, ledger state (certificates, withdrawals, pots, epoch transitions
+including the reward engine, all as invertible journalled deltas), header and
+block validation gates driven by on-chain conformance rules. Not yet: script
+execution, KES/VRF verification, governance enactment, multi-peer chain
+selection. This document is primarily **design rationale** — it records
+decisions with their reasoning. Where reality has since moved past a section, a
+dated *Status* note says so rather than rewriting history. The current README
+is the accurate feature list.
 
 ## Project goals
 
@@ -63,6 +72,12 @@ observer  →  relay (add server sides + tx-submission)  →  block producer
 ```
 
 ### Fidelity: semantic model first
+
+> **Status (2026-06): superseded.** The decision to target a *real* Preview
+> relay for milestone 1 made the real wire (CBOR, handshake, mux framing)
+> load-bearing from the first connection, so Cardamom has been wire-faithful
+> since then — see `WIRE.md`. The seam idea survived inverted: the *test*
+> infrastructure (SimPeer, `Channel.Test`) sits behind the seam instead.
 
 We are **not** wire-compatible with mainnet on day one. We use native Elixir
 terms as the "wire format", structured so that a real CBOR codec and the real
@@ -155,6 +170,16 @@ Deps: `ExUnit` (built-in) + **`StreamData`** (property tests — ideal for codec
 — natural fit for strict parsing). `Mox` later only if channel injection grows.
 
 ## Build strategy: trust-everything skeleton FIRST (validation stubbed)
+
+> **Status (2026-07): the seam is being filled, as designed.** Validation now
+> exists in stages: headers pass a decode→validate→store gate
+> (operational-cert signature verification); blocks pass a validation gate in
+> which on-chain conformance rules (value conservation, the withdrawal oracle)
+> render an accept/reject verdict *before* derived state commits; and the
+> ledger fold (UTxO + non-UTxO accounting including the epoch reward engine)
+> is real. Still stubbed: script execution, KES/VRF, governance enactment.
+> Nothing was torn out — the rules slotted into the seam this section reserved
+> for them. The trust assumption below still applies to what remains stubbed.
 
 The first build is a **trust-everything observer skeleton**: absorb blocks,
 trust them all, `validate(block) → :ok`, ledger state is a toy dict, no SQL. This
@@ -540,6 +565,13 @@ view trails, ledger never reads it back.")
 
 ### Ledger state is itself two-natured (open exploration)
 
+> **Status (2026-07): built, and the line fell where predicted.** The light
+> per-tx UTxO fold and the heavy epoch-periodic accounting (stake snapshots,
+> the reward calculation, pool reaping) are both implemented, per the Conway
+> formal specification — with the epoch transition expressed as invertible
+> per-block delta operations so rollback works across an epoch boundary. The
+> open exploration below is retained as the reasoning that shaped it.
+
 A pure UTxO model makes "state" conceptually light: the set of unspent outputs,
 updated per-tx by local set difference/union — no Ethereum-style global mutable
 account map. **But** Cardano's ledger state is UTxO *plus* accumulated
@@ -672,7 +704,14 @@ ChainStore; the SqlWriter restarting must not drop live ledger state.
 
 ## Open questions
 
-- Final supervision tree shape.
-- Module/namespace layout.
-- Exact simplified-ledger rules for the chosen era.
-- Where the future codec seam sits precisely.
+*(refreshed 2026-07; the original list — supervision tree, namespace layout,
+ledger-rule scope, codec seam — is settled and visible in the code)*
+
+- The governance half of the epoch rules (ratification/enactment, gov-action
+  deposits, DRep expiry) — needs gov-action tracking first.
+- Enacted-parameter tracking (reward parameters are currently genesis-valued).
+- KES/VRF header verification and chain continuity (Tier-1 header checks).
+- From-genesis replay/refold as the validation run for the reward engine.
+- Transaction validation as an independent, context-injected process, so the
+  same rules run on mempool transactions as predictions.
+- Multi-peer operation and real chain selection (we follow one relay today).

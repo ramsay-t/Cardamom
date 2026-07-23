@@ -5,6 +5,19 @@ specification is a deliberate aim of this project. Building Cardamom against a r
 relay is partly a way to *generate findings* for the network spec. So: record where
 the spec speaks clearly, where it's silent, and every byte-level ambiguity we hit.
 
+> **Model update (2026-07-23):** the CSPm/FDR model referenced throughout this
+> document has a successor — the same mini-protocols re-formalised in Agda
+> (ITree-CSP) with machine-checked proofs, in
+> `input-output-hk/agda-cardano-common` branch `kangfeng/itree-csp`
+> (`src/ITree-CSP/CSP/Examples/Cardano_network/`). Notable deltas: the mux
+> contract (`Network ≈FD CopySpec`) is now a *proved theorem*; the
+> FindIntersect single-point/list divergence flagged below is *fixed*
+> (`List Point`); the peers are explicitly API-driven, making the
+> driver-factoring house rules below the model's own architecture; and the
+> Leios protocols are included. CSPm line numbers below are retained as the
+> historical citations our FSM transcription used; new work should cite the
+> Agda modules (`ChainSync.agda` etc.). See `network-specs.md` §2.1.
+
 ## Epistemics: the CSP is a HYPOTHESIS, not ground truth
 
 The CSP model is the **most formal artifact available, but it may or may not match
@@ -84,8 +97,8 @@ conformance test. Cite this real split.
 
 ## Conway CDDL (on-chain encoding) — milestone 1 header structure
 
-`~/GoogleDrive/IOHK/cardano-ledger/eras/conway/impl/cddl/data/conway.cddl`
-(cardano-ledger @ cd8b7fa, 2026-06-03). The on-chain / consensus-critical
+`cardano-ledger/eras/conway/impl/cddl/data/conway.cddl`
+(read at cd8b7fa, 2026-06-03). The on-chain / consensus-critical
 encoding — STRICT-ENFORCE side of the CDDL directive.
 
 M1-relevant grammar (the strict targets):
@@ -192,7 +205,12 @@ fudge. (Process-structure analogue of strict-CDDL "don't coerce".)
 
 ## Authoritative behavioural source: the CSP model
 
-`~/Downloads/mini_protocols_KA_BF_CS_Tx_20260514.csp` (CSPm / FDR; dated
+*(Historical: this section describes the CSPm/FDR file our transcription was
+built from. That file is superseded by — and no longer available outside — the
+Agda successor described in the note at the top of this document, which now
+holds the authoritative versions of everything below.)*
+
+`mini_protocols_KA_BF_CS_Tx_20260514.csp` (CSPm / FDR; dated
 2026-05-14). A machine-checked process model of the Cardano multiplexer + four
 mini-protocols (KeepAlive, BlockFetch, ChainSync, TxSubmission2). **This is the
 authoritative spec for protocol LOGIC** (message sequencing + agency + the client/
@@ -242,8 +260,9 @@ them is the open work (and a likely source of spec findings):
 
 - **(gap)** Handshake — the first & most failure-prone exchange — has no formal
   model here. Is there a separate handshake model, or genuinely unmodelled?
-- **(clarity)** `MsgCSFindIntersect` carries one `Point` here vs `[Point]` on the
-  real wire (comment ~457–459 is honest about it) — model/wire arity diverges.
+- **(clarity — RESOLVED in the Agda successor)** `MsgCSFindIntersect` carried
+  one `Point` in the CSPm model vs `[Point]` on the real wire (comment ~457–459
+  was honest about it); the Agda model carries `List Point` (`Data.agda`).
 - **(clarity)** SDU egress scheduling discipline (priority/fairness between
   protocols on one socket) is in prose (~142) but unmodelled — a real behavioural
   question (inter-protocol fairness) pinned down nowhere.
@@ -331,9 +350,9 @@ comment is a documentation defect in the source. Concrete spec-finding — exact
 the kind of "the only spec is the code and the code's own docs are wrong" issue
 this project surfaces. As the INITIATOR (we dial out), we send dir bit = 0.
 
-## Transport CDDL + sources (ouroboros-network, local)
+## Transport CDDL + sources (ouroboros-network)
 
-`~/GoogleDrive/IOHK/ouroboros-network` (@ d842a23, 2026-05-22). Fills what the
+`ouroboros-network` (read at d842a23, 2026-05-22). Fills what the
 CSP abstracts and the ledger CDDL lacks:
 
 - **chain-sync wire encoding** — `.../cddl/specs/chain-sync.cddl`. Maps 1:1 to
@@ -422,6 +441,10 @@ PeerSharing. So: **Handshake + KeepAlive + ChainSync.** KeepAlive is the barest
 "stay connected" protocol; ChainSync is the barest "do something useful" one.
 
 ## Milestone 1 work split
+
+*(Historical: milestone 1 was completed 2026-06; both halves below happened as
+planned, and the findings the second half generated are consolidated in
+`WIRE.md` and `network-specs.md`.)*
 
 1. **Transcribe the logic** — ChainSync client `:gen_statem` from the CSP. Have
    the spec; high-confidence.

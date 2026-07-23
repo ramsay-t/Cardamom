@@ -1,8 +1,10 @@
 # Cardamom — guidance for Claude (and other AI assistants)
 
 Public working guidance for anyone (human or AI) contributing to Cardamom. For
-the architecture rationale see `architecture.md`; for the wire protocol see
-`wire-protocol.md`; for security invariants see `security.md`.
+the architecture rationale see `architecture.md`; for the specification
+landscape see `network-specs.md`; for the byte-level wire guide see `WIRE.md`;
+for working notes and findings see `wire-protocol.md`; for security invariants
+see `security.md`; for testing methodology see `../test/TEST_STRATEGY.md`.
 
 ## What Cardamom is
 
@@ -28,10 +30,12 @@ a field that doesn't fit is an error, not something to trim or normalise. Libera
 different lenient interpretations can diverge. Test the reject paths, not just the
 happy path (see the MC/DC-style corner tests in the codec test suites).
 
-**CSP structural fidelity.** Mini-protocol state machines mirror the protocol's
-formal (CSP) structure: one `:gen_statem` per protocol, state names matching the
-protocol's states, branches ordered as the model's choices, and the relevant
-model location cited per state. Send-last then transition to a receiving state.
+**Structural fidelity to the formal protocol model.** Mini-protocol state
+machines mirror the formal model's process structure (the CSP-style Agda
+ITree-CSP model in `input-output-hk/agda-cardano-common`, branch
+`kangfeng/itree-csp` — see `network-specs.md` §2.1): one `:gen_statem` per
+protocol, state names matching the model's states, branches ordered as the
+model's choices, and the relevant model location cited per state. Send-last then transition to a receiving state.
 External choice ⟺ a guarded receive; a decision the node makes (internal choice)
 is factored into a separate driver process that messages the FSM. If a state's
 structure can't be expressed this way, raise it rather than forcing it.
@@ -66,7 +70,9 @@ experiment on it.
 ## Scope guardrails
 
 - **Preview testnet only.** Connecting to mainnet is refused structurally
-  (`Cardamom.Network`). 
-- **Read-only / consumer protocols** (chain-sync, block-fetch, keep-alive). Any
-  protocol that propagates or submits transactions, or accepts inbound
-  connections, is out of scope without an explicit decision.
+  (`Cardamom.Network`).
+- **Read-only / consumer roles only.** We consume chain-sync, block-fetch and
+  keep-alive, and we *receive* tx-submission gossip and peer-sharing replies
+  for observation. The bright line: anything that **propagates or submits** a
+  transaction, or **accepts inbound connections**, is out of scope without an
+  explicit, deliberate decision — never "just to test it".
