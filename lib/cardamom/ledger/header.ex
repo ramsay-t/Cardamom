@@ -4,21 +4,24 @@ defmodule Cardamom.Ledger.Header do
   wire era tag.
 
   Why not the era tag: the `[era_tag, ...]` number is NOT a reliable discriminator — block-fetch
-  and chain-sync number eras differently (block-fetch tags an Alonzo block 5; chain-sync tags a
-  Babbage header 4), and the 15-field→10-field header change does NOT line up with the era index
-  anyway (Alonzo AND Babbage are 15-field two-VRF; only Conway+ is 10-field combined-VRF). Trying
-  to map tag→shape means guessing a mapping the wire doesn't actually honour. (This is the bug
-  that froze body backfill: era 5 was dispatched to the 10-field decoder, but those blocks are
-  15-field, so every one was rejected.)
+  and chain-sync number eras DIFFERENTLY (resolved 2026-07-24, see docs/WIRE.md §9: the block
+  envelope is the consensus DISK encoding where Byron occupies TWO tags — 0 EBB, 1 regular — so
+  Shelley=2 … Alonzo=5, Babbage=6, Conway=7; the chain-sync header envelope gives Byron ONE slot,
+  so every later era is one lower: Alonzo=4, Babbage=5, Conway=6). Mapping tag→shape means
+  knowing which numbering you're holding — guess wrong and every block rejects. (This is the bug
+  that froze body backfill: block tag 5 was assumed Babbage/10-field via the wrong table, but
+  block-tag 5 is ALONZO and those headers are 15-field, so every one was rejected.)
 
   The header IS self-describing: it is `[header_body, kes_signature]`, and the CBOR array length
   of `header_body` says which shape it is — no era tag required:
 
-    * 15 elements → TPraos / pre-combined-VRF Praos (Shelley … Babbage): two VRF certs, OCert +
-      ProtVer inlined. → `Cardamom.Ledger.Shelley.Header`. Verified: real Alonzo (proto 6) and
-      Babbage (proto 7) blocks are 15-field.
-    * 10 elements → combined-VRF Praos (Conway+): one VRF cert, nested OCert + ProtVer.
-      → `Cardamom.Ledger.Praos.Header`. Verified: real Conway (proto 8) headers are 10-field.
+    * 15 elements → TPraos (Shelley … Alonzo): two VRF certs, OCert + ProtVer inlined.
+      → `Cardamom.Ledger.Shelley.Header`. Verified against real Alonzo-era Preview blocks — NB
+      their ProtVer field may signal proto 7 (a late-Alonzo block voting for the Vasil HF);
+      proto-version ≠ era, another of the four version axes.
+    * 10 elements → Praos (Babbage+, incl. Conway/Dijkstra): one combined VRF cert, nested
+      OCert + ProtVer. → `Cardamom.Ledger.Praos.Header`. Verified against real Babbage-era
+      Preview headers.
 
   Byron (era 0) headers are structurally different — `[tag, header]`, not `[body, sig]` — so
   Byron is taken only when the era tag explicitly says 0 (Byron never reaches the array-length

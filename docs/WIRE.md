@@ -233,14 +233,36 @@ two protocols number eras differently**. Byte-verified on the *same block*
 
 *(fixtures: `preview_rollforward.hex` vs `blocks/block-0.hex`)*
 
-Similarly, current Conway-era chain-sync headers arrive tagged **5**
-(10-field Praos headers; fixture `preview_rollforward_praos.hex` is one,
-post-strip). Working hypothesis: block-fetch uses the HardFork era index
-(Byron 0 … Babbage 5, Conway 6, Dijkstra 7) and chain-sync's header envelope
-runs one lower for the Shelley family; we have not chased the *why* into the
-consensus codecs. **Design consequence: do not build anything that trusts the
-era tag as a cross-protocol era identity** — see §10 for what to do instead.
-This is one axis of a wider tangle (era index ≠ on-chain protocol major
+**The mechanism (resolved 2026-07-24, from the consensus source).** The
+*block* envelope is the HardFork combinator's *disk* encoding, sent verbatim
+inside block-fetch's tag-24 wrapper. That encoding extends Byron's legacy
+format — and a Byron block was already `[tag, payload]` with tag 0 = EBB,
+1 = regular block — so **Byron occupies two tags** and later eras continue
+from 2 (`ouroboros-consensus-cardano` `Cardano/Node.hs`, `SerialiseHFC`
+instance):
+
+| Era | block envelope | chain-sync header envelope |
+|---|--:|--:|
+| Byron (EBB / regular) | 0 / 1 | 0 |
+| Shelley | 2 | 1 |
+| Allegra | 3 | 2 |
+| Mary | 4 | 3 |
+| Alonzo | 5 | 4 |
+| Babbage | 6 | 5 |
+| Conway | 7 | 6 |
+| Dijkstra | 8 | 7 |
+
+The chain-sync *header* envelope gives Byron a single slot, hence the
+constant off-by-one for every later era. (Independent confirmation: the
+TSUNAGI implementation's incident record documents being bitten by exactly
+this — forging blocks tagged 6 when Conway blocks must carry 7.)
+
+So our byte-verified fixtures above are **Alonzo** (block tag 5 / header
+tag 4), and `preview_rollforward_praos.hex` is a **Babbage** header
+(chain-sync tag 5, 10-field Praos). **Design consequence: do not build
+anything that trusts the era tag as a cross-protocol era identity** — the
+two numberings differ, and shape dispatch (§10) is the robust alternative.
+This is one axis of a wider tangle (era tags ≠ on-chain protocol major
 version ≠ negotiated N2N version — four version axes in total, none
 aligned).
 
@@ -251,14 +273,14 @@ A Shelley-family header is `[header_body, kes_signature]`, and
 tag is unnecessary *and* unreliable (§9). Trusting it froze our body backfill
 for an evening.
 
-* **15 elements → TPraos** (Shelley…Babbage): TWO CertifiedVRF fields
+* **15 elements → TPraos** (Shelley…Alonzo): TWO CertifiedVRF fields
   (nonce + leader), OCert (4 fields) and ProtVer (2) **inlined flat**:
   `[block_no, slot, prev_hash, issuer_vkey, vrf_vkey, vrf_eta, vrf_leader,
   body_size, body_hash, ocert_vkey, ocert_n, ocert_kes_period, ocert_sigma,
   proto_major, proto_minor]`
   — decoder `lib/cardamom/ledger/shelley/header.ex`, from
   `TPraos/BHeader.hs` (CBORGroup inlining is why it's flat).
-* **10 elements → Praos** (Conway+): ONE combined CertifiedVRF, OCert and
+* **10 elements → Praos** (Babbage+): ONE combined CertifiedVRF, OCert and
   ProtVer **nested** as sub-arrays:
   `[block_no, slot, prev_hash, issuer_vkey, vrf_vkey, [vrf_out, vrf_proof],
   body_size, body_hash, [ocert…4], [major, minor]]`
@@ -409,10 +431,10 @@ citations: `lib/cardamom/ledger/byron/body.ex`.
 
 | Fixture | Proves | Pinned by |
 |---|---|---|
-| `preview_rollforward.hex` | RollForward envelope, era tag 4, 15-field TPraos header | `ledger/header_test.exs`, `conway/header_real_test.exs` |
-| `preview_rollforward_praos.hex` | 10-field Praos header (Conway; bare, post-strip) | `ledger/praos/header_test.exs`, `praos/validation_test.exs` |
+| `preview_rollforward.hex` | RollForward envelope, header tag 4 (Alonzo), 15-field TPraos header | `ledger/header_test.exs`, `conway/header_real_test.exs` |
+| `preview_rollforward_praos.hex` | 10-field Praos header (Babbage; bare, post-strip) | `ledger/praos/header_test.exs`, `praos/validation_test.exs` |
 | `preview_rollbackward.hex` | RollBackward shape | *captured, not yet test-pinned* |
-| `blocks/block-0.hex … block-19.hex` | block-fetch era tag 5, block structure, body-hash verification, genesis-era decode | `conway/block_fixtures_test.exs` |
+| `blocks/block-0.hex … block-19.hex` | block-fetch tag 5 (Alonzo), block structure, body-hash verification, genesis-era decode | `conway/block_fixtures_test.exs` |
 | `preview_block_1.hex`, `preview_block_13011.hex`, `preview_block_with_tx.hex` | real block + tx decode end-to-end | `conway/block_real_test.exs` |
 | `preview_block_indefinite_txbodies.hex` | indefinite-length `tx_bodies` in the wild | `conway/block_real_test.exs` |
 | `preview_block_invalid_tx.hex` | `invalid_transactions` + collateral path | `store/collateral_return_index_test.exs` |

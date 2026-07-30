@@ -1,9 +1,16 @@
 defmodule Cardamom.Ledger.Block do
   @moduledoc """
   Era-dispatching entry point for decoding a block's transactions. A block arrives
-  era-wrapped — `[era, inner]` — where `era` is the HardFork `CardanoEras` index:
+  era-wrapped — `[era, inner]` — in the consensus DISK numbering (docs/WIRE.md §9), where
+  Byron's legacy format already used tags 0 (EBB) / 1 (regular), so:
 
-      0 Byron, 1 Shelley, 2 Allegra, 3 Mary, 4 Alonzo, 5 Babbage, 6 Conway, 7 Dijkstra.
+      0/1 Byron (EBB/regular), 2 Shelley, 3 Allegra, 4 Mary, 5 Alonzo, 6 Babbage,
+      7 Conway, 8 Dijkstra.
+
+  KNOWN LATENT MISMATCH (flagged 2026-07-24, harmless on Preview which has no Byron blocks and
+  no Dijkstra yet, needs a tested fix before either appears): the dispatch below still assumes
+  the OLD one-slot-Byron table — tag 1 (a regular Byron block) would misroute to the
+  Shelley-family decoder, and tag 8 (Dijkstra) errors as unknown_era.
 
   Byron (era 0) is structurally unrelated to every later era and is decoded by
   `Cardamom.Ledger.Byron.Body`. Eras 1-7 are the Shelley FAMILY: they all share the
