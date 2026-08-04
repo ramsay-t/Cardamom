@@ -107,8 +107,9 @@ defmodule Cardamom.PeerSharing.Client do
     state
   end
 
+  # :done is terminal — nothing to do. (No catch-all: Codec.decode's typed message set is
+  # fully covered above; the type checker proves an extra clause dead.)
   defp on_msg(:done, state), do: state
-  defp on_msg(_other, state), do: state
 
   # Record each shared address as a low-trust candidate (event :peer_shared = neutral
   # delta — known but no reputation gain). It becomes dial-eligible only via the (future)

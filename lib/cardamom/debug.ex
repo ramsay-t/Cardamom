@@ -22,8 +22,6 @@ defmodule Cardamom.Debug do
   Or at boot via the params file key `"debug_raw_bytes": true` (→ app env :debug_raw_bytes),
   or env var CARDAMOM_DEBUG_RAW_BYTES=1.
   """
-  require Logger
-
   @category :raw_bytes
   @filter_id :cardamom_raw_bytes
   @default_handler :cardamom_file

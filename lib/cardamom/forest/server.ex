@@ -12,7 +12,6 @@ defmodule Cardamom.Forest.Server do
   """
 
   use GenServer
-  require Logger
 
   alias Cardamom.Forest
 

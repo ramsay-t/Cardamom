@@ -114,8 +114,10 @@ defmodule Cardamom.Mux.Cbor do
   defp read_len(ai, rest) do
     case ai_follow(ai) do
       {:bytes, n} ->
+        bits = n * 8
+
         case rest do
-          <<v::unsigned-size(n * 8), after_len::binary>> -> {:ok, v, after_len}
+          <<v::unsigned-size(^bits), after_len::binary>> -> {:ok, v, after_len}
           _ -> :more
         end
 

@@ -38,7 +38,7 @@ defmodule Cardamom.Ledger.HeaderHandler do
   def handle_continue(:run, %{era: era, raw: raw, peer: peer} = st) do
     case Header.decode(era, raw) do
       {:ok, h} ->
-        case validate(h) do
+        case validate(h, raw) do
           :ok ->
             store(h, raw)
             emit("HeaderStored", header_meta(h, era, raw))
@@ -77,12 +77,16 @@ defmodule Cardamom.Ledger.HeaderHandler do
   end
 
   # ---- VALIDATE: the gate. Returns :ok | {:invalid, reason}. ----
-  # Currently the header-only crypto check we have (operational-cert cold-key signature). Byron
-  # headers have no opcert (nil) → nothing to check here yet (Byron validation is a separate story).
-  defp validate(%{operational_cert: nil}), do: :ok
+  # The header-only crypto checks: the operational cert's cold-key signature (the cold key
+  # authorised this hot KES key), then the KES signature over the header body (the hot key,
+  # at the slot's evolution, signed THIS header). Byron headers have no opcert (nil) →
+  # nothing to check here yet (Byron validation is a separate story).
+  defp validate(%{operational_cert: nil}, _raw), do: :ok
 
-  defp validate(h) do
-    Validation.verify_ocert(h)
+  defp validate(h, raw) do
+    with :ok <- Validation.verify_ocert(h) do
+      Validation.verify_kes(h, raw)
+    end
   end
 
   # ---- STORE: only reached on a PASS. Mark re-extract, feed the forest, persist. ----

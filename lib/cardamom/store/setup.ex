@@ -9,7 +9,6 @@ defmodule Cardamom.Store.Setup do
   defensively check whether the schema exists. It starts, migrates, and returns
   :ignore (no lingering process; its job is done at boot).
   """
-  require Logger
 
   def child_spec(_opts) do
     %{id: __MODULE__, start: {__MODULE__, :start_link, []}, type: :worker, restart: :transient}

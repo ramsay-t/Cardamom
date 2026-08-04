@@ -1064,12 +1064,17 @@ defmodule Cardamom.ChainStore do
       nil ->
         case fetch_fn.() do
           nil -> nil
-          val -> Cache.put(key, val) && val
+          val -> put_and_return(key, val)
         end
 
       val ->
         val
     end
+  end
+
+  defp put_and_return(key, val) do
+    Cache.put(key, val)
+    val
   end
 
   # ---- LEDGER STATE (non-UTxO accounting): generic domain/key -> value, driven by the invertible

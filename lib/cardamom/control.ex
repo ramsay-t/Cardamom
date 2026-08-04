@@ -20,7 +20,6 @@ defmodule Cardamom.Control do
   """
 
   use GenServer
-  require Logger
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))

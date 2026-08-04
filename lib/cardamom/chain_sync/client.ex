@@ -269,7 +269,8 @@ defmodule Cardamom.ChainSync.Client do
     slot = rollback_slot(point)
 
     if Process.whereis(Cardamom.Forest.Server), do: Cardamom.Forest.Server.rollback(point)
-    if slot && Process.whereis(Cardamom.ChainStore), do: Cardamom.ChainStore.rollback(slot)
+    # (no slot guard: rollback_slot/1 always yields an integer — origin/unknown → 0 = roll all)
+    if Process.whereis(Cardamom.ChainStore), do: Cardamom.ChainStore.rollback(slot)
     :ok
   rescue
     e -> Logger.warning("rollback failed: #{inspect(e)}")

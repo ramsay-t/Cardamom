@@ -38,9 +38,20 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
     # This makes synthetic headers indistinguishable from real ones to the validator — SimPeer and
     # tests exercise the real crypto path, not a bypass. Deterministic key optional via :cold_seed.
     {cold_pub, cold_priv} = cold_keypair(opts)
-    hot_vkey = :crypto.strong_rand_bytes(32)
+    # REAL KES key tree: hot_vkey is a genuine Sum6 root, and the header body will be
+    # genuinely KES-signed below — so built headers pass Praos.Validation.verify_kes (the
+    # gate), not just verify_ocert. Same test-fidelity rule as the cold signature. A shared
+    # default tree (persistent_term) keeps repeated builds cheap; pass :kes_tree to override.
+    kes_tree = Keyword.get(opts, :kes_tree) || default_kes_tree()
+    hot_vkey = Cardamom.Crypto.KES.vk(kes_tree)
     counter = Keyword.get(opts, :ocert_counter, 0)
-    kes_period = Keyword.get(opts, :ocert_kes_period, 0)
+    # Default the opcert's start period to the SLOT'S OWN KES period (what a real pool
+    # does — certs are issued for the current period), so any slot yields an in-window
+    # evolution t. Override with :ocert_kes_period for out-of-window tests.
+    kes_period =
+      Keyword.get(opts, :ocert_kes_period) ||
+        div(slot, Application.get_env(:cardamom, :slots_per_kes_period, 129_600))
+
     signed = <<hot_vkey::binary, counter::unsigned-big-64, kes_period::unsigned-big-64>>
     sigma = :crypto.sign(:eddsa, :none, signed, [cold_priv, :ed25519])
 
@@ -69,7 +80,16 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
       0
     ]
 
-    raw = CBOR.encode([header_body, b(448)])
+    # KES-sign the body's EXACT encoded bytes at the evolution the validator will derive
+    # (t = slot ÷ slotsPerKESPeriod − c₀), then splice raw from those same bytes — so
+    # what is signed is byte-identical to what a decoder carves back out.
+    body_bytes = CBOR.encode(header_body)
+
+    t =
+      div(slot, Application.get_env(:cardamom, :slots_per_kes_period, 129_600)) - kes_period
+
+    kes_sig = Cardamom.Crypto.KES.sign(kes_tree, t, body_bytes)
+    raw = <<0x82, body_bytes::binary>> <> CBOR.encode(%CBOR.Tag{tag: :bytes, value: kes_sig})
     hash = Crypto.blake2b_256(raw)
 
     %{
@@ -87,6 +107,20 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
   defp prev_hash_field(h) when is_binary(h), do: %CBOR.Tag{tag: :bytes, value: h}
 
   defp b(n), do: %CBOR.Tag{tag: :bytes, value: :crypto.strong_rand_bytes(n)}
+
+  # One shared KES tree for all built headers (64 Ed25519 keygens — generate once, reuse).
+  # Throwaway test key; a "pool identity" shared across synthetic headers is fine.
+  defp default_kes_tree do
+    case :persistent_term.get({__MODULE__, :kes_tree}, nil) do
+      nil ->
+        tree = Cardamom.Crypto.KES.generate()
+        :persistent_term.put({__MODULE__, :kes_tree}, tree)
+        tree
+
+      tree ->
+        tree
+    end
+  end
 
   # An Ed25519 cold keypair for the opcert. Random by default; pass :cold_seed (32 bytes) for a
   # DETERMINISTIC key (tests that want a stable issuer across builds). Returns {pub, priv}.

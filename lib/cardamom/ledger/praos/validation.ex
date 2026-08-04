@@ -9,9 +9,12 @@ defmodule Cardamom.Ledger.Praos.Validation do
     * Tier 1 — chain continuity (prev_hash, slot/blockno) — needs the parent header. TODO.
     * Tier 2a — OPERATIONAL CERTIFICATE cold-key signature (`verify_ocert/1`) — DONE here. Pure
       crypto, header-only: proves the pool's offline COLD key authorised this hot KES key.
-    * Tier 2b — KES signature over the header body — a Merkle tree of Ed25519 (Sum₆KES). TODO
-      (needs the byte-exact SumKES signature layout).
-    * Tier 3 — VRF leadership (needs stake distribution + epoch nonce). Deferred.
+    * Tier 2b — KES signature over the header body (`verify_kes/2`) — DONE here, via
+      `Cardamom.Crypto.KES` (Sum₆; validated against 500 real stored headers spanning
+      evolutions t=0..60 before gating). Proves the header was signed by the hot key the
+      opcert authorised, at the correct evolution for its slot.
+    * Tier 3 — VRF leadership (needs stake distribution + epoch nonce). Deferred (needs a
+      native ECVRF binding — see the VRF decision note in CLAUDE_NOTES).
 
   Counter MONOTONICITY (opcert n ≥ last-seen for this issuer) and KES-period BOUNDS need external
   state (a per-issuer counter map / protocol params) and are NOT done here — this module is the
@@ -51,6 +54,46 @@ defmodule Cardamom.Ledger.Praos.Validation do
   end
 
   def verify_ocert(_), do: {:invalid, :ocert_missing}
+
+  # KES-window parameters — genesis facts, app-env-overridable for tests/other networks.
+  # Preview shelley-genesis: slotsPerKESPeriod=129600, maxKESEvolutions=62.
+  defp slots_per_kes_period, do: Application.get_env(:cardamom, :slots_per_kes_period, 129_600)
+  defp max_kes_evolutions, do: Application.get_env(:cardamom, :max_kes_evolutions, 62)
+
+  @doc """
+  KES signature over the header body (Praos spec OCERT rule's KES half: the header body is
+  signed by the opcert's hot key at evolution `t = slot ÷ slotsPerKESPeriod − c₀`, and the
+  OCERT window requires `c₀ ≤ kesPeriod(slot) < c₀ + MaxKESEvolutions`).
+
+  Takes the header struct AND its RAW bytes: the signed message is the header body's own
+  byte span (carved, never re-encoded — `Cardamom.Crypto.KES.header_signable/1`).
+  Returns :ok | {:invalid, reason}; never raises.
+  """
+  @spec verify_kes(map(), binary()) :: :ok | {:invalid, term()}
+  def verify_kes(%{operational_cert: oc, slot: slot}, raw)
+      when is_map(oc) and is_integer(slot) and is_binary(raw) do
+    with {:ok, hot} <- fetch_bin(oc, :hot_vkey),
+         c0 when is_integer(c0) <- Map.get(oc, :kes_period),
+         {:ok, body_bytes, sig} <- Cardamom.Crypto.KES.header_signable(raw) do
+      t = div(slot, slots_per_kes_period()) - c0
+
+      cond do
+        t < 0 or t >= max_kes_evolutions() ->
+          {:invalid, {:kes_period_out_of_range, t}}
+
+        Cardamom.Crypto.KES.verify(hot, t, body_bytes, sig) ->
+          :ok
+
+        true ->
+          {:invalid, :kes_bad_signature}
+      end
+    else
+      {:error, reason} -> {:invalid, {:kes_unparseable, reason}}
+      _ -> {:invalid, :ocert_malformed}
+    end
+  end
+
+  def verify_kes(_, _), do: {:invalid, :ocert_missing}
 
   defp fetch_bin(map, key) do
     case Map.get(map, key) do

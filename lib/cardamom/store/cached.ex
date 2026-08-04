@@ -101,11 +101,16 @@ defmodule Cardamom.Store.Cached do
       nil ->
         case fetch_fn.() do
           nil -> nil
-          val -> Cache.put(cache_key, val) && val
+          val -> put_and_return(cache_key, val)
         end
 
       val ->
         val
     end
+  end
+
+  defp put_and_return(cache_key, val) do
+    Cache.put(cache_key, val)
+    val
   end
 end

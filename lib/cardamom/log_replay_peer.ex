@@ -15,7 +15,6 @@ defmodule Cardamom.LogReplayPeer do
   """
 
   use GenServer
-  require Logger
 
   alias Cardamom.{Channel, Mux.SDU}
   alias Cardamom.Protocol.ChainSync.Codec, as: CS

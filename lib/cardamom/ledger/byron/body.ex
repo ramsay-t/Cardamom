@@ -261,7 +261,7 @@ defmodule Cardamom.Ledger.Byron.Body do
   defp take(bin) do
     {:ok, _term, rest} = CBOR.decode(bin)
     span = byte_size(bin) - byte_size(rest)
-    <<item::binary-size(span), ^rest::binary>> = bin
+    <<item::binary-size(^span), ^rest::binary>> = bin
     {item, rest}
   end
 end
