@@ -66,6 +66,37 @@ defmodule Cardamom.Ledger.Block do
 
   def txs_in(_, _), do: {:error, :not_binary}
 
+  @doc """
+  Decode just the block's HEADER (era-dispatched, shape-based) from raw block bytes — for
+  callers that need header fields (e.g. the declared protocol major for era-gating) without
+  decoding transactions. `{:ok, %Cardamom.Ledger.Conway.Header{}}` | `{:error, reason}`.
+  Never raises.
+  """
+  @spec header(binary()) :: {:ok, map()} | {:error, term()}
+  def header(raw) when is_binary(raw) do
+    case Conway.Block.decode(strip_era(raw)) do
+      {:ok, %{header: h}} -> {:ok, h}
+      other -> other
+    end
+  rescue
+    e -> {:error, {:exception, e}}
+  end
+
+  def header(_), do: {:error, :not_binary}
+
+  # Conway.Block.decode expects the UNWRAPPED (bare array-5) block; strip an `[era, inner]`
+  # envelope if present (mirrors how txs_in reads the era tag).
+  defp strip_era(<<0x82, rest::binary>> = raw) do
+    case CBOR.decode(rest) do
+      {:ok, era, inner} when is_integer(era) and is_binary(inner) -> inner
+      _ -> raw
+    end
+  rescue
+    _ -> raw
+  end
+
+  defp strip_era(raw), do: raw
+
   # Read the era tag from a `[era, inner]` envelope (0x82 = array-2, first element the era
   # int). A bare array-5 block (0x85) has no era tag → :error (caller defaults it).
   defp era_tag(<<0x82, rest::binary>>) do

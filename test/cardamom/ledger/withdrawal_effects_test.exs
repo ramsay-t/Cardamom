@@ -23,14 +23,24 @@ defmodule Cardamom.Ledger.WithdrawalEffectsTest do
   end
 
   # Capture [:cardamom, :ledger, :divergence] events fired during fun; returns their metadata.
-  defp capture_divergences(fun) do
+  # The telemetry handler is GLOBAL, so under `async: true` a CONCURRENT test's divergence would
+  # leak in. Filter to events whose metadata contains `marker` (this call site's own fixture
+  # credential/address, hex) — handle the interleaving by identity, don't serialise it away (the
+  # project's own thesis applied to tests; see the BEAM-logs-not-ordered note). Default marker is
+  # h(1), which every credential-based fixture here uses.
+  defp capture_divergences(fun, marker \\ nil) do
     id = make_ref()
     me = self()
+    # Default marker: this file's fixture credential as it appears in divergence metadata
+    # (inspected {:key, <<…>>} — decimal byte list, NOT hex), so the substring test matches.
+    mark = marker || inspect(k(1))
 
     :telemetry.attach(
       id,
       [:cardamom, :ledger, :divergence],
-      fn _event, _meas, meta, _cfg -> send(me, {:divergence, id, meta}) end,
+      fn _event, _meas, meta, _cfg ->
+        if String.contains?(inspect(meta), mark), do: send(me, {:divergence, id, meta})
+      end,
       nil
     )
 
@@ -137,10 +147,13 @@ defmodule Cardamom.Ledger.WithdrawalEffectsTest do
     read = reader(%{reward: %{}, vote_deleg: %{}})
 
     divergences =
-      capture_divergences(fn ->
-        assert {[], [{:withdrawal_decodable, {:violation, %{address: _}}, []}]} =
-                 WithdrawalEffects.effects([{<<0xE0, 1, 2>>, 100}], read)
-      end)
+      capture_divergences(
+        fn ->
+          assert {[], [{:withdrawal_decodable, {:violation, %{address: _}}, []}]} =
+                   WithdrawalEffects.effects([{<<0xE0, 1, 2>>, 100}], read)
+        end,
+        "e00102"
+      )
 
     assert [%{check: :withdrawal_address_unparseable}] = divergences
   end

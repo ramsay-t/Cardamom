@@ -30,6 +30,12 @@ defmodule Cardamom.Ledger.WithdrawalEffects do
 
   alias Cardamom.Ledger.Address
 
+  # Protocol major at which the Conway vote-delegation-before-withdrawal rule takes effect
+  # (Conway = on-chain protocol major 9). Before it (Babbage 7–8 …) a key-hash withdrawal
+  # needs NO vote delegation, so the check must not fire — keying rule changes off PROTOCOL
+  # MAJOR, the correct version axis ([[reference_cardano_version_axes]]).
+  @conway_major 9
+
   @doc """
   Ops + check results for one decoded tx's withdrawals (`[{reward_addr_bytes, coin}]`). `read`
   is the usual `(domain, key) -> value | nil` fun (pass the block's read-through overlay so
@@ -38,11 +44,16 @@ defmodule Cardamom.Ledger.WithdrawalEffects do
     * `ops` — the `{:set, :reward, cred, old, 0}` zeroing ops (`constMap wdrlCreds 0 ∪ˡ rewards`),
     * `results` — `{rule, outcome, opts}` tuples for `Cardamom.Ledger.Verdict.add_all/2`.
 
+  `protocol_major` (default Conway = 9, so existing callers keep today's behaviour) era-gates
+  the vote-delegation precondition — `Cardamom.Ledger.TxValidation` passes the block's own major.
   An unparseable/malformed withdrawal yields a `:withdrawal_decodable` violation and NO op: the
   network accepted the tx, so failing to decode it means our derived state would silently omit
   the zeroing — exactly a stop-and-fix condition.
   """
-  def effects(withdrawals, read) when is_list(withdrawals) and is_function(read, 2) do
+  def effects(withdrawals, read, protocol_major \\ @conway_major)
+
+  def effects(withdrawals, read, protocol_major)
+      when is_list(withdrawals) and is_function(read, 2) do
     Enum.reduce(withdrawals, {[], []}, fn entry, {ops, results} ->
       case entry do
         {addr, amount} when is_binary(addr) and is_integer(amount) ->
@@ -58,7 +69,11 @@ defmodule Cardamom.Ledger.WithdrawalEffects do
               # the effect: constMap wdrlCreds 0 ∪ˡ rewards — the account is zeroed. The op is
               # built even when a check violates (self-describing; the gate decides its fate).
               {ops ++ [{:set, :reward, cred, balance, 0}],
-               results ++ [check_full_balance(cred, amount, balance), check_vote_delegated(cred, read)]}
+               results ++
+                 [
+                   check_full_balance(cred, amount, balance),
+                   check_vote_delegated(cred, read, protocol_major)
+                 ]}
           end
 
         other ->
@@ -69,7 +84,7 @@ defmodule Cardamom.Ledger.WithdrawalEffects do
     end)
   end
 
-  def effects(_not_a_list, _read), do: {[], []}
+  def effects(_not_a_list, _read, _major), do: {[], []}
 
   # `(stake cred, amount) ∈ rewards` — amount must equal the FULL balance we derived.
   defp check_full_balance(_cred, amount, balance) when amount == balance,
@@ -82,10 +97,14 @@ defmodule Cardamom.Ledger.WithdrawalEffects do
   end
 
   # `filter isKeyHash wdrlCreds ⊆ dom voteDelegs` — key-hash creds must have vote-delegated;
-  # script creds are outside the rule's domain (vacuous pass).
-  defp check_vote_delegated({:script, _}, _read), do: {:withdrawal_vote_delegated, :pass, []}
+  # script creds are outside the rule's domain (vacuous pass). ERA-GATED: the rule is Conway+
+  # (major ≥ 9); pre-Conway there is no such precondition, so a vacuous pass.
+  defp check_vote_delegated(_cred, _read, major) when major < @conway_major,
+    do: {:withdrawal_vote_delegated, :pass, []}
 
-  defp check_vote_delegated({:key, _} = cred, read) do
+  defp check_vote_delegated({:script, _}, _read, _major), do: {:withdrawal_vote_delegated, :pass, []}
+
+  defp check_vote_delegated({:key, _} = cred, read, _major) do
     if read.(:vote_deleg, cred) == nil do
       detail = %{credential: inspect(cred)}
       diverge(:withdrawal_without_vote_delegation, detail)

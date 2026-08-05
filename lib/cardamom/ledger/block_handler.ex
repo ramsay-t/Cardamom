@@ -62,7 +62,7 @@ defmodule Cardamom.Ledger.BlockHandler do
         # THE GATE: build this block's ledger delta AND its check results, render the verdict,
         # and only apply on accept. (Empty blocks go through too — they can still cross an epoch
         # boundary, and boundary blocks are often empty.)
-        {ops, results} = build_ledger_delta(hash, slot, txs)
+        {ops, results} = build_ledger_delta(hash, raw, slot, txs)
         verdict = Verdict.add_all(Verdict.new(hash, slot), results)
 
         case Verdict.decision(verdict) do
@@ -138,9 +138,9 @@ defmodule Cardamom.Ledger.BlockHandler do
   # ORDERING ASSUMPTION (recorded, not enforced): deltas assume blocks apply in slot order. Live
   # chain-sync delivers in order; body BACKFILL can extract out of order, where a cert/epoch op
   # could capture a wrong old value. The conformance checks are the drift alarm for this.
-  defp build_ledger_delta(hash, slot, txs) do
+  defp build_ledger_delta(hash, raw, slot, txs) do
     base_read = fn dom, key -> ChainStore.ledger_read(dom, key) end
-    pp = ChainStore.protocol_deposits()
+    ctx = %{protocol_major: protocol_major(raw), pp: ChainStore.protocol_deposits()}
 
     epoch_ops = epoch_transition_ops(hash, slot, base_read)
 
@@ -150,33 +150,28 @@ defmodule Cardamom.Ledger.BlockHandler do
         fees -> [{:add, :fees, :pot, fees}]
       end
 
+    # Per tx via the INDEPENDENT, era-gated validator (Cardamom.Ledger.TxValidation) — the same
+    # step the mempool path runs. Thread the accumulated ops as each tx's read base so a tx sees
+    # earlier txs' (and the epoch/fee) ops (same-block visibility → journal invertibility).
     Enum.reduce(txs, {epoch_ops ++ fee_ops, []}, fn tx, {ops, results} ->
       read = Cardamom.Ledger.Delta.read_through(ops, base_read)
-
-      {w_ops, w_results} =
-        Cardamom.Ledger.WithdrawalEffects.effects(Map.get(tx, :withdrawals, []), read)
-
-      w_results = Enum.map(w_results, fn {rule, outcome, opts} ->
-        {rule, outcome, Keyword.put(opts, :txid, Map.get(tx, :txid))}
-      end)
-
-      ops = ops ++ w_ops
-
-      cert_ops =
-        tx
-        |> Map.get(:certs)
-        |> Cardamom.Ledger.Conway.Cert.decode_all()
-        |> Enum.reduce(ops, fn cert, acc ->
-          read2 = Cardamom.Ledger.Delta.read_through(acc, base_read)
-          acc ++ Cardamom.Ledger.CertEffects.effects(cert, read2, pp)
-        end)
-
-      {cert_ops, results ++ w_results}
+      {tx_ops, tx_results} = Cardamom.Ledger.TxValidation.run(tx, read, ctx)
+      {ops ++ tx_ops, results ++ tx_results}
     end)
   rescue
     e ->
       Logger.warning("block #{short(hash)}: ledger-delta build failed: #{inspect(e)}")
       {[], [{:ledger_delta_build, {:skip, {:build_crashed, inspect(e)}}, []}]}
+  end
+
+  # The block's OWN declared protocol major (its header's ProtVer) — the correct axis to gate
+  # era-specific rules ([[reference_cardano_version_axes]]). Falls back to Conway (9) if the
+  # header can't be read, so a decode hiccup never silently disables Conway checks.
+  defp protocol_major(raw) do
+    case Cardamom.Ledger.Block.header(raw) do
+      {:ok, %{protocol_version: {major, _minor}}} when is_integer(major) -> major
+      _ -> 9
+    end
   end
 
   # Journal + apply an accepted block's delta. ledger_apply_block dedupes by slot (on_conflict
