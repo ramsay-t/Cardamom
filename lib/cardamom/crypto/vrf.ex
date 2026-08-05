@@ -29,6 +29,12 @@ defmodule Cardamom.Crypto.VRF do
 
   Pinned by IOG's official draft-03 vectors AND 300 real network-accepted proofs
   (test/cardamom/crypto/vrf_test.exs, test/fixtures/vrf/).
+
+  LEADER-ELECTION ORACLE (the not-yet-built payoff): with `Cardamom.Ledger.Nonce`
+  giving η per epoch, `verify(vrf_vkey, proof, blake2b(slot ‖ η))` over every stored
+  header validates our whole leadership stack against the chain. It needs a from-genesis
+  (or published-anchor) nonce fold over CONTIGUOUS headers, so it lands with the replay
+  driver — VRF suite tier 3, deliberately still absent.
   """
 
   import Bitwise
