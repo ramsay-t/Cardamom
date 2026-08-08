@@ -90,6 +90,28 @@ defmodule Cardamom.Ledger.Conway.Block do
     end
   end
 
+  @doc """
+  Decode the block's `transaction_witness_sets` segment into a list of witness-set MAPS
+  (positionally aligned with the tx bodies). Structural decode only — `Cardamom.Ledger.Conway.
+  Witness` turns each into inert terms. `{:ok, [map]}` | `{:error, reason}`.
+  """
+  @spec witness_sets(binary()) :: {:ok, [map()]} | {:error, term()}
+  def witness_sets(raw) when is_binary(raw) do
+    with {:ok, _era, [_hdr, _bodies_b, wits_b, _aux_b, _invalid_b]} <- segments(raw),
+         {:ok, sets, _rest} <- CBOR.decode(wits_b) do
+      {:ok, List.wrap(unset(sets))}
+    else
+      {:error, _} = e -> e
+      other -> {:error, {:unexpected, other}}
+    end
+  rescue
+    e -> {:error, {:exception, e}}
+  end
+
+  # witness_sets may itself arrive as a #6.258 set of maps or a bare array.
+  defp unset(%CBOR.Tag{tag: 258, value: list}), do: list
+  defp unset(list), do: list
+
   # ---- the span-extracting top-level walk ----
 
   # Split the block into its 5 elements' ORIGINAL byte slices. A real block is

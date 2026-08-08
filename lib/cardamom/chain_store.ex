@@ -162,6 +162,29 @@ defmodule Cardamom.ChainStore do
   end
 
   @doc """
+  A slot-ordered PAGE of stored blocks strictly after the `(slot, hash)` cursor, for the
+  from-genesis replay driver — which must feed blocks in slot order WITHOUT loading the whole
+  (millions-of-rows) table. Returns `[%{hash, slot, raw}]` of at most `limit`, ordered by
+  `(slot, hash)`; pass the last row's `{slot, hash}` back as the next cursor. `nil` cursor = from
+  the start. Tie-break on hash makes the order total (many blocks can share a slot on some eras;
+  Preview's 1s slots rarely, but the driver must be deterministic regardless).
+  """
+  def blocks_after(cursor, limit \\ 500) do
+    import Ecto.Query
+
+    base = from(b in BlockRow, order_by: [asc: b.slot, asc: b.hash], limit: ^limit,
+                select: %{hash: b.hash, slot: b.slot, raw: b.raw})
+
+    q =
+      case cursor do
+        nil -> base
+        {s, h} -> from(b in base, where: b.slot > ^s or (b.slot == ^s and b.hash > ^h))
+      end
+
+    Repo.all(q)
+  end
+
+  @doc """
   LOCAL lookup of a block by (header) hash: cache → SQLite, nil if absent. NO network
   fetch (that's get_blocks/2). The read-only "what block do we already have for H?"
   query — used internally by get_blocks and available for forensics/assertions.
@@ -522,6 +545,23 @@ defmodule Cardamom.ChainStore do
     Repo.update_all(from(b in BlockRow, where: b.hash == ^hash), set: [txo_processed: false])
     Cache.delete({:block, hash})
     :ok
+  end
+
+  @doc """
+  DESTRUCTIVE — wipe all DERIVED state for a from-genesis refold: truncate `txos`,
+  `ledger_state`, `ledger_deltas`, reset every block to `txo_processed = false`, and flush the
+  cache. KEEPS `headers` and `blocks.raw` (immutable, content-verified). Genesis reseeds the
+  initial UTxO + pots on the next fold. Returns `{:ok, %{txos, ledger_state, ledger_deltas,
+  blocks_reset}}`. Call ONLY via `Cardamom.Replay.wipe_derived_state/1`, which guards it.
+  """
+  def wipe_derived_state! do
+    import Ecto.Query
+    {txos, _} = Repo.delete_all(Txo)
+    {ls, _} = Repo.delete_all(LedgerState)
+    {ld, _} = Repo.delete_all(LedgerDelta)
+    {reset, _} = Repo.update_all(from(b in BlockRow), set: [txo_processed: false])
+    if function_exported?(Cache, :flush, 0), do: Cache.flush()
+    {:ok, %{txos: txos, ledger_state: ls, ledger_deltas: ld, blocks_reset: reset}}
   end
 
   @doc """
