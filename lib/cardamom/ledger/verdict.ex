@@ -40,6 +40,12 @@ defmodule Cardamom.Ledger.Verdict do
     withdrawal_full_balance: "Certs.lagda.md:596-607 (mapˢ (map₁ stake) (wdrls ˢ) ⊆ rewards ˢ)",
     withdrawal_vote_delegated: "Certs.lagda.md:596-607 (filter isKeyHash wdrlCreds ⊆ dom voteDelegs)",
     withdrawal_decodable: "decode adequacy: the network accepted it, so we must be able to decode it",
+    vkey_signatures: "Utxow.lagda.md (∀ vk∈vkSigs, verify vk txid sig) — witness signatures valid",
+    witness_coverage: "Utxow.lagda.md (witsVKeyNeeded ⊆ dom vkSigs) — required key-hashes all signed",
+    validity_interval: "Utxo.lagda.md (slot ∈ txvldt: [invalid_before, invalid_hereafter))",
+    min_fee: "Utxo.lagda.md (minfee pp tx ≤ txfee) — necessary lower bound over the tx body size",
+    min_ada: "Utxo.lagda.md (∀ o∈outs, coin o ≥ minUTxO) — coinsPerUTxOByte·(|o|+160)",
+    max_tx_size: "Utxo.lagda.md (txsize ≤ maxTxSize)",
     ledger_delta_build: "delta construction integrity (implementation health, not a spec rule)"
   }
 

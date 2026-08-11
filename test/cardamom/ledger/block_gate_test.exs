@@ -37,9 +37,17 @@ defmodule Cardamom.Ledger.BlockGateTest do
 
   # A block whose single tx withdraws `withdrawn` and pays it all as `fee` (inputs/outputs
   # empty, so conservation is: withdrawn == fee).
+  #
+  # NOTE these tests exercise the WITHDRAWAL and CONSERVATION rules in isolation; BlockBuilder
+  # emits UNSIGNED synthetic txs, so witness COVERAGE will flag the (unwitnessed) reward-account
+  # key-hash. That is correct behaviour (a real withdrawal carries the stake key's signature),
+  # tested in witness_check_test; here we scope assertions to the rule under test via
+  # `violation_for/2` rather than demand an exact single-violation list.
   defp withdrawal_block(slot, withdrawn, fee) do
     BlockBuilder.build(slot: slot, bodies: [%{2 => fee, 5 => %{key_addr(1) => withdrawn}}])
   end
+
+  defp violation_for(rule, summary), do: Enum.filter(summary.violations, &(&1.rule == rule))
 
   defp capture_verdicts(fun) do
     id = make_ref()
@@ -69,18 +77,33 @@ defmodule Cardamom.Ledger.BlockGateTest do
     end
   end
 
-  test "conformant block ACCEPTS: all checks pass, effects committed, verdict emitted" do
-    seed_reward(k(1), 5_000)
-    block = withdrawal_block(10, 5_000, 5_000)
+  test "conformant SIGNED block ACCEPTS: all checks pass, effects committed, verdict emitted" do
+    # A REAL keypair: the reward account's key-hash is blake2b_224(vk), and the tx is signed by
+    # sk — so withdrawal, conservation AND witness coverage all pass (a genuinely valid block).
+    sk = :crypto.strong_rand_bytes(32)
+    {vk, _} = :crypto.generate_key(:eddsa, :ed25519, sk)
+    kh = Cardamom.Crypto.blake2b_224(vk)
+    cred = {:key, kh}
+    reward_addr = %CBOR.Tag{tag: :bytes, value: <<0xE0, kh::binary>>}
+
+    # withdrawal == fee (conservation), and fee ≥ minFee (economic rule): use a realistic 200k.
+    seed_reward(cred, 200_000)
+
+    block =
+      BlockBuilder.build(
+        slot: 10,
+        bodies: [%{2 => 200_000, 5 => %{reward_addr => 200_000}}],
+        sign_with: [sk]
+      )
 
     verdicts = capture_verdicts(fn -> assert :ok = ChainStore.process_block(block.raw, 10) end)
 
     # committed: the account zeroed (the PRE-CERT effect), fees accrued
-    assert ChainStore.ledger_read(:reward, k(1)) == 0
-    assert ChainStore.ledger_read(:fees, :pot) == 5_000
+    assert ChainStore.ledger_read(:reward, cred) == 0
+    assert ChainStore.ledger_read(:fees, :pot) == 200_000
 
-    # verdict: 2 withdrawal checks + conservation, all passes
-    assert [{%{passes: 3, skips: 0, violations: 0}, %{decision: :accept}}] = verdicts
+    # every check passed, block accepted
+    assert [{%{violations: 0}, %{decision: :accept}}] = verdicts
   end
 
   test "withdrawal-rule violation REJECTS AT THE GATE: no delta applied, no self-heal" do
@@ -90,8 +113,9 @@ defmodule Cardamom.Ledger.BlockGateTest do
     verdicts =
       capture_verdicts(fn ->
         assert {:error, {:validation_rejected, summary}} = ChainStore.process_block(block.raw, 10)
+        # scoped to the rule under test (the unsigned synthetic tx also trips witness coverage)
         assert [%{rule: :withdrawal_full_balance, detail: %{withdrawn: 5_000, our_balance: 4_999}}] =
-                 summary.violations
+                 violation_for(:withdrawal_full_balance, summary)
       end)
 
     # the gate withheld the COMMIT: balance NOT zeroed (old stance would have self-healed to 0),
@@ -108,22 +132,32 @@ defmodule Cardamom.Ledger.BlockGateTest do
     block = withdrawal_block(10, 5_000, 5_000)
 
     assert {:error, {:validation_rejected, summary}} = ChainStore.process_block(block.raw, 10)
-    assert [%{rule: :withdrawal_vote_delegated}] = summary.violations
+    assert [%{rule: :withdrawal_vote_delegated}] = violation_for(:withdrawal_vote_delegated, summary)
   end
 
   test "conservation violation REJECTS AT COMPLETION: block parks unprocessed" do
-    seed_reward(k(1), 5_000)
-    # withdrawal checks pass (5_000 == 5_000) but the tx keeps 1_000 unaccounted:
-    # consumed = 5_000 (withdrawal), produced = 4_000 (fee) — Utxo.lagda.md:437-449 violated.
-    block = withdrawal_block(10, 5_000, 4_000)
+    # Must PASS the gate (signed, sig+coverage+min_fee ok) so extraction runs and conservation is
+    # checked at completion — then fail conservation: consumed 200_000 (withdrawal), produced
+    # 199_000 (fee, still ≥ minFee), 1_000 unaccounted (Utxo.lagda.md:437-449).
+    sk = :crypto.strong_rand_bytes(32)
+    {vk, _} = :crypto.generate_key(:eddsa, :ed25519, sk)
+    kh = Cardamom.Crypto.blake2b_224(vk)
+    cred = {:key, kh}
+    reward_addr = %CBOR.Tag{tag: :bytes, value: <<0xE0, kh::binary>>}
+
+    seed_reward(cred, 200_000)
+
+    block =
+      BlockBuilder.build(slot: 10, bodies: [%{2 => 199_000, 5 => %{reward_addr => 200_000}}], sign_with: [sk])
 
     assert {:error, {:validation_rejected, summary}} = ChainStore.process_block(block.raw, 10)
 
-    assert [%{rule: :value_conservation, detail: %{diff: 1_000}}] = summary.violations
+    assert [%{rule: :value_conservation, detail: %{diff: 1_000}}] =
+             violation_for(:value_conservation, summary)
 
     # this check runs post-resolution, so the delta HAS applied (account zeroed) — but the block
     # is NOT marked processed: the reconciler will re-hit it and re-alarm (self-announcing stop).
-    assert ChainStore.ledger_read(:reward, k(1)) == 0
+    assert ChainStore.ledger_read(:reward, cred) == 0
   end
 
   test "empty block (no txs, nothing to violate) accepts with an empty verdict" do

@@ -26,7 +26,7 @@ defmodule Cardamom.Ledger.TxValidation do
   replay → halt, mempool → falsifiable prediction.
   """
 
-  alias Cardamom.Ledger.{Delta, WithdrawalEffects, CertEffects}
+  alias Cardamom.Ledger.{Delta, WithdrawalEffects, CertEffects, WitnessCheck, EconomicRules}
   alias Cardamom.Ledger.Conway.Cert
 
   @doc """
@@ -55,7 +55,36 @@ defmodule Cardamom.Ledger.TxValidation do
         {ops ++ CertEffects.effects(cert, read, pp), cres}
       end)
 
-    {ops, stamp(w_results ++ cert_results, txid)}
+    extra = witness_results(tx, ctx) ++ economic_results(tx, ctx)
+    {ops, stamp(w_results ++ cert_results ++ extra, txid)}
+  end
+
+  # Phase-1 ECONOMIC / structural rules (validity interval, min-fee, min-ada, max-size). Run
+  # only when the ctx carries a block `:slot` (the validity-interval rule needs it; other paths
+  # that lack a slot, e.g. some mempool contexts, get the rules that don't need one via ctx too).
+  # Individual rules SKIP when their param/field is absent — never a guess.
+  defp economic_results(tx, ctx) do
+    if Map.has_key?(ctx, :slot) do
+      EconomicRules.check(tx, ctx) |> Enum.map(fn {r, o, opts} -> {r, o, Keyword.delete(opts, :txid)} end)
+    else
+      []
+    end
+  end
+
+  # Phase-1 WITNESS rules run only when the ctx supplies a `:txo_resolver` — `(txid, ix) -> txo`
+  # for the spent inputs' payment credentials. Without one (mempool paths that lack UTxO access,
+  # or tests focused on ledger effects) the witness rules are simply not asserted here; the tx's
+  # witnesses must be attached (`Ledger.Block.txs_with_witnesses/1`) or there's nothing to check.
+  defp witness_results(tx, ctx) do
+    case {Map.get(ctx, :txo_resolver), Map.get(tx, :witnesses)} do
+      {resolver, w} when is_function(resolver, 2) and is_map(w) ->
+        {results, _} = WitnessCheck.check(tx, resolver)
+        # WitnessCheck already stamps :txid; return unstamped-shape tuples for the outer stamp.
+        Enum.map(results, fn {rule, outcome, opts} -> {rule, outcome, Keyword.delete(opts, :txid)} end)
+
+      _ ->
+        []
+    end
   end
 
   # Every check result carries the tx it came from, for verdict attribution.

@@ -57,7 +57,7 @@ defmodule Cardamom.Ledger.BlockHandler do
 
   @impl true
   def handle_continue(:spawn_children, %{hash: hash, raw: raw, slot: slot} = st) do
-    case Cardamom.Ledger.Block.txs_in(raw) do
+    case Cardamom.Ledger.Block.txs_with_witnesses(raw) do
       {:ok, txs} ->
         # THE GATE: build this block's ledger delta AND its check results, render the verdict,
         # and only apply on accept. (Empty blocks go through too — they can still cross an epoch
@@ -140,7 +140,18 @@ defmodule Cardamom.Ledger.BlockHandler do
   # could capture a wrong old value. The conformance checks are the drift alarm for this.
   defp build_ledger_delta(hash, raw, slot, txs) do
     base_read = fn dom, key -> ChainStore.ledger_read(dom, key) end
-    ctx = %{protocol_major: protocol_major(raw), pp: ChainStore.protocol_deposits()}
+    # txo_resolver enables the phase-1 WITNESS rules (vkey-sig + coverage): resolve a spent
+    # input's stored TXO for its payment credential. Coverage SKIPS an input we can't resolve
+    # yet (same-block sibling / not-yet-extracted producer) — no false reject; signatures are
+    # always checked. Only :key payment creds demand a vkey; :script ones don't.
+    ctx =
+      %{
+        protocol_major: protocol_major(raw),
+        pp: ChainStore.protocol_deposits(),
+        txo_resolver: &ChainStore.txo/2,
+        slot: slot
+      }
+      |> Map.merge(ChainStore.protocol_params())
 
     epoch_ops = epoch_transition_ops(hash, slot, base_read)
 

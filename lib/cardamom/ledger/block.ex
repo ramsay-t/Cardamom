@@ -67,6 +67,45 @@ defmodule Cardamom.Ledger.Block do
   def txs_in(_, _), do: {:error, :not_binary}
 
   @doc """
+  Decode a block's transactions AND attach each tx's WITNESS SET positionally (witness set i ↦
+  tx body i), so the phase-1 witness rules can run per tx. Same tx maps as `txs_in/1`, each with
+  `:witnesses` (the inert decoded set from `Cardamom.Ledger.Conway.Witness`); an empty set when
+  a tx has none or when the witness segment can't be read (Byron, or a decode hiccup) — never a
+  crash. `{:ok, [tx]}` | `{:error, reason}`.
+  """
+  @spec txs_with_witnesses(binary()) :: {:ok, [map()]} | {:error, term()}
+  def txs_with_witnesses(raw) when is_binary(raw) do
+    with {:ok, txs} <- txs_in(raw) do
+      wits =
+        case Conway.Witness.decode_block_witnesses(raw) do
+          {:ok, sets} -> sets
+          _ -> []
+        end
+
+      {:ok, zip_witnesses(txs, wits)}
+    end
+  end
+
+  def txs_with_witnesses(_), do: {:error, :not_binary}
+
+  @empty_witnesses %{
+    vkey: [],
+    native: [],
+    bootstrap: [],
+    plutus_v1: [],
+    plutus_data: [],
+    redeemers: nil,
+    plutus_v2: [],
+    plutus_v3: []
+  }
+
+  # Positional join: tx i ↦ witness set i; any tx without a corresponding set gets the empty set.
+  defp zip_witnesses(txs, wits) do
+    Enum.with_index(txs)
+    |> Enum.map(fn {tx, i} -> Map.put(tx, :witnesses, Enum.at(wits, i, @empty_witnesses)) end)
+  end
+
+  @doc """
   Decode just the block's HEADER (era-dispatched, shape-based) from raw block bytes — for
   callers that need header fields (e.g. the declared protocol major for era-gating) without
   decoding transactions. `{:ok, %Cardamom.Ledger.Conway.Header{}}` | `{:error, reason}`.

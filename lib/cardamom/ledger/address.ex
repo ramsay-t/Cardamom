@@ -63,4 +63,37 @@ defmodule Cardamom.Ledger.Address do
   end
 
   def stake_credential(_), do: nil
+
+  @doc """
+  The PAYMENT (spending) credential of an address — the authority that must authorise spending a
+  UTxO at it: `{:key, hash28}` (a vkey must sign) | `{:script, hash28}` (a script must witness) |
+  nil (Byron/malformed). This is the credential that drives `witsVKeyNeeded`: only `:key` payment
+  creds require a vkey signature; `:script` ones are satisfied by native/plutus witnesses instead.
+
+  The payment credential is the FIRST 28 bytes of the payload for base/pointer/enterprise types
+  (0..7); its kind is a KEY unless the address type's low bit is set (types 1/3/5/7 are payment
+  SCRIPT). Reward addresses (14/15) have no payment part (nil). Byron (8) → nil.
+  """
+  @spec payment_credential(binary()) :: {:key, binary()} | {:script, binary()} | nil
+  def payment_credential(<<header, rest::binary>>) do
+    type = header >>> 4
+
+    case type do
+      t when t in 0..7 ->
+        case rest do
+          <<payment::binary-size(28), _::binary>> ->
+            # low bit of the type = payment is a SCRIPT (types 1,3,5,7); else a KEY.
+            if (t &&& 1) == 0, do: {:key, payment}, else: {:script, payment}
+
+          _ ->
+            nil
+        end
+
+      # reward addresses have no payment part; Byron / anything else: none.
+      _ ->
+        nil
+    end
+  end
+
+  def payment_credential(_), do: nil
 end

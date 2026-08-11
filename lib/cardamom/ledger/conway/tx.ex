@@ -119,7 +119,17 @@ defmodule Cardamom.Ledger.Conway.Tx do
       # proposal_procedures (key 20). Proposal PRESENCE matters now — each proposal carries a
       # govActionDeposit (a `produced` term), so conservation must skip proposal txs honestly.
       votes: Map.get(body, 19),
-      proposals: Map.get(body, 20)
+      proposals: Map.get(body, 20),
+      # VALIDITY INTERVAL (phase-1): ttl / invalid_hereafter (key 3, upper, EXCLUSIVE) and
+      # invalid_before (key 8, lower, INCLUSIVE). A block's slot must lie in [before, hereafter).
+      # Absent = unbounded on that side. required_signers (key 14) for witness coverage.
+      invalid_hereafter: Map.get(body, 3),
+      invalid_before: Map.get(body, 8),
+      required_signers: Map.get(body, 14),
+      # tx BODY size in bytes (the original span) — the dominant term of minFee. NB the true
+      # minFee is over the WHOLE tx (body+witnesses+…); the body size is what we have per-tx
+      # here, so a fee rule must account for that (skip or bound), not assert on body size alone.
+      body_size: byte_size(body_bytes)
     }
   end
 

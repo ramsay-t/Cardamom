@@ -1316,6 +1316,23 @@ defmodule Cardamom.ChainStore do
     })
   end
 
+  @doc """
+  Protocol PARAMS for phase-1 economic rules. Preview SHELLEY-GENESIS values (minFeeA/B,
+  maxTxSize) — app-env overridable. `coins_per_utxo_byte` is DELIBERATELY absent (nil): it's an
+  ENACTED param (set at the Babbage HF, not in genesis), and until we track enactment the min-ADA
+  rule must SKIP rather than assert against a guess ([[reference_cardano_version_axes]] / the
+  pp-tracking TODO). A protocol-param-update gov action could also change minFeeA/B on-chain;
+  same caveat — genesis-valued until enacted-param tracking, conformance oracles are the alarm.
+  """
+  def protocol_params do
+    Application.get_env(:cardamom, :protocol_params, %{
+      min_fee_a: 44,
+      min_fee_b: 155_381,
+      max_tx_size: 16_384,
+      coins_per_utxo_byte: nil
+    })
+  end
+
   # Our-own-data serialisation (never wire-sourced; [:safe] guards corrupt rows). See design memory.
   defp enc(term), do: :erlang.term_to_binary(term)
   defp dec(bin), do: :erlang.binary_to_term(bin, [:safe])

@@ -47,7 +47,18 @@ defmodule Cardamom.Ledger.Conway.BlockBuilder do
 
     tx_count = length(bodies)
     bodies_bytes = CBOR.encode(bodies)
-    wits_bytes = CBOR.encode(List.duplicate(%{}, tx_count))
+    # Witness sets: empty by default; pass :witness_sets (a list of transaction_witness_set maps,
+    # positionally aligned with bodies) to build a SIGNED synthetic block that passes the phase-1
+    # witness rules. `:sign_with` is a convenience — a list of Ed25519 secret keys per tx; each
+    # tx gets a vkey witness signing its own txid (blake2b-256 of the body bytes).
+    wit_sets =
+      cond do
+        (ws = Keyword.get(opts, :witness_sets)) && is_list(ws) -> ws
+        (sks = Keyword.get(opts, :sign_with)) && is_list(sks) -> sign_bodies(bodies, sks)
+        true -> List.duplicate(%{}, tx_count)
+      end
+
+    wits_bytes = CBOR.encode(wit_sets)
     aux_bytes = CBOR.encode(%{})
     invalid_bytes = CBOR.encode([])
 
@@ -95,5 +106,28 @@ defmodule Cardamom.Ledger.Conway.BlockBuilder do
       bodies_offset: byte_size(era_prefix) + 1 + byte_size(hdr.raw),
       envelope: %CBOR.Tag{tag: 24, value: %CBOR.Tag{tag: :bytes, value: raw}}
     }
+  end
+
+  # For each (body, secret key) pair, build a witness set with one vkey witness signing that
+  # body's txid — a genuinely valid signature, so the built block passes phase-1 witness checks.
+  # Fewer keys than bodies → the rest get empty witness sets.
+  defp sign_bodies(bodies, sks) do
+    bodies
+    |> Enum.with_index()
+    |> Enum.map(fn {body, i} ->
+      case Enum.at(sks, i) do
+        sk when is_binary(sk) ->
+          {vk, _} = :crypto.generate_key(:eddsa, :ed25519, sk)
+          txid = Crypto.blake2b_256(CBOR.encode(body))
+          sig = :crypto.sign(:eddsa, :none, txid, [sk, :ed25519])
+
+          %{
+            0 => [[%CBOR.Tag{tag: :bytes, value: vk}, %CBOR.Tag{tag: :bytes, value: sig}]]
+          }
+
+        _ ->
+          %{}
+      end
+    end)
   end
 end
