@@ -46,6 +46,10 @@ defmodule Cardamom.Ledger.Verdict do
     min_fee: "Utxo.lagda.md (minfee pp tx ≤ txfee) — necessary lower bound over the tx body size",
     min_ada: "Utxo.lagda.md (∀ o∈outs, coin o ≥ minUTxO) — coinsPerUTxOByte·(|o|+160)",
     max_tx_size: "Utxo.lagda.md (txsize ≤ maxTxSize)",
+    cert_stake_registration: "Certs.lagda.md (regcred ∉ dom rewards) — not already registered",
+    cert_stake_deregistration: "Certs.lagda.md (decred ∈ dom rewards) — must be registered",
+    cert_delegation_target: "Certs.lagda.md (pool ∈ dom poolParams) — delegation target exists",
+    cert_pool_retirement: "Certs.lagda.md (pool ∈ dom poolParams) — retiring pool is registered",
     ledger_delta_build: "delta construction integrity (implementation health, not a spec rule)"
   }
 

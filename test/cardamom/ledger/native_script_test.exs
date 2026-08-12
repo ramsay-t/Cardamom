@@ -1,0 +1,80 @@
+defmodule Cardamom.Ledger.NativeScriptTest do
+  @moduledoc """
+  Native-script (timelock) EVALUATION — full validation of a real script class with zero Plutus.
+  Semantics (Shelley multisig + Allegra timelocks; the decoded tree from
+  `Cardamom.Ledger.Conway.Witness`):
+
+    * {:sig, kh}              — kh ∈ signers (the tx's supplied vkey key-hashes)
+    * {:all, ss}             — every sub-script satisfied (empty ⇒ true)
+    * {:any, ss}             — some sub-script satisfied (empty ⇒ false)
+    * {:n_of_k, n, ss}       — at least n of ss satisfied
+    * {:invalid_before, s}    — the tx's validity interval starts at/after s (lower ≥ s):
+                                the tx can only be accepted from slot s onward.
+    * {:invalid_hereafter, s} — the tx's validity interval ends at/before s (upper ≤ s).
+
+  IMPORTANT: timelock leaves are checked against the TX's declared validity interval, NOT the
+  block slot directly (the ledger already enforced slot ∈ interval; a timelock says "this script
+  is only unlocked for txs whose interval sits the right side of s"). An unbounded interval on
+  the relevant side ⇒ the timelock CANNOT be satisfied (you can't prove the bound).
+  """
+  use ExUnit.Case, async: true
+
+  alias Cardamom.Ledger.NativeScript
+
+  defp kh(n), do: <<n::224>>
+  # env: the signer set + the tx's validity interval {lower, upper} (nil = unbounded)
+  defp env(signers, lower \\ nil, upper \\ nil),
+    do: %{signers: MapSet.new(signers), lower: lower, upper: upper}
+
+  test "sig: satisfied iff the key-hash is among the signers" do
+    assert NativeScript.satisfied?({:sig, kh(1)}, env([kh(1)]))
+    refute NativeScript.satisfied?({:sig, kh(1)}, env([kh(2)]))
+  end
+
+  test "all: every sub-script (empty ⇒ true)" do
+    assert NativeScript.satisfied?({:all, [{:sig, kh(1)}, {:sig, kh(2)}]}, env([kh(1), kh(2)]))
+    refute NativeScript.satisfied?({:all, [{:sig, kh(1)}, {:sig, kh(2)}]}, env([kh(1)]))
+    assert NativeScript.satisfied?({:all, []}, env([]))
+  end
+
+  test "any: some sub-script (empty ⇒ false)" do
+    assert NativeScript.satisfied?({:any, [{:sig, kh(1)}, {:sig, kh(2)}]}, env([kh(2)]))
+    refute NativeScript.satisfied?({:any, [{:sig, kh(1)}, {:sig, kh(2)}]}, env([kh(3)]))
+    refute NativeScript.satisfied?({:any, []}, env([]))
+  end
+
+  test "n_of_k: at least n of the sub-scripts" do
+    s = {:n_of_k, 2, [{:sig, kh(1)}, {:sig, kh(2)}, {:sig, kh(3)}]}
+    assert NativeScript.satisfied?(s, env([kh(1), kh(3)]))
+    refute NativeScript.satisfied?(s, env([kh(1)]))
+    assert NativeScript.satisfied?({:n_of_k, 0, []}, env([]))
+  end
+
+  test "invalid_before s: tx lower bound must be ≥ s" do
+    # interval [100, _): satisfies before(100) and before(50), NOT before(150)
+    assert NativeScript.satisfied?({:invalid_before, 100}, env([], 100))
+    assert NativeScript.satisfied?({:invalid_before, 50}, env([], 100))
+    refute NativeScript.satisfied?({:invalid_before, 150}, env([], 100))
+    # unbounded lower ⇒ can't prove ⇒ fail
+    refute NativeScript.satisfied?({:invalid_before, 100}, env([], nil))
+  end
+
+  test "invalid_hereafter s: tx upper bound must be ≤ s" do
+    # interval [_, 200): satisfies hereafter(200) and hereafter(250), NOT hereafter(150)
+    assert NativeScript.satisfied?({:invalid_hereafter, 200}, env([], nil, 200))
+    assert NativeScript.satisfied?({:invalid_hereafter, 250}, env([], nil, 200))
+    refute NativeScript.satisfied?({:invalid_hereafter, 150}, env([], nil, 200))
+    refute NativeScript.satisfied?({:invalid_hereafter, 200}, env([], nil, nil))
+  end
+
+  test "nested: all[ sig, any[sig,sig], before ]" do
+    s = {:all, [{:sig, kh(1)}, {:any, [{:sig, kh(9)}, {:sig, kh(2)}]}, {:invalid_before, 10}]}
+    assert NativeScript.satisfied?(s, env([kh(1), kh(2)], 10))
+    refute NativeScript.satisfied?(s, env([kh(1)], 10)), "any branch unmet"
+    refute NativeScript.satisfied?(s, env([kh(1), kh(2)], 5)), "before(10) unmet at lower=5"
+  end
+
+  test "unknown script shape is never satisfied (fail-closed)" do
+    refute NativeScript.satisfied?({:unknown, [99]}, env([kh(1)]))
+  end
+end

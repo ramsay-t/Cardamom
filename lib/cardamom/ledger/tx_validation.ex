@@ -26,7 +26,7 @@ defmodule Cardamom.Ledger.TxValidation do
   replay → halt, mempool → falsifiable prediction.
   """
 
-  alias Cardamom.Ledger.{Delta, WithdrawalEffects, CertEffects, WitnessCheck, EconomicRules}
+  alias Cardamom.Ledger.{Delta, WithdrawalEffects, CertEffects, WitnessCheck, EconomicRules, CertPreconditions}
   alias Cardamom.Ledger.Conway.Cert
 
   @doc """
@@ -45,14 +45,17 @@ defmodule Cardamom.Ledger.TxValidation do
     {w_ops, w_results} =
       WithdrawalEffects.effects(Map.get(tx, :withdrawals, []), read0, major)
 
-    # Then this tx's certs, each over the running overlay of the ops so far.
+    # Then this tx's certs, each over the running overlay of the ops so far — so a cert that
+    # registers a credential/pool is visible to a later cert in the SAME tx (both the effect and
+    # the PRECONDITION check see it). Preconditions checked BEFORE this cert's own effect applies.
     {ops, cert_results} =
       tx
       |> Map.get(:certs)
       |> Cert.decode_all()
       |> Enum.reduce({w_ops, []}, fn cert, {ops, cres} ->
         read = Delta.read_through(ops, base_read)
-        {ops ++ CertEffects.effects(cert, read, pp), cres}
+        pre = CertPreconditions.check(cert, read)
+        {ops ++ CertEffects.effects(cert, read, pp), cres ++ pre}
       end)
 
     extra = witness_results(tx, ctx) ++ economic_results(tx, ctx)
