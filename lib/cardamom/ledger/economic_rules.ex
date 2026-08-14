@@ -12,8 +12,9 @@ defmodule Cardamom.Ledger.EconomicRules do
       WHOLE tx; we only have the tx BODY size per tx, so we assert the NECESSARY LOWER BOUND
       `fee ≥ a·body_size + b` — a genuine underpayment still trips it and we never over-reject
       (witnesses only make the true minFee larger). SKIPS when `a`/`b` are absent (pp-tracking).
-    * `:min_ada` — every output's coin ≥ `minUTxO(output) = coinsPerUTxOByte · (|output| + 160)`
-      (the Babbage constant-overhead form). SKIPS when `coinsPerUTxOByte` is unknown — Preview
+    * `:min_ada` — every output's coin ≥ `Cardamom.Ledger.MinAda.get_min_coin_tx_out(output, params)`, a
+      SWAPPABLE POLICY (the min-ADA rule shape is expected to change on-chain — see MinAda).
+      SKIPS when the policy returns `:unknown` (its params aren't tracked yet) — Preview
       conway-genesis omits it (it's an ENACTED param, not genesis; honest skip until pp-tracking).
     * `:max_tx_size` — `body_size ≤ maxTxSize`. SKIPS when the cap is absent.
 
@@ -21,8 +22,7 @@ defmodule Cardamom.Ledger.EconomicRules do
   `:coins_per_utxo_byte`, `:max_tx_size`.
   """
 
-  # Babbage min-UTxO per-output byte overhead (constant 160 in the coinsPerUTxOByte formula).
-  @utxo_overhead 160
+  alias Cardamom.Ledger.MinAda
 
   @doc "Run the economic/structural rules for one decoded tx against `ctx`."
   def check(tx, ctx) when is_map(tx) and is_map(ctx) do
@@ -80,27 +80,26 @@ defmodule Cardamom.Ledger.EconomicRules do
 
   # ---- min ada per output ----
 
+  # min-ADA is a SWAPPABLE POLICY (`Cardamom.Ledger.MinAda`) — this rule owns the DECISION
+  # (per-output floor → verdict) but NOT the formula. When the policy returns :unknown for any
+  # output (param not tracked yet), we SKIP rather than guess. See MinAda for why the whole
+  # computation is behind a seam (the min-ADA rule shape is expected to change on-chain).
   defp min_ada(tx, ctx) do
-    case {Map.get(ctx, :coins_per_utxo_byte), Map.get(tx, :outputs)} do
-      {cpb, outputs} when is_integer(cpb) and is_list(outputs) ->
-        under =
-          Enum.filter(outputs, fn o ->
-            coin = o[:value] || 0
-            size = output_size(o)
-            is_integer(coin) and coin < cpb * (size + @utxo_overhead)
-          end)
+    case Map.get(tx, :outputs) do
+      outputs when is_list(outputs) ->
+        checks = Enum.map(outputs, fn o -> {o[:value] || 0, MinAda.get_min_coin_tx_out(o, ctx)} end)
 
-        if under == [],
-          do: {:min_ada, :pass},
-          else: {:min_ada, {:violation, %{under_min: length(under)}}}
+        if Enum.any?(checks, fn {_coin, req} -> req == :unknown end) do
+          {:min_ada, {:skip, :min_ada_unknown}}
+        else
+          under = Enum.count(checks, fn {coin, req} -> is_integer(coin) and coin < req end)
+          if under == 0, do: {:min_ada, :pass}, else: {:min_ada, {:violation, %{under_min: under}}}
+        end
 
       _ ->
-        {:min_ada, {:skip, :coins_per_utxo_byte_unknown}}
+        {:min_ada, {:skip, :no_outputs}}
     end
   end
-
-  defp output_size(%{raw: raw}) when is_binary(raw), do: byte_size(raw)
-  defp output_size(_), do: 0
 
   # ---- max tx size ----
 

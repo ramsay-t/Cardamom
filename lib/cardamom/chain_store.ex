@@ -1329,7 +1329,13 @@ defmodule Cardamom.ChainStore do
       min_fee_a: 44,
       min_fee_b: 155_381,
       max_tx_size: 16_384,
-      coins_per_utxo_byte: nil
+      # min-ADA is a swappable POLICY (Cardamom.Ledger.MinAda); coins_per_utxo_byte is an enacted
+      # param we don't track yet (nil ⇒ the rule SKIPS), and constant_overhead is the ledger's
+      # babbageMinUTxOValue `constantOverhead` (160 = 20 words·8 bytes, a fixed memory-cost term).
+      # BOTH here (not hardcoded in the rule) so a value OR the policy can change via config when
+      # the network's min-ADA system changes (Ramsay flagged this incoming).
+      coins_per_utxo_byte: nil,
+      constant_overhead: 160
     })
   end
 
