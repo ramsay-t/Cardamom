@@ -1317,26 +1317,32 @@ defmodule Cardamom.ChainStore do
   end
 
   @doc """
-  Protocol PARAMS for phase-1 economic rules. Preview SHELLEY-GENESIS values (minFeeA/B,
-  maxTxSize) — app-env overridable. `coins_per_utxo_byte` is DELIBERATELY absent (nil): it's an
-  ENACTED param (set at the Babbage HF, not in genesis), and until we track enactment the min-ADA
-  rule must SKIP rather than assert against a guess ([[reference_cardano_version_axes]] / the
-  pp-tracking TODO). A protocol-param-update gov action could also change minFeeA/B on-chain;
-  same caveat — genesis-valued until enacted-param tracking, conformance oracles are the alarm.
+  GENESIS protocol-param defaults (Preview shelley-genesis; app-env overridable). The LIVE params
+  are these overlaid with any ENACTED values — see `protocol_params/0`. `coins_per_utxo_byte` is
+  nil here (an enacted param, not in genesis: the min-ADA rule SKIPS until enactment supplies it);
+  `constant_overhead` is the ledger's babbageMinUTxOValue `constantOverhead` (160 = 20 words·8
+  bytes). Both live here (not hardcoded in the rule) so a value or policy can change via config /
+  enactment when the network's min-ADA system changes.
   """
-  def protocol_params do
+  def protocol_param_defaults do
     Application.get_env(:cardamom, :protocol_params, %{
       min_fee_a: 44,
       min_fee_b: 155_381,
       max_tx_size: 16_384,
-      # min-ADA is a swappable POLICY (Cardamom.Ledger.MinAda); coins_per_utxo_byte is an enacted
-      # param we don't track yet (nil ⇒ the rule SKIPS), and constant_overhead is the ledger's
-      # babbageMinUTxOValue `constantOverhead` (160 = 20 words·8 bytes, a fixed memory-cost term).
-      # BOTH here (not hardcoded in the rule) so a value OR the policy can change via config when
-      # the network's min-ADA system changes (Ramsay flagged this incoming).
       coins_per_utxo_byte: nil,
       constant_overhead: 160
     })
+  end
+
+  @doc """
+  LIVE protocol params for the phase-1 economic rules: genesis defaults overlaid with ENACTED
+  param-changes from the `:pparams` ledger domain (`Cardamom.Ledger.ParamUpdate.current_params`).
+  A param a network has enacted a change to reads its enacted value; otherwise the genesis
+  default. So once a from-genesis replay applies enacted param-changes, min_fee/min_ada assert
+  against the values actually in force rather than skipping.
+  """
+  def protocol_params do
+    Cardamom.Ledger.ParamUpdate.current_params(protocol_param_defaults(), &ledger_read/2)
   end
 
   # Our-own-data serialisation (never wire-sourced; [:safe] guards corrupt rows). See design memory.
