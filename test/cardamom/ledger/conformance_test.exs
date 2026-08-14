@@ -112,9 +112,19 @@ defmodule Cardamom.Ledger.ConformanceTest do
     assert {:skip, {:unknown_cert, 99}} = Conformance.check_value_conservation(t)
   end
 
-  test ":skip a tx carrying governance proposals (govActionDeposit not decoded yet)" do
-    t = tx(%{inputs: [], outputs: [], proposals: [[:some, :proposal]]})
-    assert {:skip, :has_gov_proposals} = Conformance.check_value_conservation(t)
+  test "govActionDeposit is now COUNTED (proposal txs balance, not skip)" do
+    # one info_action proposal with a 50M deposit (a `produced` term), sourced by a 50M input
+    a = <<7::256>>
+    seed_txo(a, 0, 50_000_000)
+    reward_acct = %CBOR.Tag{tag: :bytes, value: <<0xE0, 1::224>>}
+    prop = [50_000_000, reward_acct, [6], nil]
+
+    balanced = tx(%{inputs: [{a, 0}], outputs: [], fee: 0, proposals: [prop]})
+    assert Conformance.check_value_conservation(balanced) == :ok
+
+    # and a MIS-stated deposit now DIVERGES instead of silently skipping
+    unbalanced = tx(%{inputs: [{a, 0}], outputs: [], fee: 0, proposals: [[49_000_000, reward_acct, [6], nil]]})
+    assert {:diverge, %{diff: 1_000_000}} = Conformance.check_value_conservation(unbalanced)
   end
 
   test ":skip multiasset (ADA-only equation can't balance assets)" do

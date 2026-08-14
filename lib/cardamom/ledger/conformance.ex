@@ -27,7 +27,8 @@ defmodule Cardamom.Ledger.Conformance do
   HONESTY / STAGED — the remaining skips, each an equation term we can't yet compute:
     * pool_registration cert — the deposit is charged ONLY if the pool is new (state- and
       same-block-order-dependent; not derivable from the cert alone),
-    * governance proposals (body key 20) — each carries a govActionDeposit (gov tracking TODO),
+    * (governance proposals (body key 20) are now BALANCED — their govActionDeposit is summed by
+      Cardamom.Ledger.Conway.Governance.total_deposit and added to depositsMade),
     * unknown/undecodable cert types,
     * multi-asset outputs (the ADA-coin equation can't balance assets),
     * an unresolved input (its block not processed yet).
@@ -36,7 +37,7 @@ defmodule Cardamom.Ledger.Conformance do
 
   require Logger
   alias Cardamom.ChainStore
-  alias Cardamom.Ledger.Conway.Cert
+  alias Cardamom.Ledger.Conway.{Cert, Governance}
 
   @doc """
   Check value conservation for one decoded tx. Returns:
@@ -52,17 +53,20 @@ defmodule Cardamom.Ledger.Conformance do
 
   def check_value_conservation(%{valid: true} = tx) do
     cond do
-      has_proposals?(tx) ->
-        # each proposal carries a govActionDeposit (produced term) — gov decoding TODO.
-        {:skip, :has_gov_proposals}
-
       multiasset_present?(tx) ->
         {:skip, :multiasset_not_balanced}
 
       true ->
         case cert_deposit_terms(Cert.decode_all(Map.get(tx, :certs)), ChainStore.protocol_deposits()) do
-          {:ok, made, refunds} -> balance(tx, made, refunds)
-          {:skip, reason} -> {:skip, reason}
+          # govActionDeposit (Σ over the tx's proposals) is a `produced` deposit, folded in with
+          # the cert deposits — gov decoding (Cardamom.Ledger.Conway.Governance) lets us balance
+          # proposal-bearing txs that were previously skipped.
+          {:ok, made, refunds} ->
+            gov = Governance.total_deposit(Map.get(tx, :proposals))
+            balance(tx, made + gov, refunds)
+
+          {:skip, reason} ->
+            {:skip, reason}
         end
     end
   end
@@ -168,10 +172,6 @@ defmodule Cardamom.Ledger.Conformance do
       end
     end)
   end
-
-  defp has_proposals?(%{proposals: p}) when is_list(p) and p != [], do: true
-  defp has_proposals?(%{proposals: %CBOR.Tag{tag: 258, value: p}}) when is_list(p) and p != [], do: true
-  defp has_proposals?(_), do: false
 
   # ADA-only if every output's value is a bare integer (coin/1); a multiasset output decodes with
   # a non-nil multiasset map and can't be balanced by the ADA equation alone.
