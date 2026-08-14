@@ -49,4 +49,33 @@ defmodule Cardamom.Ledger.NativeScript do
 
   # Anything else (incl. {:unknown, _}) — fail-closed.
   def satisfied?(_script, _env), do: false
+
+  @doc """
+  The native-script HASH used as its script credential: `blake2b_224(0x00 ‖ CBOR(script))`, where
+  `0x00` is the Shelley native-script language tag (`nativeMultiSigTag = "\\00"`, cardano-ledger
+  Shelley/Scripts.hs). Re-encodes the decoded tuple tree to its CDDL array form.
+
+  CAVEAT (verify against real data): this hashes a RE-ENCODING of the decoded tree, not the
+  original received script bytes. It matches the on-chain script hash only if our re-encode is
+  byte-identical to the wire form — true for canonical CBOR of these small fixed shapes, but
+  CONFIRM on real script-locked inputs (a mismatch means we must carry raw script spans instead).
+  """
+  @spec hash(term()) :: <<_::224>>
+  def hash(script), do: Cardamom.Crypto.blake2b_224(<<0x00, encode(script)::binary>>)
+
+  # Re-encode a decoded native script to its CDDL array (inverse of Witness.native/1).
+  defp encode({:sig, kh}), do: CBOR.encode([0, %CBOR.Tag{tag: :bytes, value: kh}])
+  defp encode({:all, ss}), do: CBOR.encode([1, Enum.map(ss, &decoded_to_term/1)])
+  defp encode({:any, ss}), do: CBOR.encode([2, Enum.map(ss, &decoded_to_term/1)])
+  defp encode({:n_of_k, n, ss}), do: CBOR.encode([3, n, Enum.map(ss, &decoded_to_term/1)])
+  defp encode({:invalid_before, s}), do: CBOR.encode([4, s])
+  defp encode({:invalid_hereafter, s}), do: CBOR.encode([5, s])
+
+  # For nested scripts we need the TERM (not pre-encoded bytes) so the parent encodes as one array.
+  defp decoded_to_term({:sig, kh}), do: [0, %CBOR.Tag{tag: :bytes, value: kh}]
+  defp decoded_to_term({:all, ss}), do: [1, Enum.map(ss, &decoded_to_term/1)]
+  defp decoded_to_term({:any, ss}), do: [2, Enum.map(ss, &decoded_to_term/1)]
+  defp decoded_to_term({:n_of_k, n, ss}), do: [3, n, Enum.map(ss, &decoded_to_term/1)]
+  defp decoded_to_term({:invalid_before, s}), do: [4, s]
+  defp decoded_to_term({:invalid_hereafter, s}), do: [5, s]
 end

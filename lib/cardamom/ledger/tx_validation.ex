@@ -26,7 +26,7 @@ defmodule Cardamom.Ledger.TxValidation do
   replay → halt, mempool → falsifiable prediction.
   """
 
-  alias Cardamom.Ledger.{Delta, WithdrawalEffects, CertEffects, WitnessCheck, EconomicRules, CertPreconditions}
+  alias Cardamom.Ledger.{Delta, WithdrawalEffects, CertEffects, WitnessCheck, EconomicRules, CertPreconditions, NativeScriptCheck}
   alias Cardamom.Ledger.Conway.Cert
 
   @doc """
@@ -81,13 +81,27 @@ defmodule Cardamom.Ledger.TxValidation do
   defp witness_results(tx, ctx) do
     case {Map.get(ctx, :txo_resolver), Map.get(tx, :witnesses)} do
       {resolver, w} when is_function(resolver, 2) and is_map(w) ->
-        {results, _} = WitnessCheck.check(tx, resolver)
-        # WitnessCheck already stamps :txid; return unstamped-shape tuples for the outer stamp.
-        Enum.map(results, fn {rule, outcome, opts} -> {rule, outcome, Keyword.delete(opts, :txid)} end)
+        {vkey_results, _} = WitnessCheck.check(tx, resolver)
+        # Native-script (script half of witnessing): env = the tx's supplied signer key-hashes +
+        # its validity interval; a script-locked input must match a supplied, satisfied script.
+        {ns_results, _} = NativeScriptCheck.check(tx, resolver, native_env(tx))
+
+        (vkey_results ++ ns_results)
+        |> Enum.map(fn {rule, outcome, opts} -> {rule, outcome, Keyword.delete(opts, :txid)} end)
 
       _ ->
         []
     end
+  end
+
+  # The NativeScript environment for this tx: the key-hashes of its supplied vkey witnesses
+  # (blake2b_224 of each vkey) and its declared validity interval.
+  defp native_env(tx) do
+    signers =
+      (Map.get(tx, :witnesses, %{})[:vkey] || [])
+      |> MapSet.new(fn {vk, _sig} -> Cardamom.Crypto.blake2b_224(vk) end)
+
+    %{signers: signers, lower: Map.get(tx, :invalid_before), upper: Map.get(tx, :invalid_hereafter)}
   end
 
   # Every check result carries the tx it came from, for verdict attribution.

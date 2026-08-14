@@ -50,6 +50,7 @@ defmodule Cardamom.Ledger.Verdict do
     cert_stake_deregistration: "Certs.lagda.md (decred ∈ dom rewards) — must be registered",
     cert_delegation_target: "Certs.lagda.md (pool ∈ dom poolParams) — delegation target exists",
     cert_pool_retirement: "Certs.lagda.md (pool ∈ dom poolParams) — retiring pool is registered",
+    native_scripts: "Utxow.lagda.md (∀ script-input, hash-matched native script is satisfied)",
     ledger_delta_build: "delta construction integrity (implementation health, not a spec rule)"
   }
 
