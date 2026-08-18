@@ -26,7 +26,7 @@ defmodule Cardamom.Ledger.TxValidation do
   replay → halt, mempool → falsifiable prediction.
   """
 
-  alias Cardamom.Ledger.{Delta, WithdrawalEffects, CertEffects, WitnessCheck, EconomicRules, CertPreconditions, NativeScriptCheck}
+  alias Cardamom.Ledger.{Delta, WithdrawalEffects, CertEffects, WitnessCheck, EconomicRules, CertPreconditions, NativeScriptCheck, Gov}
   alias Cardamom.Ledger.Conway.Cert
 
   @doc """
@@ -58,8 +58,41 @@ defmodule Cardamom.Ledger.TxValidation do
         {ops ++ CertEffects.effects(cert, read, pp), cres ++ pre}
       end)
 
+    # GOV effects: this tx's proposals insert GovActionStates; its votes accumulate into them —
+    # over the running overlay so a vote can target a proposal made earlier in the SAME tx.
+    gov_ops = gov_ops(tx, ops, base_read, ctx)
+    ops = ops ++ gov_ops
+
     extra = witness_results(tx, ctx) ++ economic_results(tx, ctx)
     {ops, stamp(w_results ++ cert_results ++ extra, txid)}
+  end
+
+  # Gov proposal + vote effects, when the ctx carries the epoch clock. Proposals first (so a
+  # same-tx vote sees them), then votes; both over the running overlay for journal invertibility.
+  # No :epoch (mempool/tests without an epoch) ⇒ no gov ops.
+  defp gov_ops(tx, prior_ops, base_read, ctx) do
+    case Map.get(ctx, :epoch) do
+      epoch when is_integer(epoch) ->
+        txid = Map.get(tx, :txid)
+        lifetime = Map.get(ctx, :gov_action_lifetime, 0)
+
+        prop_ops =
+          Gov.proposal_ops(txid, Map.get(tx, :proposals),
+            epoch: epoch,
+            lifetime: lifetime,
+            read: Delta.read_through(prior_ops, base_read)
+          )
+
+        vote_ops =
+          Gov.vote_ops(Map.get(tx, :votes),
+            read: Delta.read_through(prior_ops ++ prop_ops, base_read)
+          )
+
+        prop_ops ++ vote_ops
+
+      _ ->
+        []
+    end
   end
 
   # Phase-1 ECONOMIC / structural rules (validity interval, min-fee, min-ada, max-size). Run

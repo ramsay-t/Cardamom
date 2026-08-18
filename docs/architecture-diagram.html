@@ -1,0 +1,221 @@
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --ink: #1a1d24;
+    --ink-soft: #565c68;
+    --hair: #e2e5ea;
+    --wire: #1f8f83;
+    --ledger: #6b5fc4;
+    --store: #b07d33;
+    --spine: #7c5cff;
+    --reject: #c9483f;
+    --mono: "Space Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181e; --panel: #1e222b; --ink: #e8eaef; --ink-soft: #99a0ad;
+      --hair: #2c313c; --wire: #3fb6a8; --ledger: #a394ee; --store: #d4a25f;
+      --spine: #9d7cff; --reject: #e0685f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16181e; --panel: #1e222b; --ink: #e8eaef; --ink-soft: #99a0ad;
+    --hair: #2c313c; --wire: #3fb6a8; --ledger: #a394ee; --store: #d4a25f;
+    --spine: #9d7cff; --reject: #e0685f;
+  }
+  :root[data-theme="light"] {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1a1d24; --ink-soft: #565c68;
+    --hair: #e2e5ea; --wire: #1f8f83; --ledger: #6b5fc4; --store: #b07d33;
+    --spine: #7c5cff; --reject: #c9483f;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+
+  header { border-bottom: 1px solid var(--hair); padding-bottom: 1.6rem; margin-bottom: 2.4rem; }
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .22em;
+    text-transform: uppercase; color: var(--spine); margin: 0 0 .6rem;
+  }
+  h1 {
+    font-family: var(--mono); font-weight: 700; font-size: clamp(1.7rem, 4vw, 2.5rem);
+    margin: 0 0 .5rem; letter-spacing: -.01em; text-wrap: balance;
+  }
+  .sub { color: var(--ink-soft); max-width: 60ch; margin: 0; font-size: 1.02rem; }
+
+  h2 {
+    font-family: var(--mono); font-size: 1.15rem; font-weight: 700;
+    margin: 3rem 0 .4rem; display: flex; align-items: baseline; gap: .6rem;
+  }
+  h2 .n {
+    font-size: .72rem; color: var(--spine); letter-spacing: .1em;
+    border: 1px solid var(--spine); border-radius: 4px; padding: .1rem .4rem;
+  }
+  .lede { color: var(--ink-soft); max-width: 66ch; margin: 0 0 1.4rem; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--hair); border-radius: 12px;
+    padding: 1.4rem; overflow-x: auto;
+  }
+  .mermaid { display: flex; justify-content: center; min-width: min-content; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: .5rem 1.4rem; margin: 1.2rem 0 0; padding: 0; list-style: none; }
+  .legend li { display: flex; align-items: center; gap: .5rem; font-family: var(--mono); font-size: .8rem; color: var(--ink-soft); }
+  .swatch { width: 14px; height: 14px; border-radius: 3px; flex: none; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-top: 1.4rem; }
+  .card { background: var(--panel); border: 1px solid var(--hair); border-radius: 10px; padding: 1.1rem 1.2rem; border-left: 3px solid var(--zone, var(--spine)); }
+  .card h3 { font-family: var(--mono); font-size: .92rem; margin: 0 0 .35rem; }
+  .card p { margin: 0; font-size: .9rem; color: var(--ink-soft); }
+  .card .tag { font-family: var(--mono); font-size: .68rem; letter-spacing: .12em; text-transform: uppercase; color: var(--zone, var(--spine)); display: block; margin-bottom: .5rem; }
+
+  code { font-family: var(--mono); font-size: .86em; background: color-mix(in srgb, var(--spine) 12%, transparent); padding: .08em .35em; border-radius: 4px; }
+
+  .flow-note { font-family: var(--mono); font-size: .82rem; color: var(--ink-soft); margin-top: 1rem; padding-left: 1rem; border-left: 2px solid var(--hair); }
+  .flow-note b { color: var(--ink); font-weight: 700; }
+  footer { margin-top: 4rem; padding-top: 1.4rem; border-top: 1px solid var(--hair); font-family: var(--mono); font-size: .76rem; color: var(--ink-soft); }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">Cardamom · BEAM-native Cardano node</p>
+    <h1>Process &amp; component map</h1>
+    <p class="sub">How the OTP supervision tree, the network mini-protocols, and the ledger-validation pipeline fit together — and where a block actually flows from the wire to the store.</p>
+  </header>
+
+  <h2><span class="n">A</span> Supervision tree</h2>
+  <p class="lede">One <code>:one_for_one</code> supervisor owns the long-lived processes. Per-peer sessions and per-block/header handlers are spun up dynamically underneath their own supervisors, so a crash is isolated to one peer or one block.</p>
+  <div class="panel">
+    <pre class="mermaid">
+flowchart TD
+  APP["Cardamom.Supervisor<br/><span>one_for_one</span>"]:::spine
+
+  APP --> STORE["Store.Repo · Cache · Setup<br/>ChainStore"]:::store
+  APP --> BREG["Ledger.BlockRegistry"]:::ledger
+  APP --> BSUP["Ledger.BlockSupervisor<br/><span>DynamicSupervisor</span>"]:::ledger
+  APP --> HREG["Ledger.HeaderRegistry"]:::ledger
+  APP --> HSUP["Ledger.HeaderSupervisor<br/><span>DynamicSupervisor</span>"]:::ledger
+  APP --> OBS["Stats · Peers · Forest.Server"]:::ledger
+  APP --> WEB["Bandit / Web.Router<br/><span>read-only UI</span>"]:::store
+  APP --> CTRL["Control"]:::spine
+  APP --> PSUP["PeerSupervisor<br/><span>DynamicSupervisor</span>"]:::wire
+  APP --> DRIVE["Genesis.Seeder · Reconciler<br/>Connector · BodyFetcher"]:::spine
+
+  PSUP -.spawns.-> SESS["Peer.Session<br/><span>per peer</span>"]:::wire
+  BSUP -.spawns.-> BH["BlockHandler<br/><span>per block</span>"]:::ledger
+  HSUP -.spawns.-> HH["HeaderHandler<br/><span>per header</span>"]:::ledger
+
+  classDef spine fill:none,stroke:#7c5cff,stroke-width:2px,color:#7c5cff;
+  classDef wire fill:none,stroke:#1f8f83,stroke-width:1.5px,color:#1f8f83;
+  classDef ledger fill:none,stroke:#6b5fc4,stroke-width:1.5px,color:#6b5fc4;
+  classDef store fill:none,stroke:#b07d33,stroke-width:1.5px,color:#b07d33;
+    </pre>
+  </div>
+  <ul class="legend">
+    <li><span class="swatch" style="background:var(--spine)"></span> supervision / drivers</li>
+    <li><span class="swatch" style="background:var(--wire)"></span> network · wire</li>
+    <li><span class="swatch" style="background:var(--ledger)"></span> ledger · validation</li>
+    <li><span class="swatch" style="background:var(--store)"></span> storage · UI</li>
+  </ul>
+
+  <h2><span class="n">B</span> One peer session</h2>
+  <p class="lede">The <b>Connector</b> dials the Preview relay and starts a <code>Peer.Session</code>, which owns a <code>Connection</code> (the bearer — it owns the socket and routes SDUs by protocol number) plus one client process per mini-protocol, all muxed over the one TCP connection.</p>
+  <div class="panel">
+    <pre class="mermaid">
+flowchart LR
+  RELAY(["Preview relay<br/><span>TCP · mux SDUs</span>"]):::ext
+  RELAY <==> CONN["Connection<br/><span>bearer · routes by proto#</span>"]:::wire
+
+  CONN --> CS["ChainSync.Client<br/><span>proto 2 · pull headers</span>"]:::wire
+  CONN --> BF["BlockFetch.Client<br/><span>proto 3 · pull bodies</span>"]:::wire
+  CONN --> KA["KeepAlive.Client<br/><span>proto 8</span>"]:::wire
+  CONN --> TS["TxSubmission.Client<br/><span>proto 4 · receive gossip</span>"]:::wire
+  CONN --> PS["PeerSharing.Client<br/><span>proto 10</span>"]:::wire
+
+  CS -.header.-> HSUP["HeaderSupervisor"]:::ledger
+  BF -.body.-> CSTORE["ChainStore"]:::store
+
+  classDef ext fill:none,stroke:#99a0ad,stroke-width:1.5px,color:#99a0ad,stroke-dasharray:4 3;
+  classDef wire fill:none,stroke:#1f8f83,stroke-width:1.5px,color:#1f8f83;
+  classDef ledger fill:none,stroke:#6b5fc4,stroke-width:1.5px,color:#6b5fc4;
+  classDef store fill:none,stroke:#b07d33,stroke-width:1.5px,color:#b07d33;
+    </pre>
+  </div>
+  <p class="flow-note"><b>Read-only by construction.</b> Only consuming protocols run; tx-submission is receive-only. Mainnet magic is refused at the connection layer.</p>
+
+  <h2><span class="n">C</span> The validation pipeline</h2>
+  <p class="lede">This is the heart of "can it validate". A header passes a <b>decode → validate → store</b> gate; a block body passes a <b>build-delta → verdict → commit</b> gate. Every rule returns a result; the verdict decides accept/reject; nothing derived commits on a reject.</p>
+  <div class="panel">
+    <pre class="mermaid">
+flowchart TD
+  subgraph HDR["HEADER GATE · HeaderHandler"]
+    direction TB
+    H1["decode (era-shape dispatch)"]:::ledger --> H2["validate<br/><span>opcert + KES</span>"]:::ledger --> H3{"pass?"}:::gate
+    H3 -->|yes| H4["store → Forest"]:::store
+    H3 -->|no| HX["drop + dock peer"]:::reject
+  end
+
+  subgraph BLK["BLOCK GATE · BlockHandler → TxValidation"]
+    direction TB
+    B1["decode txs + witnesses"]:::ledger --> B2["build ledger delta<br/><span>per tx, running overlay</span>"]:::ledger
+    B2 --> RULES["phase-1 rules per tx"]:::ledger
+    RULES --> B3["Verdict.decision"]:::ledger
+    B3 -->|accept| B4["apply delta · spawn retriers<br/>mark txo_processed"]:::store
+    B3 -->|reject| BX["park unprocessed<br/><span>stop-and-fix</span>"]:::reject
+  end
+
+  H4 -.body fetched.-> B1
+
+  RULES --- R1["witness sig + coverage"]:::rule
+  RULES --- R2["native-script eval"]:::rule
+  RULES --- R3["validity interval · min_fee · size"]:::rule
+  RULES --- R4["cert preconditions + effects"]:::rule
+  RULES --- R5["withdrawals · gov proposals/votes"]:::rule
+  RULES --- R6["value conservation"]:::rule
+
+  classDef ledger fill:none,stroke:#6b5fc4,stroke-width:1.5px,color:#6b5fc4;
+  classDef store fill:none,stroke:#b07d33,stroke-width:1.5px,color:#b07d33;
+  classDef reject fill:none,stroke:#c9483f,stroke-width:1.5px,color:#c9483f;
+  classDef gate fill:none,stroke:#7c5cff,stroke-width:1.5px,color:#7c5cff;
+  classDef rule fill:none,stroke:#6b5fc4,stroke-width:1px,color:#8a80c9,stroke-dasharray:3 2;
+    </pre>
+  </div>
+  <p class="flow-note"><b>One rule set, three policies.</b> The same <code>TxValidation.run</code> runs on block txs (assert / stop-and-fix), on a replay (halt), and — next — on mempool txs (predict). A reject on real chain data means <i>our</i> derivation is wrong.</p>
+
+  <h2><span class="n">D</span> Where state lives</h2>
+  <p class="lede">Chain data and derived ledger state are different stores. The forest holds candidate branches; ChainStore fronts SQLite with a cache; ledger state is a current-value set plus an invertible per-block delta journal, so rollback is a normal operation run backwards.</p>
+  <div class="grid">
+    <div class="card" style="--zone:var(--store)">
+      <span class="tag">chain data · truth</span>
+      <h3>ChainStore → SQLite + Cache</h3>
+      <p>Headers &amp; blocks verbatim (hash fidelity) plus decoded columns. Nebulex cache fronts the durable Ecto/SQLite store.</p>
+    </div>
+    <div class="card" style="--zone:var(--ledger)">
+      <span class="tag">belief · candidates</span>
+      <h3>Forest.Server</h3>
+      <p>Candidate-chain forest keyed by hash, indexed by parent — tolerant of out-of-order arrival, forks and gaps.</p>
+    </div>
+    <div class="card" style="--zone:var(--ledger)">
+      <span class="tag">derived · foldable</span>
+      <h3>Ledger state</h3>
+      <p>UTxO set + non-UTxO accounting (rewards, deposits, pots, <code>:pparams</code>, <code>:gov</code>) as invertible delta ops in a k-bounded journal.</p>
+    </div>
+    <div class="card" style="--zone:var(--store)">
+      <span class="tag">read-only</span>
+      <h3>Web UI · Stats · Peers</h3>
+      <p>Observe node state through clean read-only seams and the telemetry spine; never drive the node.</p>
+    </div>
+  </div>
+
+  <footer>
+    Cardamom · 818 tests · following Preview, validating toward Conway.
+    Diagram reflects the supervision tree in <code>application.ex</code> and the wired pipeline as of this build.
+  </footer>
+</div>

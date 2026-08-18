@@ -1345,6 +1345,16 @@ defmodule Cardamom.ChainStore do
     Cardamom.Ledger.ParamUpdate.current_params(protocol_param_defaults(), &ledger_read/2)
   end
 
+  @doc """
+  govActionLifetime — epochs a governance action stays live before expiring (Conway gov param;
+  Preview conway-genesis = 30). App-env overridable. Used to set a proposal's expiry epoch when
+  Cardamom.Ledger.Gov records it. (An enacted-param change to it would flow through :pparams once
+  we track it; genesis-valued for now, same caveat as the other gov params.)
+  """
+  def gov_action_lifetime do
+    Application.get_env(:cardamom, :gov_action_lifetime, 30)
+  end
+
   # Our-own-data serialisation (never wire-sourced; [:safe] guards corrupt rows). See design memory.
   defp enc(term), do: :erlang.term_to_binary(term)
   defp dec(bin), do: :erlang.binary_to_term(bin, [:safe])

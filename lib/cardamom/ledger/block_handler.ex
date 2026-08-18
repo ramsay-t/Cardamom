@@ -149,7 +149,11 @@ defmodule Cardamom.Ledger.BlockHandler do
         protocol_major: protocol_major(raw),
         pp: ChainStore.protocol_deposits(),
         txo_resolver: &ChainStore.txo/2,
-        slot: slot
+        slot: slot,
+        # gov clock: this block's epoch + govActionLifetime, so proposal effects can set the
+        # expiry epoch. nil slot (test callers) ⇒ no epoch ⇒ TxValidation skips gov ops.
+        epoch: slot && Cardamom.Ledger.Epoch.of(slot),
+        gov_action_lifetime: ChainStore.gov_action_lifetime()
       }
       |> Map.merge(ChainStore.protocol_params())
 

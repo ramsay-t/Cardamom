@@ -167,4 +167,30 @@ defmodule Cardamom.Ledger.BlockGateTest do
 
     assert [{%{passes: 0, skips: 0, violations: 0}, %{decision: :accept}}] = verdicts
   end
+
+  test "a proposal-bearing block records the GovActionState in :gov ledger state" do
+    # a signed tx whose sole content is one info-action proposal (deposit balanced by an input)
+    sk = :crypto.strong_rand_bytes(32)
+    {vk, _} = :crypto.generate_key(:eddsa, :ed25519, sk)
+    kh = Cardamom.Crypto.blake2b_224(vk)
+    reward_addr = %CBOR.Tag{tag: :bytes, value: <<0xE0, kh::binary>>}
+    # input at a key address owned by sk (so witness coverage + sig pass), 40M covers the deposit
+    in_addr = <<0x00, kh::binary, 0::224>>
+    src = <<3::256>>
+    # input 40.2M = deposit 40M (produced) + fee 200k (produced, ≥ minFee) → conservation holds
+    ChainStore.insert_txo(src, 0, %{address: in_addr, value: 40_200_000, datum_hash: nil, datum: nil}, 1)
+
+    proposal = [40_000_000, reward_addr, [6], nil]
+    body = %{0 => [[%CBOR.Tag{tag: :bytes, value: src}, 0]], 2 => 200_000, 20 => [proposal]}
+    block = BlockBuilder.build(slot: 10, bodies: [body], sign_with: [sk])
+
+    assert :ok = ChainStore.process_block(block.raw, 10)
+
+    # the gov action is keyed by {txid, 0}; the tx id is blake2b-256 of the body bytes
+    {:ok, [tx]} = Cardamom.Ledger.Block.txs_in(block.raw)
+    state = ChainStore.ledger_read(:gov, {tx.txid, 0})
+    assert %{action: :info_action, expires_in: expires, votes: %{}} = state
+    # epoch of slot 10 + govActionLifetime (30 default) — just assert it's set & in the future
+    assert expires > Cardamom.Ledger.Epoch.of(10)
+  end
 end
