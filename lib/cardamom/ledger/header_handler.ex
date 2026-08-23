@@ -92,8 +92,9 @@ defmodule Cardamom.Ledger.HeaderHandler do
   # the ordering can actually be asserted. (Ramsay's decision: skip fast if not connected,
   # validate on connection.)
   defp validate(h, raw) do
-    with :ok <- Validation.verify_ocert(h) do
-      Validation.verify_kes(h, raw)
+    with :ok <- Validation.verify_ocert(h),
+         :ok <- Validation.verify_kes(h, raw) do
+      Validation.verify_vrf_output(h)
     end
   end
 

@@ -95,6 +95,48 @@ defmodule Cardamom.Ledger.Praos.Validation do
 
   def verify_kes(_, _), do: {:invalid, :ocert_missing}
 
+  @doc """
+  VRF cert OUTPUT-CONSISTENCY (header-only, needs no epoch nonce / stake): the header's stated
+  64-byte VRF output must be the one its 80-byte proof derives to
+  (`Cardamom.Crypto.VRF.proof_to_output`). A malformed or forged VRF cert — a proof that doesn't
+  produce the claimed output — fails here. Verified against real Preview headers.
+
+  This is the STATELESS half of VRF checking, so it runs at the header gate. It is NOT the full
+  leader-election check: proving the producer was legitimately ELECTED needs the VRF INPUT
+  `blake2b(slot ‖ η)` (the epoch nonce) AND the leader threshold from the pool's stake σ
+  (`certNat < 1−(1−f)^σ`) — both require folded state (η persistence + stake snapshot) that a
+  header alone doesn't carry. That layers on as the leader-election oracle when η+σ are available.
+
+  Praos header carries `vrf_result = [output(64), proof(80)]`. Returns :ok | {:invalid, reason}.
+  """
+  @spec verify_vrf_output(map()) :: :ok | {:invalid, term()}
+  def verify_vrf_output(%{vrf_result: [output, proof]}) do
+    output = unwrap(output)
+    proof = unwrap(proof)
+
+    cond do
+      not (is_binary(output) and byte_size(output) == 64) ->
+        {:invalid, {:vrf_output_size, safe_size(output)}}
+
+      not (is_binary(proof) and byte_size(proof) == 80) ->
+        {:invalid, {:vrf_proof_size, safe_size(proof)}}
+
+      Cardamom.Crypto.VRF.proof_to_output(proof) == {:ok, output} ->
+        :ok
+
+      true ->
+        {:invalid, :vrf_output_mismatch}
+    end
+  end
+
+  # No VRF cert to check (Byron / malformed) — nothing to assert here.
+  def verify_vrf_output(_), do: :ok
+
+  defp unwrap(%CBOR.Tag{tag: :bytes, value: b}), do: b
+  defp unwrap(b), do: b
+  defp safe_size(b) when is_binary(b), do: byte_size(b)
+  defp safe_size(_), do: :not_bytes
+
   defp fetch_bin(map, key) do
     case Map.get(map, key) do
       b when is_binary(b) -> {:ok, b}

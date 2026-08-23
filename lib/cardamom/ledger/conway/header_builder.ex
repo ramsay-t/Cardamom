@@ -64,7 +64,11 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
       prev_hash_field(prev_hash),
       %CBOR.Tag{tag: :bytes, value: cold_pub},
       b(32),
-      [b(64), b(80)],
+      # VRF cert [output(64), proof(80)] — SELF-CONSISTENT (output derives from proof), so a
+      # built header passes Praos.Validation.verify_vrf_output (same "sim ≥ reality" discipline as
+      # the real KES/opcert sigs). NB it's not a real leadership proof (no VRF prover) — it's a
+      # well-formed cert whose output matches its proof, which is exactly what the gate checks.
+      self_consistent_vrf(),
       [b(64), b(80)],
       Keyword.get(opts, :block_body_size, 1024),
       # block_body_hash: an explicit value (a real commitment, for block building) or
@@ -107,6 +111,19 @@ defmodule Cardamom.Ledger.Conway.HeaderBuilder do
   defp prev_hash_field(h) when is_binary(h), do: %CBOR.Tag{tag: :bytes, value: h}
 
   defp b(n), do: %CBOR.Tag{tag: :bytes, value: :crypto.strong_rand_bytes(n)}
+
+  # A [output, proof] VRF cert whose output genuinely derives from its proof. The proof's gamma
+  # (first 32 bytes) must be a valid curve point for proof_to_output to succeed, so we compress a
+  # real scalar multiple of the base point; the remaining c(16)+s(32) are random (this is not a
+  # real VRF proof against η/σ — no prover — just a self-consistent, well-formed cert).
+  defp self_consistent_vrf do
+    alias Cardamom.Crypto.Ed25519
+    k = :rand.uniform(1_000_000) + 1
+    gamma = Ed25519.compress(Ed25519.smul(k, Ed25519.base_point()))
+    proof = gamma <> :crypto.strong_rand_bytes(16 + 32)
+    {:ok, output} = Cardamom.Crypto.VRF.proof_to_output(proof)
+    [%CBOR.Tag{tag: :bytes, value: output}, %CBOR.Tag{tag: :bytes, value: proof}]
+  end
 
   # One shared KES tree for all built headers (64 Ed25519 keygens — generate once, reuse).
   # Throwaway test key; a "pool identity" shared across synthetic headers is fine.
