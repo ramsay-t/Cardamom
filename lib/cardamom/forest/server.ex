@@ -102,7 +102,7 @@ defmodule Cardamom.Forest.Server do
 
   @impl true
   def handle_call({:add, hash, parent}, _from, %{forest: f} = state) do
-    f = Forest.add(f, %{hash: hash, parent_hash: parent})
+    {f, connected} = Forest.add_reporting(f, %{hash: hash, parent_hash: parent})
     tip = Forest.tip(f)
 
     :telemetry.execute([:cardamom, :forest, :header], %{}, %{
@@ -111,6 +111,13 @@ defmodule Cardamom.Forest.Server do
       tip: tip,
       tip_height: Forest.height(f, tip)
     })
+
+    # Signal each header that just became CONNECTED to its parent chain — so the header pipeline
+    # can run the checks deferred while it was floating (Tier-1 continuity). Emitting one event
+    # per connected hash keeps the forest dumb: it announces connection; it does not re-validate.
+    Enum.each(connected, fn h ->
+      :telemetry.execute([:cardamom, :forest, :connected], %{}, %{hash: h})
+    end)
 
     # The forest is the authority on the tip — persist its JUDGED tip as the durable
     # resume anchor (NOT the raw chain-sync stream's latest, which may be a fork the

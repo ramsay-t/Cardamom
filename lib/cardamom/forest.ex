@@ -78,10 +78,23 @@ defmodule Cardamom.Forest do
 
   @doc "Add a header `%{hash, parent_hash}`. Idempotent, out-of-order safe, O(1) amortised."
   @spec add(t(), header()) :: t()
-  def add(%__MODULE__{} = f, %{hash: hash, parent_hash: parent}) do
+  def add(%__MODULE__{} = f, entry) do
+    {f, _connected} = add_reporting(f, entry)
+    f
+  end
+
+  @doc """
+  Like `add/2` but also returns the hashes that BECAME CONNECTED (gained a real height) as a
+  result of this add — the newly-added node if its parent was already connected, plus any
+  previously-floating descendants the add cascaded a height to. `{forest, [hash]}`. Used by
+  `Cardamom.Forest.Server` to signal the header pipeline to run the checks (e.g. Tier-1
+  continuity) that were deferred while the header was floating.
+  """
+  @spec add_reporting(t(), %{hash: hash(), parent_hash: hash() | nil}) :: {t(), [hash()]}
+  def add_reporting(%__MODULE__{} = f, %{hash: hash, parent_hash: parent}) do
     cond do
-      hash == f.root -> f
-      Map.has_key?(f.parents, hash) -> f
+      hash == f.root -> {f, []}
+      Map.has_key?(f.parents, hash) -> {f, []}
       true -> do_add(f, hash, parent)
     end
   end
@@ -99,33 +112,34 @@ defmodule Cardamom.Forest do
         # Store nil. BUT this node might be the block that connects a fragment
         # waiting on IT — so cascade in case children are already waiting.
         f = put_in(f.heights[hash], nil)
-        cascade(f, hash)
+        cascade({f, []}, hash)
 
       ph when is_integer(ph) ->
-        # Parent connected → we get a real height; cascade to any waiting children.
+        # Parent connected → we get a real height; this node connects now, cascade to children.
         f = put_in(f.heights[hash], ph + 1)
         f = bump_best(f, ph + 1, hash)
-        cascade(f, hash)
+        cascade({f, [hash]}, hash)
     end
   end
 
-  # Forward-fill heights for descendants of `node`, but only when `node` itself
-  # has a real height. Walks only the newly-connected fragment, each node once.
-  defp cascade(f, node) do
+  # Forward-fill heights for descendants of `node`, but only when `node` itself has a real
+  # height. Walks only the newly-connected fragment, each node once. Accumulates every hash that
+  # gains a height (the connected set) alongside the forest.
+  defp cascade({f, connected}, node) do
     case Map.get(f.heights, node) do
       nil ->
-        f
+        {f, connected}
 
       h ->
         f.children
         |> Map.get(node, MapSet.new())
-        |> Enum.reduce(f, fn child, acc ->
+        |> Enum.reduce({f, connected}, fn child, {acc, conn} ->
           if Map.get(acc.heights, child) == nil and Map.has_key?(acc.parents, child) do
             acc = put_in(acc.heights[child], h + 1)
             acc = bump_best(acc, h + 1, child)
-            cascade(acc, child)
+            cascade({acc, [child | conn]}, child)
           else
-            acc
+            {acc, conn}
           end
         end)
     end

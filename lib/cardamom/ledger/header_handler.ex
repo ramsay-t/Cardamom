@@ -77,12 +77,20 @@ defmodule Cardamom.Ledger.HeaderHandler do
   end
 
   # ---- VALIDATE: the gate. Returns :ok | {:invalid, reason}. ----
-  # The header-only crypto checks: the operational cert's cold-key signature (the cold key
-  # authorised this hot KES key), then the KES signature over the header body (the hot key,
-  # at the slot's evolution, signed THIS header). Byron headers have no opcert (nil) →
-  # nothing to check here yet (Byron validation is a separate story).
+  # The header checks: operational-cert cold-key signature (the cold key authorised this hot KES
+  # key), the KES signature over the header body (the hot key, at the slot's evolution, signed
+  # THIS header), and Tier-1 CONTINUITY (links to its parent: number+1, slot increasing). Byron
+  # headers have no opcert (nil) → nothing to check here yet (Byron validation is a separate story).
   defp validate(%{operational_cert: nil}, _raw), do: :ok
 
+  # The gate does the STATELESS header-crypto checks only (opcert, KES — they need nothing but the
+  # header itself). Tier-1 CONTINUITY is deliberately NOT here: a header can legitimately arrive
+  # before its parent (out-of-order backfill; synthetic/sim headers with no stored parent), so
+  # checking it at the gate would wrongly drop it. Instead continuity runs WHEN THE FOREST
+  # CONNECTS the header to its parent (Cardamom.Ledger.ContinuityRecheck subscribes to
+  # [:cardamom, :forest, :connected]) — the point at which the parent is guaranteed present and
+  # the ordering can actually be asserted. (Ramsay's decision: skip fast if not connected,
+  # validate on connection.)
   defp validate(h, raw) do
     with :ok <- Validation.verify_ocert(h) do
       Validation.verify_kes(h, raw)

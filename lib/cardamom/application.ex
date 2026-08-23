@@ -42,6 +42,9 @@ defmodule Cardamom.Application do
         Cardamom.Peers,
         # The candidate-chain forest + tip pointer; fed (hash, parent) by Connection.
         Cardamom.Forest.Server,
+        # Re-runs Tier-1 continuity when a floating header connects to its parent (the deferral
+        # from the header gate) — subscribes to [:cardamom, :forest, :connected].
+        Cardamom.Ledger.ContinuityRecheck,
         # Command hub: status + on-demand graceful disconnect (permanent; rediscovers
         # topology on restart). The control surface the `Cardamom` module delegates to.
         # Wire it to the PeerSupervisor so disconnect_all/0 terminates live sessions
