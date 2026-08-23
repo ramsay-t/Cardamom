@@ -82,4 +82,33 @@ defmodule Cardamom.Ledger.GovTest do
     assert Gov.proposal_ops(<<0::256>>, :garbage, epoch: 1, lifetime: 6, read: read(%{})) == []
     assert Gov.vote_ops(:garbage, read: read(%{})) == []
   end
+
+  # MC/DC per clause: the RAW voting_procedure vote encodings (the wire shape [vote, anchor]),
+  # not just the pre-decoded %{vote: v}. vote 0/1/2 = no/yes/abstain; anything else :unknown.
+  test "raw voting_procedure encodings map 0/1/2 → no/yes/abstain, else :unknown" do
+    gaid = {<<1::256>>, 0}
+    st = %{votes: %{}, expires_in: 9, action: :info_action}
+    voter = {:drep, b(<<3::224>>)}
+
+    for {enc, expected} <- [{[0, nil], :no}, {[1, nil], :yes}, {[2, nil], :abstain}, {[9, nil], :unknown}] do
+      votes = %{voter => %{gaid => enc}}
+      assert [{:set, :gov, ^gaid, ^st, updated}] = Gov.vote_ops(votes, read: read(%{gaid => st}))
+      assert updated.votes[voter] == expected
+    end
+  end
+
+  # MC/DC: proposal list arrives as a #6.258 SET tag as well as a bare list.
+  test "proposal_ops accepts a #6.258 set-wrapped proposal list" do
+    txid = <<8::256>>
+    set = %CBOR.Tag{tag: 258, value: [[1, b(<<0xE0, 1::224>>), [6], nil]]}
+    assert [{:set, :gov, {^txid, 0}, nil, _}] =
+             Gov.proposal_ops(txid, set, epoch: 1, lifetime: 6, read: read(%{}))
+  end
+
+  # MC/DC: an unknown gov-action in a proposal is skipped (no state inserted).
+  test "an unknown gov action in a proposal produces no gov op" do
+    txid = <<4::256>>
+    prop = [1, b(<<0xE0, 1::224>>), [99, :junk], nil]
+    assert Gov.proposal_ops(txid, [prop], epoch: 1, lifetime: 6, read: read(%{})) == []
+  end
 end

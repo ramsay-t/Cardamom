@@ -76,4 +76,22 @@ defmodule Cardamom.Ledger.CertPreconditionsTest do
     assert [{:cert_stake_registration, :pass, _}] = results
     assert Enum.all?(results, fn {_r, _o, opts} -> Keyword.get(opts, :txid) == <<5::256>> end)
   end
+
+  # MC/DC per clause: the COMBINED reg+delegation certs also check the pool target.
+  test "combined reg+delegation certs check their delegation target pool" do
+    known = reader(%{pool: %{kh(9) => %{}}})
+    unknown = reader(%{pool: %{}})
+
+    for type <- [:stake_registration_and_delegation, :stake_vote_registration_and_delegation] do
+      cert = %{type: type, credential: cred(1), pool: kh(9)}
+      assert [{:cert_delegation_target, :pass, _}] = P.check(cert, known)
+      assert [{:cert_delegation_target, {:violation, _}, _}] = P.check(cert, unknown)
+    end
+  end
+
+  test "pool_retirement of an unknown pool violates (the violation arm)" do
+    cert = %{type: :pool_retirement, pool: kh(9), epoch: 100}
+    assert [{:cert_pool_retirement, {:violation, %{reason: :pool_not_registered}}, _}] =
+             P.check(cert, reader(%{pool: %{}}))
+  end
 end

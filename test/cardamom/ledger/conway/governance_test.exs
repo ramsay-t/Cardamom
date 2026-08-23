@@ -75,4 +75,27 @@ defmodule Cardamom.Ledger.Conway.GovernanceTest do
     assert Governance.decode_proposal([1, b(<<0xE0, 0::224>>), [99, :junk], nil]).action == :unknown
     assert Governance.decode_proposal(:garbage) == %{deposit: 0, action: :unknown, reward_account: nil}
   end
+
+  # MC/DC per clause: defensive fallthroughs.
+  test "info_action in the bare-int form (= 6, not an array) is recognised" do
+    prop = [1, b(<<0xE0, 0::224>>), 6, nil]
+    assert Governance.decode_proposal(prop).action == :info_action
+  end
+
+  test "total_deposit skips non-integer-deposit entries; unset handles set-tag + junk" do
+    # a malformed proposal (no integer deposit) contributes 0
+    assert Governance.total_deposit([[:no_deposit, :x], [5, :y]]) == 5
+    assert Governance.total_deposit(%CBOR.Tag{tag: 258, value: [[7, :z]]}) == 7
+    assert Governance.total_deposit(:garbage) == 0
+  end
+
+  test "parameter_change with a non-map param_update yields an empty update map" do
+    prop = [1, b(<<0xE0, 0::224>>), [0, nil, :not_a_map, nil], nil]
+    assert Governance.decode_proposal(prop).param_update == %{}
+  end
+
+  test "a reward_account that isn't bytes decodes to nil (unbytes fallthrough)" do
+    prop = [1, :not_bytes, [6], nil]
+    assert Governance.decode_proposal(prop).reward_account == nil
+  end
 end

@@ -77,4 +77,61 @@ defmodule Cardamom.Ledger.NativeScriptTest do
   test "unknown script shape is never satisfied (fail-closed)" do
     refute NativeScript.satisfied?({:unknown, [99]}, env([kh(1)]))
   end
+
+  # ---- hash/1: every encode clause + nested decoded_to_term (MC/DC per clause) ----
+
+  describe "hash/1 covers every script shape (and nesting)" do
+    for {label, script} <- [
+          sig: {:sig, <<1::224>>},
+          all: {:all, [{:sig, <<1::224>>}]},
+          any: {:any, [{:sig, <<2::224>>}]},
+          n_of_k: {:n_of_k, 1, [{:sig, <<3::224>>}]},
+          invalid_before: {:invalid_before, 100},
+          invalid_hereafter: {:invalid_hereafter, 200},
+          # nesting drives the decoded_to_term arms for each shape
+          nested: {:all,
+                   [
+                     {:sig, <<4::224>>},
+                     {:any, [{:n_of_k, 1, [{:sig, <<5::224>>}]}, {:invalid_before, 1}]},
+                     {:invalid_hereafter, 9}
+                   ]}
+        ] do
+      test "#{label} hashes to 28 bytes, deterministically" do
+        h = NativeScript.hash(unquote(Macro.escape(script)))
+        assert byte_size(h) == 28
+        assert h == NativeScript.hash(unquote(Macro.escape(script)))
+      end
+    end
+
+    test "distinct shapes hash distinctly (no accidental collision in the re-encode)" do
+      hashes =
+        [
+          {:sig, <<1::224>>},
+          {:all, [{:sig, <<1::224>>}]},
+          {:any, [{:sig, <<1::224>>}]},
+          {:n_of_k, 1, [{:sig, <<1::224>>}]},
+          {:invalid_before, 1},
+          {:invalid_hereafter, 1}
+        ]
+        |> Enum.map(&NativeScript.hash/1)
+
+      assert length(Enum.uniq(hashes)) == length(hashes)
+    end
+  end
+
+  # ---- satisfied? MC/DC: guard-fail arms fall through to fail-closed ----
+
+  test "MC/DC: n_of_k with a non-integer n / non-list scripts → fail-closed (guard misses)" do
+    refute NativeScript.satisfied?({:n_of_k, :not_int, [{:sig, kh(1)}]}, env([kh(1)]))
+    refute NativeScript.satisfied?({:n_of_k, 1, :not_a_list}, env([kh(1)]))
+  end
+
+  test "MC/DC: sig with a non-binary keyhash → fail-closed" do
+    refute NativeScript.satisfied?({:sig, :not_bytes}, env([kh(1)]))
+  end
+
+  test "MC/DC: all/any with a non-list body → fail-closed (guard misses)" do
+    refute NativeScript.satisfied?({:all, :nope}, env([]))
+    refute NativeScript.satisfied?({:any, :nope}, env([]))
+  end
 end

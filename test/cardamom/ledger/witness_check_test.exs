@@ -112,4 +112,33 @@ defmodule Cardamom.Ledger.WitnessCheckTest do
     {results, _} = WitnessCheck.check(tx, reader(%{}))
     assert Enum.all?(results, fn {_r, _o, opts} -> Keyword.get(opts, :txid) == <<42::256>> end)
   end
+
+  # MC/DC per clause: the remaining needed-set contributors + the no-txid skip.
+  test "required_signers (body key 14) add to the needed set — bare list AND #6.258 set" do
+    {vk, _sk} = keypair()
+    kh = keyhash(vk)
+
+    bare = %{txid: <<7::256>>, inputs: [], required_signers: [%CBOR.Tag{tag: :bytes, value: kh}],
+             witnesses: %{vkey: [], native: [], bootstrap: []}}
+    assert {:witness_coverage, {:violation, d}, _} = result(:witness_coverage, elem(WitnessCheck.check(bare, reader(%{})), 0))
+    assert d.missing == [Base.encode16(kh, case: :lower)]
+
+    setd = put_in(bare.required_signers, %CBOR.Tag{tag: 258, value: [%CBOR.Tag{tag: :bytes, value: kh}]})
+    assert {:witness_coverage, {:violation, _}, _} = result(:witness_coverage, elem(WitnessCheck.check(setd, reader(%{})), 0))
+  end
+
+  test "a tx with no txid → signature check SKIPS (can't verify over a missing message)" do
+    tx = %{inputs: [], witnesses: %{vkey: [], native: [], bootstrap: []}}
+    {results, _} = WitnessCheck.check(tx, reader(%{}))
+    assert {:vkey_signatures, {:skip, :no_txid}, _} = result(:vkey_signatures, results)
+  end
+
+  test "a satisfied required-signer passes coverage" do
+    {vk, sk} = keypair()
+    txid = <<7::256>>
+    tx = %{txid: txid, inputs: [], required_signers: [%CBOR.Tag{tag: :bytes, value: keyhash(vk)}],
+           witnesses: %{vkey: [{vk, sign(txid, sk)}], native: [], bootstrap: []}}
+    {results, _} = WitnessCheck.check(tx, reader(%{}))
+    assert {:witness_coverage, :pass, _} = result(:witness_coverage, results)
+  end
 end

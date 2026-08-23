@@ -82,4 +82,21 @@ defmodule Cardamom.Ledger.Ratify.ThresholdTest do
     r = t(%{action: :treasury_withdrawals}, cc_threshold: nil)
     assert r.cc == @defer
   end
+
+  # MC/DC per clause: the max-over-groups edge cases and the unknown-action fallthrough.
+  test "ChangePParams touching NO known groups → DRep threshold nil (max of empty)" do
+    r = t(%{action: :parameter_change, param_groups: []})
+    assert r.drep == nil and r.spo == nil
+  end
+
+  test "ChangePParams max picks the SMALLER-first then LARGER (gte? both branches)" do
+    # gov (0.75) then economic (0.67): first sets acc, second is not ≥ → acc stays 0.75
+    assert t(%{action: :parameter_change, param_groups: [:gov, :economic]}).drep == {75, 100}
+    # economic (0.67) then gov (0.75): second IS ≥ → replaces → 0.75
+    assert t(%{action: :parameter_change, param_groups: [:economic, :gov]}).drep == {75, 100}
+  end
+
+  test "an unknown gov action defers every body (fail-closed)" do
+    assert t(%{action: :some_future_action}) == %{cc: @defer, drep: @defer, spo: @defer}
+  end
 end

@@ -84,6 +84,34 @@ defmodule Cardamom.Ledger.Conway.WitnessTest do
     assert w.native == [{:unknown, [99, :junk]}]
   end
 
+  # MC/DC per clause: the defensive drop/fallthrough arms.
+  test "vkey witness with wrong-sized vkey or sig is dropped (not kept malformed)" do
+    assert Witness.decode(%{0 => [[bytes(<<1::128>>), bytes(<<2::512>>)]]}).vkey == []
+    assert Witness.decode(%{0 => [[bytes(<<1::256>>), bytes(<<2::256>>)]]}).vkey == []
+  end
+
+  test "a bootstrap witness with the wrong arity is dropped" do
+    assert Witness.decode(%{2 => [[bytes(<<1::256>>)]]}).bootstrap == []
+  end
+
+  test "a non-list / non-set value under a key decodes to empty (items fallthrough)" do
+    assert Witness.decode(%{0 => :not_a_list, 1 => 42}) |> Map.take([:vkey, :native]) ==
+             %{vkey: [], native: []}
+  end
+
+  test "native n_of_k with a non-integer n falls to {:unknown, _} (guard miss)" do
+    assert Witness.decode(%{1 => [[3, :not_int, []]]}).native == [{:unknown, [3, :not_int, []]}]
+  end
+
+  test "decode_block_witnesses on non-block bytes returns {:error, _}, never raises" do
+    assert {:error, _} = Witness.decode_block_witnesses(<<0xFF, 1, 2, 3>>)
+  end
+
+  test "a vkey witness with a non-bytes-tag value still decodes (unbytes fallthrough), then drops on size" do
+    # raw binary (not %CBOR.Tag{:bytes}) — unbytes passes it through; 32/64 sizes still enforced
+    assert Witness.decode(%{0 => [[<<1::256>>, <<2::512>>]]}).vkey == [{<<1::256>>, <<2::512>>}]
+  end
+
   test "REAL fixture: the witness set of a real Preview tx-bearing block decodes" do
     raw =
       "test/fixtures/preview_block_with_tx.hex"
