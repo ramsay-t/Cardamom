@@ -62,6 +62,8 @@ outward from conformance checking rather than being bolted on at the end.
 
 ## Documentation
 
+- [`docs/PROGRESS.md`](docs/PROGRESS.md) — **where things stand**: done / built /
+  open / awaiting decision, known defects, and a per-session log.
 - [`docs/architecture.md`](docs/architecture.md) — the forest+pointer model,
   storage design, concurrency model, and the observer→relay→producer
   progression (design rationale, with status notes where reality has moved).

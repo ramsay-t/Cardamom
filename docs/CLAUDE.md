@@ -4,7 +4,9 @@ Public working guidance for anyone (human or AI) contributing to Cardamom. For
 the architecture rationale see `architecture.md`; for the specification
 landscape see `network-specs.md`; for the byte-level wire guide see `WIRE.md`;
 for working notes and findings see `wire-protocol.md`; for security invariants
-see `security.md`; for testing methodology see `../test/TEST_STRATEGY.md`.
+see `security.md`; for testing methodology see `../test/TEST_STRATEGY.md`;
+for current status and open work see `PROGRESS.md` (update it at the end of
+every session — it is the committed record; the private notes are not).
 
 ## What Cardamom is
 
