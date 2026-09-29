@@ -5,18 +5,44 @@ specification is a deliberate aim of this project. Building Cardamom against a r
 relay is partly a way to *generate findings* for the network spec. So: record where
 the spec speaks clearly, where it's silent, and every byte-level ambiguity we hit.
 
-> **Model update (2026-07-23):** the CSPm/FDR model referenced throughout this
-> document has a successor — the same mini-protocols re-formalised in Agda
-> (ITree-CSP) with machine-checked proofs, in
-> `input-output-hk/agda-cardano-common` branch `kangfeng/itree-csp`
-> (`src/ITree-CSP/CSP/Examples/Cardano_network/`). Notable deltas: the mux
-> contract (`Network ≈FD CopySpec`) is now a *proved theorem*; the
-> FindIntersect single-point/list divergence flagged below is *fixed*
-> (`List Point`); the peers are explicitly API-driven, making the
-> driver-factoring house rules below the model's own architecture; and the
-> Leios protocols are included. CSPm line numbers below are retained as the
-> historical citations our FSM transcription used; new work should cite the
-> Agda modules (`ChainSync.agda` etc.). See `network-specs.md` §2.1.
+> **Status.** These are the *working notes* kept while building the network
+> stack (2026-05 to 2026-07), preserved as the record of what was read, in
+> what order, and what was found. The distilled, link-verified versions are
+> [`network-specs.md`](network-specs.md) (the spec landscape, with pinned
+> URLs to every artifact) and [`WIRE.md`](WIRE.md) (the wire byte by byte,
+> fixture-backed). Read those first; come here for the reasoning.
+>
+> **Model update (2026-07-23, links added 2026-09-29):** the CSPm/FDR model
+> referenced throughout this document has a successor — the same
+> mini-protocols re-formalised in Agda (ITree-CSP) with machine-checked
+> proofs, in [`input-output-hk/agda-cardano-common`, branch
+> `kangfeng/itree-csp`](https://github.com/input-output-hk/agda-cardano-common/tree/kangfeng/itree-csp/src/ITree-CSP/CSP/Examples/Cardano_network)
+> (start with its
+> [`README.md`](https://github.com/input-output-hk/agda-cardano-common/blob/kangfeng/itree-csp/src/ITree-CSP/CSP/Examples/Cardano_network/README.md)).
+> Notable deltas: the mux contract (`Network ≈FD CopySpec`) is now a *proved
+> theorem*; the FindIntersect single-point/list divergence flagged below is
+> *fixed* ([`Data.agda` L91](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/Data.agda#L91), `List Point`); the
+> peers are explicitly API-driven, making the driver-factoring house rules
+> below the model's own architecture; and the Leios protocols are included.
+>
+> **Re-pinning the chain-sync citations.** The CSPm file
+> (`mini_protocols_KA_BF_CS_Tx_20260514.csp`) is no longer available, so the
+> CSPm line numbers below cannot be checked. The same states in the Agda
+> model, at the commit we read (ee1f4a2, 2026-07-06):
+>
+> | CSPm citation below | Agda ([`ChainSync.agda`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/ChainSync.agda)) |
+> |---|---|
+> | message set (~460–468) | [`Data.agda`, `MessageChainSync`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/Data.agda#L91) |
+> | `StIdle` (491–509) | [`clientStep c stIdle`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/ChainSync.agda#L176) |
+> | `StCanAwait` (512–528) | [`clientStep c stCanAwait`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/ChainSync.agda#L199) |
+> | `StMustReply` (531–542) | [`clientStep c stMustReply`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/ChainSync.agda#L216) |
+> | `StIntersect` (545–554) | [`clientStep c stIntersect`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/ChainSync.agda#L230) |
+> | state set | [`CSState`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/ChainSync.agda#L135-L140) |
+> | mux contract `CopySpec [FD= Network` (~88–90) | [`Network.agda`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/Network.agda) + the `Network*Thm.agda` proofs |
+>
+> The branch has since moved (connections indexed by `(Link, Dir)`; proofs
+> under `NetworkVerification/`); new work should cite the current tip. See
+> [`network-specs.md` §2.1](network-specs.md#21-the-formal-behavioural-model--agda-itree-csp).
 
 ## Epistemics: the CSP is a HYPOTHESIS, not ground truth
 
@@ -97,8 +123,8 @@ conformance test. Cite this real split.
 
 ## Conway CDDL (on-chain encoding) — milestone 1 header structure
 
-`cardano-ledger/eras/conway/impl/cddl/data/conway.cddl`
-(read at cd8b7fa, 2026-06-03). The on-chain / consensus-critical
+[`cardano-ledger/eras/conway/impl/cddl/data/conway.cddl`](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/conway/impl/cddl/data/conway.cddl)
+(read at cd8b7fa, 2026-06-03; link pinned to the 2026-09-29 master). The on-chain / consensus-critical
 encoding — STRICT-ENFORCE side of the CDDL directive.
 
 M1-relevant grammar (the strict targets):
@@ -267,7 +293,7 @@ them is the open work (and a likely source of spec findings):
   protocols on one socket) is in prose (~142) but unmodelled — a real behavioural
   question (inter-protocol fairness) pinned down nowhere.
 
-## Mux design notes — read from `network-mux/src/Network/Mux.hs`
+## Mux design notes — read from [`network-mux/src/Network/Mux.hs`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/network-mux/src/Network/Mux.hs)
 
 How the multiplexer shares one TCP bearer across mini-protocols (verified against
 source):
@@ -304,9 +330,9 @@ relay requires.
 
 ## SDU header — byte-level spec (read from source)
 
-Authoritative source: `network-mux/src/Network/Mux/Codec.hs` (`encodeSDU` /
-`decodeSDU`) + `Types.hs`. CORRECTION (2026-07-23): a prose spec DOES exist —
-`ouroboros-network/docs/network-spec/mux.tex` §Wire Format documents this
+Authoritative source: [`network-mux/src/Network/Mux/Codec.hs`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/network-mux/src/Network/Mux/Codec.hs) (`encodeSDU` /
+`decodeSDU`) + [`Types.hs`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/network-mux/src/Network/Mux/Types.hs). CORRECTION (2026-07-23): a prose spec DOES exist —
+[`ouroboros-network/docs/network-spec/mux.tex` §Wire Format](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/docs/network-spec/mux.tex#L60) documents this
 header correctly (including mode bit 0 = initiator, agreeing with the code and
 contradicting only the Codec.hs source comment). We built this section from
 source before discovering it — itself a FINDABILITY finding: nothing led a
@@ -342,7 +368,7 @@ spec-landscape map written to close that gap).
 Decode reverses; `mhNum = a .&. 0x7fff`, dir from `a .&. 0x8000`.
 
 ### FINDING — direction bit: CODE CONTRADICTS ITS OWN COMMENT
-`Codec.hs` prose comment (lines 29-32) says: "d: 1 = initiator, 0 = responder."
+[`Codec.hs` prose comment](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/network-mux/src/Network/Mux/Codec.hs#L32-L33) (lines 29–32 when read; 32–33 at the 2026-09-15 main) says: "d: 1 = initiator, 0 = responder."
 The CODE says the OPPOSITE: `putNumAndMode n InitiatorDir = n` (bit=0);
 `ResponderDir = n .|. 0x8000` (bit=1); and `getDir`: `0x8000==0 -> InitiatorDir`.
 **CODE IS TRUTH (per epistemics): bit 0 = initiator, bit 1 = responder.** The
@@ -352,7 +378,8 @@ this project surfaces. As the INITIATOR (we dial out), we send dir bit = 0.
 
 ## Transport CDDL + sources (ouroboros-network)
 
-`ouroboros-network` (read at d842a23, 2026-05-22). Fills what the
+[`ouroboros-network`](https://github.com/IntersectMBO/ouroboros-network) (read at d842a23, 2026-05-22; the CDDLs live under
+[`cardano-diffusion/protocols/cddl/specs/`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs)). Fills what the
 CSP abstracts and the ledger CDDL lacks:
 
 - **chain-sync wire encoding** — `.../cddl/specs/chain-sync.cddl`. Maps 1:1 to
@@ -374,13 +401,14 @@ CSP abstracts and the ledger CDDL lacks:
 - **de-facto-truth Haskell** — handshake/protocol `Codec.hs`/`Type.hs`/
   `Version.hs` for triangulation when CSP/CDDL/reality disagree.
 - Versioning is real & on-wire: v14 current, v11–13 obsolete/. Target v14; check
-  what Preview actually negotiates.
+  what Preview actually negotiates. *(Later: we propose v14 only and Preview
+  accepts it; v16 appends `perasSupport` to the version data — see `WIRE.md` §3.)*
 
 ## What the real node ENFORCES → what closes/blacklists a peer (read from source 2026-06-15)
 
 SimPeer must enforce these so "sim-green" means "Preview-ready" — a fake more
 lenient than reality gives false confidence. Read from
-`ouroboros-network/protocols/lib/.../{ChainSync,KeepAlive}/Codec.hs`. Three
+[`ouroboros-network/protocols/lib/.../{ChainSync,KeepAlive}/Codec.hs`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/ouroboros-network/protocols/lib/Ouroboros/Network/Protocol). Three
 enforcement axes; violating any → the connection is killed:
 
 1. **Agency / state-respecting decode.** Decoders pattern-match on
@@ -415,7 +443,9 @@ sim means we won't get dropped by Preview for a protocol-correctness reason.
 
 `networkMagic = 2` for Preview testnet (mainnet 764824073, preprod 1). Goes in
 the handshake `nodeToNodeVersionData = [networkMagic, ...]` as a word32. WRONG
-VALUE = instant handshake rejection. Source: cardano docs / `--testnet-magic 2`.
+VALUE = instant handshake rejection. Source: Preview's
+[`shelley-genesis.json`](https://book.world.dev.cardano.org/environments/preview/shelley-genesis.json)
+(`networkMagic`) / `--testnet-magic 2`.
 
 ## Barest-minimum protocol set to stay connected to a Preview relay
 

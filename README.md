@@ -67,7 +67,8 @@ outward from conformance checking rather than being bolted on at the end.
   progression (design rationale, with status notes where reality has moved).
 - [`docs/network-specs.md`](docs/network-specs.md) — **the spec landscape**:
   every specification artifact needed to implement a Cardano network layer,
-  what each covers, and where the gaps are.
+  what each covers, and where the gaps are — with a pinned link to each one.
+  Start here if you are implementing a Cardano client in any language.
 - [`docs/WIRE.md`](docs/WIRE.md) — **the wire, byte by byte**: an observer's
   guide to the node-to-node protocols, era envelopes, header/block/tx
   encodings, and the gotchas — every claim pinned to a captured fixture and a

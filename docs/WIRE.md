@@ -3,10 +3,11 @@
 *What actually travels over a Cardano N2N connection, byte by byte — written
 from a from-scratch client implementation (Cardamom) built against the Preview
 testnet, with every claim pinned by a real captured fixture and a passing test
-where one exists. Last revised 2026-07-23.*
+where one exists. Last revised 2026-09-29 (upstream links pinned to the
+commits listed in [`network-specs.md` §0](network-specs.md#0-the-repositories-in-one-place)).*
 
-**What this is.** The official CDDL grammars (see `network-specs.md` for the
-full spec landscape) define the message encodings; this guide covers what they
+**What this is.** The official CDDL grammars (see [`network-specs.md`](network-specs.md) for the
+full spec landscape, with links to every upstream artifact) define the message encodings; this guide covers what they
 *don't*: the transport framing, the envelope layers around headers and blocks,
 the era-tag numbering, the behavioural expectations that get a peer
 disconnected, and the gotchas that cost us real debugging time. Read it as a
@@ -17,7 +18,7 @@ validators — "our decoder accepts it" does not mean "it is valid Cardano data"
 (two of our own bugs decoded wrong data without noticing). Where validity
 matters, the CDDL + ledger rules are the authority.
 
-**Conformance vectors.** Fixtures live in `test/fixtures/` (hex dumps of real
+**Conformance vectors.** Fixtures live in [`test/fixtures/`](../test/fixtures/) (hex dumps of real
 Preview traffic and real Preview blocks); the tests that pin each
 interpretation are cited per section. If you are building your own client,
 these fixtures are directly reusable test inputs.
@@ -36,13 +37,13 @@ bytes 6-7  payload length     u16
 then       exactly `length` payload bytes
 ```
 
-*Spec:* `network-spec/mux.tex` §Wire Format; *reference:* `Network.Mux.Codec`.
-*Our codec:* `lib/cardamom/mux/sdu.ex`. **Beware:** the comment inside
-`Codec.hs` states the mode bit backwards; the spec and the code's behaviour
+*Spec:* [`network-spec/mux.tex` §Wire Format](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/docs/network-spec/mux.tex#L60); *reference:* [`Network.Mux.Codec`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/network-mux/src/Network/Mux/Codec.hs).
+*Our codec:* [`lib/cardamom/mux/sdu.ex`](../lib/cardamom/mux/sdu.ex). **Beware:** the comment inside
+[`Codec.hs`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/network-mux/src/Network/Mux/Codec.hs#L32-L33) states the mode bit backwards; the spec and the code's behaviour
 agree on 0 = initiator. As a dialing client you always send M = 0.
 
 The standard socket bearer caps SDU payloads at **12,288 bytes**
-(`Bearer.hs`), well under the u16 maximum.
+([`Bearer.hs` L86](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/network-mux/src/Network/Mux/Bearer.hs#L86)), well under the u16 maximum.
 
 **Reassembly is not optional.** Two things happen routinely:
 
@@ -55,7 +56,7 @@ So the receive loop must: concatenate carried-over tail + new payload, decode
 therefore needs three-way results: `{:ok, msg, rest}` / `:incomplete` /
 `{:error, …}` — a short read is *not* an error. (Missing this cost us a
 "relay stalls at block ~500" bug that was really our own dropped fragments.)
-*Our implementation:* `lib/cardamom/mux/reassembler.ex`, shared by all
+*Our implementation:* [`lib/cardamom/mux/reassembler.ex`](../lib/cardamom/mux/reassembler.ex), shared by all
 protocols so the logic cannot drift.
 
 ## 2. Mini-protocol numbers and conduct
@@ -70,8 +71,9 @@ protocols so the logic cannot drift.
 | 10 | peer-sharing | client asks |
 
 (Wire numbers appear in the SDU header. They are *not* in the formal model,
-which names protocols; they are in `network-spec/miniprotocols.tex` and the
-CDDLs.)
+which names protocols; they are in [`network-spec/miniprotocols.tex`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/docs/network-spec/miniprotocols.tex),
+[`mux.tex` §protocol numbers](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/docs/network-spec/mux.tex#L147) and the
+[CDDLs](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs).)
 
 The real node enforces, per state, and **closes the connection** on violation:
 1. **agency** — a message sent in a state where you lack agency, with wrong
@@ -93,23 +95,28 @@ Every message below is a CBOR array with a leading integer tag.
 [3, versionTable]              query reply
 ```
 
-v14 `versionData = [networkMagic:u32, initiatorOnlyDiffusionMode:bool,
-peerSharing:0|1, query:bool]`. Preview's `networkMagic = 2` (from its shelley
+v14–v15 `versionData = [networkMagic:u32, initiatorOnlyDiffusionMode:bool,
+peerSharing:0|1, query:bool]`
+([`node-to-node-version-data-v14.cddl`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/node-to-node-version-data-v14.cddl)).
+From v16 a fifth field `perasSupport:bool` is appended
+([`…-v16.cddl`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/node-to-node-version-data-v16.cddl); the handshake grammar
+[dispatches on version range](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/handshake-node-to-node-v14.cddl#L11-L18)).
+Cardamom proposes v14 only and Preview relays accept it. Preview's `networkMagic = 2` (from its shelley
 genesis; wrong value = instant refuse). `initiatorOnlyDiffusionMode = true`
 declares "I dial, I don't serve" — the observer role is first-class in the
 handshake.
 
 Gotchas:
 * The CDDL notes the codec **only accepts definite-length maps** for the
-  version table. (The hex `cbor` library emits definite-length by default —
+  version table ([`handshake-node-to-node-v14.cddl` L16](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/handshake-node-to-node-v14.cddl#L16)). (The hex `cbor` library emits definite-length by default —
   verify yours does.)
 * A `refuse` with reason `versionMismatch` carries a **list of version
   numbers** — a list of small ints, which naive CBOR decoding in some
   libraries (ours included) hands back as a *charlist/string* (`[14]` ≡
   `~c"\\x0e"`). Normalise at the codec boundary.
 
-*Our codec + tests:* `lib/cardamom/protocol/handshake/codec.ex`,
-`test/cardamom/protocol/handshake/`.
+*Our codec + tests:* [`lib/cardamom/protocol/handshake/codec.ex`](../lib/cardamom/protocol/handshake/codec.ex),
+[`test/cardamom/protocol/handshake/`](../test/cardamom/protocol/handshake/).
 
 ## 4. Chain-sync (protocol 2)
 
@@ -125,7 +132,9 @@ Gotchas:
 ```
 
 FSM: `StIdle → StCanAwait → (AwaitReply) → StMustReply`, plus `StIntersect` —
-see the Agda model (`ChainSync.agda`) or `miniprotocols.tex`.
+see the Agda model ([`ChainSync.agda`, `clientStep`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/ChainSync.agda#L175-L245)) or
+[`miniprotocols.tex`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/docs/network-spec/miniprotocols.tex). Encoding:
+[`chain-sync.cddl`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/chain-sync.cddl).
 
 **Points.** A point is `[slot, hash]` or `[]` (origin). The hash MUST be a
 CBOR **byte** string (`#bytes(h)`). Encoding it as a raw binary produces a
@@ -144,11 +153,11 @@ with text-string hashes).
 Strip the envelope, keep the **exact** inner bytes: the header hash is
 blake2b-256 of those received bytes, and hashing any re-encoding will not
 match the chain. *Fixture:* `preview_rollforward.hex` (a real RollForward:
-`[2, [4, #6.24(…)], tip]`); *tests:* `test/cardamom/ledger/header_test.exs`,
-`conway/header_real_test.exs`.
+`[2, [4, #6.24(…)], tip]`); *tests:* [`test/cardamom/ledger/header_test.exs`](../test/cardamom/ledger/header_test.exs),
+[`conway/header_real_test.exs`](../test/cardamom/ledger/conway/header_real_test.exs).
 
-*Codec:* `lib/cardamom/protocol/chain_sync/codec.ex`; envelope handling in
-`lib/cardamom/chain_sync/client.ex` (`unwrap_header`).
+*Codec:* [`lib/cardamom/protocol/chain_sync/codec.ex`](../lib/cardamom/protocol/chain_sync/codec.ex); envelope handling in
+[`lib/cardamom/chain_sync/client.ex`](../lib/cardamom/chain_sync/client.ex) (`unwrap_header`).
 
 ## 5. Block-fetch (protocol 3)
 
@@ -163,11 +172,11 @@ match the chain. *Fixture:* `preview_rollforward.hex` (a real RollForward:
 
 Same point encoding (and the same byte-string trap) as chain-sync. Blocks
 stream in chain order within a batch; a batch of hundreds of blocks arrives as
-a long multi-SDU stream — reassembly (§1) is load-bearing here. There is no
+a long multi-SDU stream — without reassembly (§1) you will drop blocks here. There is no
 message to request blocks by unordered hash set.
 
-*Codec:* `lib/cardamom/protocol/block_fetch/codec.ex`; *fixtures:*
-`test/fixtures/blocks/block-*.hex` (the first 20 real Preview blocks);
+*CDDL:* [`block-fetch.cddl`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/block-fetch.cddl). *Codec:* [`lib/cardamom/protocol/block_fetch/codec.ex`](../lib/cardamom/protocol/block_fetch/codec.ex); *fixtures:*
+[`test/fixtures/blocks/`](../test/fixtures/blocks/) (`block-0.hex` … `block-20.hex`, the first 21 real Preview blocks);
 *tests:* `conway/block_fixtures_test.exs`, `conway/block_real_test.exs`.
 
 ## 6. Tx-submission2 (protocol 4)
@@ -189,7 +198,8 @@ a block, or aged out) rather than being told.
 **Encoding trap:** the id/tx lists MUST be **indefinite-length** CBOR arrays
 (`0x9f … 0xff`). The reference codec rejects definite-length here, while most
 CBOR libraries *emit* definite-length by default — we hand-roll these two
-arrays. *Codec:* `lib/cardamom/protocol/tx_submission/codec.ex`.
+arrays ([`tx-submission2.cddl` L28, L32](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/tx-submission2.cddl#L28-L32)).
+*Codec:* [`lib/cardamom/protocol/tx_submission/codec.ex`](../lib/cardamom/protocol/tx_submission/codec.ex).
 
 ## 7. Keep-alive (protocol 8)
 
@@ -201,8 +211,8 @@ arrays. *Codec:* `lib/cardamom/protocol/tx_submission/codec.ex`.
 
 Send on a ~60s cadence and answer the peer's pings promptly; we measured a
 connection with no keep-alive traffic being dropped at ~97s. This is the
-cheapest protocol and effectively mandatory. *Client:*
-`lib/cardamom/keep_alive/client.ex`.
+cheapest protocol and effectively mandatory. *CDDL:* [`keep-alive.cddl`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/keep-alive.cddl). *Client:*
+[`lib/cardamom/keep_alive/client.ex`](../lib/cardamom/keep_alive/client.ex).
 
 ## 8. Peer-sharing (protocol 10)
 
@@ -217,8 +227,8 @@ peerAddress = [0, u32, port]                    IPv4
 
 Addresses are **packed integers, not strings**, and there is no hostname form
 — a DNS-named peer cannot be shared. Treat received addresses as inert data to
-record, not as instructions to dial. *Codec:*
-`lib/cardamom/protocol/peer_sharing/codec.ex`.
+record, not as instructions to dial. *CDDL:* [`peer-sharing-v14.cddl`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/peer-sharing-v14.cddl). *Codec:*
+[`lib/cardamom/protocol/peer_sharing/codec.ex`](../lib/cardamom/protocol/peer_sharing/codec.ex).
 
 ## 9. Era envelopes — the numbering trap
 
@@ -238,8 +248,8 @@ two protocols number eras differently**. Byte-verified on the *same block*
 inside block-fetch's tag-24 wrapper. That encoding extends Byron's legacy
 format — and a Byron block was already `[tag, payload]` with tag 0 = EBB,
 1 = regular block — so **Byron occupies two tags** and later eras continue
-from 2 (`ouroboros-consensus-cardano` `Cardano/Node.hs`, `SerialiseHFC`
-instance):
+from 2 ([`ouroboros-consensus-cardano` `Cardano/Node.hs`, the comment and `SerialiseHFC`
+instance at L136–214](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/src/ouroboros-consensus-cardano/Ouroboros/Consensus/Cardano/Node.hs#L136-L214)):
 
 | Era | block envelope | chain-sync header envelope |
 |---|--:|--:|
@@ -254,8 +264,9 @@ instance):
 
 The chain-sync *header* envelope gives Byron a single slot, hence the
 constant off-by-one for every later era. (Independent confirmation: the
-TSUNAGI implementation's incident record documents being bitten by exactly
-this — forging blocks tagged 6 when Conway blocks must carry 7.)
+TSUNAGI implementation's [incident record](https://tsunagi.tech/kintsugi/#frontier-1-era-envelope-inc-001-verified-closed)
+documents being bitten by exactly this — forging blocks tagged 6 when Conway
+blocks must carry 7, "an off-by-one rooted in Byron occupying two era tags".)
 
 So our byte-verified fixtures above are **Alonzo** (block tag 5 / header
 tag 4), and `preview_rollforward_praos.hex` is a **Babbage** header
@@ -278,18 +289,18 @@ for an evening.
   `[block_no, slot, prev_hash, issuer_vkey, vrf_vkey, vrf_eta, vrf_leader,
   body_size, body_hash, ocert_vkey, ocert_n, ocert_kes_period, ocert_sigma,
   proto_major, proto_minor]`
-  — decoder `lib/cardamom/ledger/shelley/header.ex`, from
-  `TPraos/BHeader.hs` (CBORGroup inlining is why it's flat).
+  — decoder [`lib/cardamom/ledger/shelley/header.ex`](../lib/cardamom/ledger/shelley/header.ex), from
+  [`TPraos/BHeader.hs`](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/libs/cardano-protocol-tpraos/src/Cardano/Protocol/TPraos/BHeader.hs) (CBORGroup inlining is why it's flat).
 * **10 elements → Praos** (Babbage+): ONE combined CertifiedVRF, OCert and
   ProtVer **nested** as sub-arrays:
   `[block_no, slot, prev_hash, issuer_vkey, vrf_vkey, [vrf_out, vrf_proof],
   body_size, body_hash, [ocert…4], [major, minor]]`
-  — decoder `lib/cardamom/ledger/praos/header.ex`, from consensus
-  `Praos/Header.hs:176-216`.
+  — decoder [`lib/cardamom/ledger/praos/header.ex`](../lib/cardamom/ledger/praos/header.ex), from consensus
+  [`Praos/Header.hs`, the `DecCBOR HeaderBody` instance](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-protocol/src/ouroboros-consensus-protocol/Ouroboros/Consensus/Protocol/Praos/Header.hs#L203).
 
 Byron is structurally unrelated (`[tag, header]`) and is selected by era tag
-0 only. *Dispatcher:* `lib/cardamom/ledger/header.ex`; *tests:*
-`header_test.exs`, `praos/header_test.exs` (real fixtures both shapes).
+0 only. *Dispatcher:* [`lib/cardamom/ledger/header.ex`](../lib/cardamom/ledger/header.ex); *tests:*
+[`header_test.exs`](../test/cardamom/ledger/header_test.exs), [`praos/header_test.exs`](../test/cardamom/ledger/praos/header_test.exs) (real fixtures both shapes).
 
 **Hashing rule (chain-link critical):** a header's identity is
 blake2b-256 of the **received** header bytes (the tag-24 payload), never a
@@ -314,10 +325,10 @@ body_hash = blake2b256( blake2b256(tx_bodies_bytes)
 ```
 
 over each segment's **original received bytes**. This algorithm exists in no
-CDDL or prose — only `cardano-ledger`'s `hashAlonzoSegWits` (a byte-exact
-spec gap, flagged in `network-specs.md` §3). Verify before trusting a fetched
+CDDL or prose — only `cardano-ledger`'s [`hashAlonzoSegWits`](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/alonzo/impl/src/Cardano/Ledger/Alonzo/BlockBody/Internal.hs#L189) (a byte-exact
+spec gap, flagged in [`network-specs.md` §3](network-specs.md#3-the-gaps-needed-but-specified-nowhere-or-wrongly)). Verify before trusting a fetched
 body: anything can be attached to a valid header. *Implementation:*
-`lib/cardamom/ledger/conway/block.ex` (`verify_body`); segment byte-spans are
+[`lib/cardamom/ledger/conway/block.ex`](../lib/cardamom/ledger/conway/block.ex) (`verify_body`); segment byte-spans are
 carved element-by-element precisely so re-encoding never happens.
 
 **invalid_transactions** (5th segment) lists tx *indices* that failed
@@ -364,13 +375,13 @@ don't re-encode).
 **Collateral-return index (subtle, corrupts UTxO tracking if wrong):** the
 collateral-return output of a phase-2-invalid tx sits at
 `TxIx = length(outputs)` — *after* the (unapplied) regular outputs — not at
-index 0. Source: Babbage `Collateral.hs` (`txIxFromIntegral (length outputs)`);
+index 0. Source: [Babbage `Collateral.hs` L55](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/babbage/impl/src/Cardano/Ledger/Babbage/Collateral.hs#L55) (`txIxFromIntegral (length outputs)`);
 no CDDL/prose states it. A dependent tx spending `(txid, 0)` of an invalid tx
 must fail to resolve, not bind to the collateral change. *Test:*
-`test/cardamom/store/collateral_return_index_test.exs` (found via a real
+[`test/cardamom/store/collateral_return_index_test.exs`](../test/cardamom/store/collateral_return_index_test.exs) (found via a real
 stuck Preview block).
 
-*Decoder:* `lib/cardamom/ledger/conway/tx.ex` (all Shelley-family eras — the
+*Decoder:* [`lib/cardamom/ledger/conway/tx.ex`](../lib/cardamom/ledger/conway/tx.ex) (all Shelley-family eras — the
 body is upward-compatible; absent keys decode as absent).
 
 ## 13. Certificates (Conway, tx body key 4)
@@ -391,8 +402,9 @@ body is upward-compatible; absent keys decode as absent).
 
 DRep sub-encoding: `[0,keyhash] | [1,scripthash] | [2] (abstain) |
 [3] (no-confidence)`. Tags 5/6 are the retired MIR/genesis certs.
-*Decoder:* `lib/cardamom/ledger/conway/cert.ex` (shapes from conway.cddl
-lines 434–539; unknown tags decode to `{:unknown, tag}` — never crash on a
+*Decoder:* [`lib/cardamom/ledger/conway/cert.ex`](../lib/cardamom/ledger/conway/cert.ex) (shapes from
+[`conway.cddl`: `certificate`](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/conway/impl/cddl/data/conway.cddl#L30) and the
+[per-certificate definitions, L429–539](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/conway/impl/cddl/data/conway.cddl#L429-L539); unknown tags decode to `{:unknown, tag}` — never crash on a
 future cert).
 
 ## 14. Byron (era 0) — different in every respect
@@ -403,7 +415,11 @@ Regular body = `[txPayload, sscPayload, dlgPayload, updPayload]`; each
 `[0, #6.24(cbor([txid, index]))]` (a tag-24 *nested CBOR* indirection unique
 to Byron); addresses are CRC-protected. txid = blake2b-256 of the tx's
 original bytes. Full field-by-field mapping with `cardano-ledger` line
-citations: `lib/cardamom/ledger/byron/body.ex`.
+citations: [`lib/cardamom/ledger/byron/body.ex`](../lib/cardamom/ledger/byron/body.ex). Upstream decoders:
+[`Chain/Block/Block.hs`](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/byron/ledger/impl/src/Cardano/Chain/Block/Block.hs),
+[`Block/Body.hs`](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/byron/ledger/impl/src/Cardano/Chain/Block/Body.hs),
+[`UTxO/TxAux.hs`](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/byron/ledger/impl/src/Cardano/Chain/UTxO/TxAux.hs),
+[`UTxO/Tx.hs`](https://github.com/IntersectMBO/cardano-ledger/blob/3118136df7b5ccff3ca2f06245ed91d81f50b994/eras/byron/ledger/impl/src/Cardano/Chain/UTxO/Tx.hs#L168) (the tag-24 `TxIn`).
 
 ## 15. Gotchas, ranked by blood lost
 
@@ -431,18 +447,20 @@ citations: `lib/cardamom/ledger/byron/body.ex`.
 
 | Fixture | Proves | Pinned by |
 |---|---|---|
-| `preview_rollforward.hex` | RollForward envelope, header tag 4 (Alonzo), 15-field TPraos header | `ledger/header_test.exs`, `conway/header_real_test.exs` |
-| `preview_rollforward_praos.hex` | 10-field Praos header (Babbage; bare, post-strip) | `ledger/praos/header_test.exs`, `praos/validation_test.exs` |
-| `preview_rollbackward.hex` | RollBackward shape | *captured, not yet test-pinned* |
-| `blocks/block-0.hex … block-19.hex` | block-fetch tag 5 (Alonzo), block structure, body-hash verification, genesis-era decode | `conway/block_fixtures_test.exs` |
-| `preview_block_1.hex`, `preview_block_13011.hex`, `preview_block_with_tx.hex` | real block + tx decode end-to-end | `conway/block_real_test.exs` |
-| `preview_block_indefinite_txbodies.hex` | indefinite-length `tx_bodies` in the wild | `conway/block_real_test.exs` |
-| `preview_block_invalid_tx.hex` | `invalid_transactions` + collateral path | `store/collateral_return_index_test.exs` |
+| [`preview_rollforward.hex`](../test/fixtures/preview_rollforward.hex) | RollForward envelope, header tag 4 (Alonzo), 15-field TPraos header | [`ledger/header_test.exs`](../test/cardamom/ledger/header_test.exs), [`conway/header_real_test.exs`](../test/cardamom/ledger/conway/header_real_test.exs) |
+| [`preview_rollforward_praos.hex`](../test/fixtures/preview_rollforward_praos.hex) | 10-field Praos header (Babbage; bare, post-strip) | [`ledger/praos/header_test.exs`](../test/cardamom/ledger/praos/header_test.exs), [`praos/validation_test.exs`](../test/cardamom/ledger/praos/validation_test.exs) |
+| [`preview_rollbackward.hex`](../test/fixtures/preview_rollbackward.hex) | RollBackward shape | *captured, not yet test-pinned* |
+| [`blocks/block-0.hex … block-20.hex`](../test/fixtures/blocks/) | block-fetch tag 5 (Alonzo), block structure, body-hash verification, genesis-era decode | [`conway/block_fixtures_test.exs`](../test/cardamom/ledger/conway/block_fixtures_test.exs) |
+| [`preview_block_1.hex`](../test/fixtures/preview_block_1.hex), [`preview_block_13011.hex`](../test/fixtures/preview_block_13011.hex), [`preview_block_with_tx.hex`](../test/fixtures/preview_block_with_tx.hex) | real block + tx decode end-to-end | [`conway/block_real_test.exs`](../test/cardamom/ledger/conway/block_real_test.exs) |
+| [`preview_block_indefinite_txbodies.hex`](../test/fixtures/preview_block_indefinite_txbodies.hex) | indefinite-length `tx_bodies` in the wild | [`conway/block_real_test.exs`](../test/cardamom/ledger/conway/block_real_test.exs) |
+| [`preview_block_invalid_tx.hex`](../test/fixtures/preview_block_invalid_tx.hex) | `invalid_transactions` + collateral path | [`store/collateral_return_index_test.exs`](../test/cardamom/store/collateral_return_index_test.exs) |
 
-`preview_capture.md` records how the live captures were taken.
+[`preview_capture.md`](../test/fixtures/preview_capture.md) records how the live captures were taken
+(against Preview's bootstrap relay, `preview-node.play.dev.cardano.org:3001`, from
+[`topology.json`](https://book.world.dev.cardano.org/environments/preview/topology.json)).
 
 ---
 
 *Safety note: everything here was learned against the Preview testnet, which
 exists for this. An unproven implementation should never point at mainnet;
-see `wire-protocol.md` for the full stance.*
+see [`wire-protocol.md`](wire-protocol.md#why-preview-not-mainnet-safety--ethics-not-just-convenience) for the full stance.*
