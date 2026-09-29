@@ -39,7 +39,7 @@ rules are out of scope.
 | Repository | What it holds for us | Tracking link | Pinned at (verified 2026-09-29) |
 |---|---|---|---|
 | `IntersectMBO/ouroboros-network` | prose spec (`docs/network-spec`), design doc, CDDLs, mux source, protocol codecs | [main](https://github.com/IntersectMBO/ouroboros-network/tree/main) | [`a3d8017e7`](https://github.com/IntersectMBO/ouroboros-network/tree/a3d8017e798b225055aaf9118ad062fe58bc650f) (2026-09-15) |
-| `IntersectMBO/ouroboros-consensus` | header decoders, the HardFork block envelope, Praos VRF derivations | [main](https://github.com/IntersectMBO/ouroboros-consensus/tree/main) | [`73fa2da6a`](https://github.com/IntersectMBO/ouroboros-consensus/tree/73fa2da6a42c273ae723a8830eb7159ab2b6b073) (2026-06-18) |
+| `IntersectMBO/ouroboros-consensus` | **the node-to-node era-envelope CDDLs** (§2.9), header decoders, the HardFork block envelope, Praos VRF derivations | [main](https://github.com/IntersectMBO/ouroboros-consensus/tree/main) | [`73fa2da6a`](https://github.com/IntersectMBO/ouroboros-consensus/tree/73fa2da6a42c273ae723a8830eb7159ab2b6b073) (2026-06-18) |
 | `IntersectMBO/cardano-ledger` | on-chain CDDL (Huddle-generated), body-hash, opcert, Byron, collateral rules | [master](https://github.com/IntersectMBO/cardano-ledger/tree/master) | [`3118136df`](https://github.com/IntersectMBO/cardano-ledger/tree/3118136df7b5ccff3ca2f06245ed91d81f50b994) (2026-09-29) |
 | `input-output-hk/agda-cardano-common`, branch `kangfeng/itree-csp` | the formal behavioural model of the mini-protocols (Agda, ITree-CSP) | [branch](https://github.com/input-output-hk/agda-cardano-common/tree/kangfeng/itree-csp) | read at [`ee1f4a2`](https://github.com/input-output-hk/agda-cardano-common/tree/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14) (2026-07-06); tip [`9a40d1d`](https://github.com/input-output-hk/agda-cardano-common/tree/9a40d1de330f376c3a102e7c9f1282f4fa830a7e) (2026-09-28) |
 
@@ -48,6 +48,7 @@ Rendered artefacts (no clone needed):
 * **Network spec (PDF):** <https://ouroboros-network.cardano.intersectmbo.org/pdfs/network-spec/network-spec.pdf>
 * **Network design (PDF):** <https://ouroboros-network.cardano.intersectmbo.org/pdfs/network-design/network-design.pdf>
 * **ouroboros-network Haddocks:** <https://ouroboros-network.cardano.intersectmbo.org/>
+* **ouroboros-consensus site** (how-tos and references; the era-envelope CDDLs are described under "Adding an era"): <https://ouroboros-consensus.cardano.intersectmbo.org/>
 * **Ledger specs and CDDL site:** <https://cardano-ledger.cardano.intersectmbo.org/>
 * **Preview testnet environment files:** [`config.json`](https://book.world.dev.cardano.org/environments/preview/config.json), [`shelley-genesis.json`](https://book.world.dev.cardano.org/environments/preview/shelley-genesis.json), [`topology.json`](https://book.world.dev.cardano.org/environments/preview/topology.json) under `book.world.dev.cardano.org/environments/preview/` (the directory itself does not list)
 * **CIP-19 (address structure):** <https://cips.cardano.org/cip/CIP-19>
@@ -61,6 +62,7 @@ Rendered artefacts (no clone needed):
 | Protocol behaviour | FSMs, agency, message sequencing, composition over one bearer | Agda ITree-CSP model (§2.1) | Formal, machine-checked |
 | Protocol behaviour (prose) | Same ground, informally, plus protocol numbers and pipelining discussion | `network-spec` LaTeX / PDF (§2.2) | Prose |
 | Message encoding | CBOR grammar of every mini-protocol message | `ouroboros-network` CDDLs (§2.3) | Grammar |
+| Era envelopes | The `[era, payload]` wrappers around headers, blocks, txs and tx ids inside those messages | `ouroboros-consensus` node-to-node CDDLs (§2.9) | Grammar |
 | Transport framing | The 8-byte SDU header, segmentation, the mode bit | `mux.tex` + `Network.Mux.Codec` (§2.4) | Prose + code |
 | Handshake & versioning | Version negotiation, `nodeToNodeVersionData`, network magic | handshake CDDLs + genesis config (§2.3, §2.7) | Grammar + config |
 | On-chain encodings | Header/block structure; the hashes that link the chain | `cardano-ledger` CDDL + Haskell (§2.5) | Grammar + code |
@@ -277,6 +279,11 @@ vectors by any implementation.
   Byron occupies two tags (EBB / regular) so every later era is one higher
   than in the header envelope
   ([`Cardano/Node.hs`, `SerialiseHFC` instance and the comment above it](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/src/ouroboros-consensus-cardano/Ouroboros/Consensus/Cardano/Node.hs#L136-L214)).
+  *Correction (2026-09-29):* we established this from the wire and the
+  Haskell, but it **is** written down — as CDDL, in `ouroboros-consensus`
+  (§2.9), a repository an implementer has no reason to search for wire
+  grammar. We found it fifteen months after it was added. That is a
+  findability finding, not a spec gap.
   This is one of at least four non-aligned version axes in Cardano: on-chain
   protocol major, era name, wire era tags, library versions. An independent
   implementation (TSUNAGI, in Zig) was bitten by exactly this — see
@@ -294,6 +301,46 @@ vectors by any implementation.
 * Sustained throughput characteristics (headers stream far faster than
   bodies; both are fine — chain-sync and block-fetch are independent
   protocols and the gap closes at the tip).
+
+### 2.9 The era envelopes — `ouroboros-consensus` node-to-node CDDLs
+
+* Directory (tracking): [`ouroboros-consensus-cardano/cddl/`](https://github.com/IntersectMBO/ouroboros-consensus/tree/main/ouroboros-consensus-cardano/cddl); pinned: [`node-to-node/chainsync/header.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/node-to-node/chainsync/header.cddl), [`node-to-node/blockfetch/block.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/node-to-node/blockfetch/block.cddl), [`node-to-node/txsubmission2/tx.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/node-to-node/txsubmission2/tx.cddl), [`node-to-node/txsubmission2/txId.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/node-to-node/txsubmission2/txId.cddl), [`base.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/base.cddl) (the `ns8` era-sum and shared types); `disk/` holds the on-disk formats, not needed on the wire.
+* How they are checked: [`GenCDDLs.hs`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/test/cardano-test/Test/Consensus/Cardano/GenCDDLs.hs) compiles them with `cddlc`, pulling each era's grammar from `cardano-ledger`, and the serialisation tests validate generated blocks, headers, txs and tx ids against them (described in the [Adding an era](https://ouroboros-consensus.cardano.intersectmbo.org/docs/howtos/adding_an_era) how-to). Added 2025-06-04.
+
+This is the layer between §2.3 and §2.5 that we did not know existed: the
+`ouroboros-network` CDDLs leave `header`, `block`, `tx` and `txId` abstract,
+and these files fill them in with the HardFork combinator's era sum
+(`ns8` in `base.cddl`: `[0, byron] / [1, shelley] / … / [7, dijkstra]`).
+Specifically:
+
+| Object | Envelope (from the CDDL) | Matches our wire observation |
+|---|---|---|
+| chain-sync header | `[eraIdx, #6.24(header-bytes)]`, Byron = `[0, [0\|1, #6.24(…)]]` (boundary/regular index *inside* the Byron payload), Shelley = 1 … Dijkstra = 7 | yes — `WIRE.md` §9, header column |
+| block-fetch block | `#6.24(cardanoBlock)`, `cardanoBlock = byron.block / [2, shelley.block] / … / [8, dijkstra.block]` — Byron's own `[0\|1, …]` occupies tags 0–1 | yes — `WIRE.md` §9, block column |
+| tx-submission tx | `[eraIdx, #6.24(tx-bytes)]` with the header numbering (Shelley = 1 … Dijkstra = 7); Byron txs carry a further `[0\|1\|2\|3, …]` for tx / certificate / update / vote payloads | **not yet observed live** (§3, gap 15) |
+| tx-submission txId | `[eraIdx, hash32]` with the header numbering | **not yet observed live** (§3, gap 15) |
+
+Both of the numbering schemes we reverse-engineered are therefore
+specified, and the second is even explained: `ns8` is the plain
+positional era sum, and the block encoding differs only because it must
+stay backward-compatible with Byron's pre-existing `[tag, block]`.
+
+**Caveats.** (a) These grammars are only as good as their test: the
+serialisation tests check that *generated* Haskell values validate against
+the CDDL, which cannot catch a mislabelled alternative whose payload has
+the same shape as its neighbours. `txId.cddl` lists the eras as
+`…alonzo, conway, dijkstra, babbage` (with a `TODO` asking why), which if
+read positionally gives Babbage index 7 rather than 5. All
+`transaction_id` types are 32-byte hashes, so the test passes either way;
+the Haskell (`encodeNS`, index = position in
+[`CardanoEras`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/src/ouroboros-consensus-cardano/Ouroboros/Consensus/Cardano/Block.hs#L245-L257))
+says Babbage = 5, Conway = 6, Dijkstra = 7, consistent with the other
+three files. Treat the Haskell as authoritative and the `txId.cddl`
+argument order as a typo worth an upstream fix. (b) Nothing in
+`ouroboros-network`'s CDDLs, `network-spec`, or the formal model points
+here. (c) The directory also documents that `seq<x>` is encoded
+indefinite-length beyond 23 elements (`base.cddl`), which explains the
+indefinite-length `tx_bodies` arrays we met in real blocks (`WIRE.md` §11).
 
 ---
 
@@ -366,10 +413,27 @@ currently the only specification.
     era tags, and negotiated N2N versions do not align and are nowhere laid
     side-by-side; every implementer builds this table themselves
     (ours: [`WIRE.md` §9](WIRE.md#9-era-envelopes--the-numbering-trap)).
+    The two wire era-tag schemes *are* now specified (§2.9), which removes
+    one axis from "unspecified" but not from "confusing".
 13. **Findability** — several artifacts above are correct but effectively
-    undiscoverable from each other (nothing links the CDDLs to `network-spec`
-    to the formal model). The absence of an index like this document is
-    itself the meta-gap.
+    undiscoverable from each other: nothing links the `ouroboros-network`
+    CDDLs to `network-spec` to the formal model, and nothing in any of them
+    points at the era-envelope CDDLs in `ouroboros-consensus` (§2.9), which
+    we found only after reverse-engineering their content. The absence of
+    an index like this document is itself the meta-gap.
+14. **`txId.cddl` era order** — the argument order in the consensus tx-id
+    grammar disagrees with the Haskell era index for Babbage/Conway/Dijkstra
+    and the test cannot detect it (§2.9 caveat a). Small, but exactly the
+    kind of thing a from-scratch implementer copies faithfully.
+15. **Tx-submission payload envelopes have no live confirmation from us.**
+    Cardamom's tx-submission client has only ever exchanged traffic with
+    our own simulated peer (no tx-submission traffic appears in any live
+    Preview session log), and that simulated peer, like our codec, uses
+    *bare* 32-byte tx ids and bare tx bytes — not the `[eraIdx, …]`
+    envelopes §2.9 specifies. This is a known defect in Cardamom, not in
+    the specification, recorded here so that nobody reads `WIRE.md` §6 as
+    wire-confirmed. The fix is to adopt the §2.9 envelopes in the codec and
+    the simulated peer, then confirm against Preview.
 
 ---
 
@@ -389,7 +453,8 @@ The smallest artifact set that gets an implementation talking to a relay:
    ([`ChainSync.agda`](https://github.com/input-output-hk/agda-cardano-common/blob/ee1f4a2d10d7b16d99e15bc8d9459bb960724a14/src/ITree-CSP/CSP/Examples/Cardano_network/ChainSync.agda#L175-L245))
    or `miniprotocols.tex`; encoding from
    [`chain-sync.cddl`](https://github.com/IntersectMBO/ouroboros-network/blob/a3d8017e798b225055aaf9118ad062fe58bc650f/cardano-diffusion/protocols/cddl/specs/chain-sync.cddl);
-   era envelopes from §2.8; header hashing from §2.5.
+   era envelopes from §2.9 (and the observations in §2.8); header hashing
+   from §2.5.
 
 All of it framed in SDUs per §2.4, all of it strict per the CDDL directive.
 Block-fetch, tx-submission, and peer-sharing are additive after that. The
@@ -401,6 +466,11 @@ worked, fixture-backed version of this recipe is
 
 ## Revision log
 
+* **2026-09-29 (later)** — §2.9 added: the era-envelope CDDLs in
+  `ouroboros-consensus`, found on Ramsay's prompt; §2.8 corrected (the
+  envelopes were specified after all — a findability finding); gaps 14–15
+  added, the second recording that our tx-submission path is sim-only and
+  its codec lacks the era envelopes.
 * **2026-09-29** — every citation converted to a pinned permalink plus a
   tracking link, verified against the upstream heads of that day; §0 added;
   §2.1 updated for the branch's move to `(Link, Dir)` indexing and the

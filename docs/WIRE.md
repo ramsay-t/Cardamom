@@ -190,6 +190,22 @@ message to request blocks by unordered hash set.
 [4]                              Done
 ```
 
+**Payload envelopes (from the consensus CDDLs, not yet confirmed by us on
+the wire):** `txId` is not a bare hash but `[eraIdx, hash32]`, and each `tx`
+is `[eraIdx, #6.24(tx-bytes)]`, using the *header* era numbering of §9
+(Shelley = 1 … Conway = 6, Dijkstra = 7); Byron txs carry a further inner
+tag. Source: [`txId.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/node-to-node/txsubmission2/txId.cddl) and
+[`tx.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/node-to-node/txsubmission2/tx.cddl) in `ouroboros-consensus`
+(see [`network-specs.md` §2.9](network-specs.md#29-the-era-envelopes--ouroboros-consensus-node-to-node-cddls),
+including a caveat about the era order written in `txId.cddl`).
+
+**Honesty note.** Unlike the other sections, nothing here is pinned by a
+live capture: Cardamom's tx-submission client has only ever talked to our
+simulated peer, and both currently use bare hashes and bare tx bytes,
+contrary to the CDDLs above. Treat this section as "grammar plus the
+consensus CDDLs", not as wire-confirmed, until the codec is corrected and a
+Preview capture exists.
+
 The protocol is **pull-based and asymmetric**: the *server* requests; a client
 that has nothing to offer replies with empty lists. Note there is **no
 removal/expiry message** — a mempool observer must infer tx exit (confirmed in
@@ -242,6 +258,17 @@ two protocols number eras differently**. Byte-verified on the *same block*
 | block-fetch `MsgBlock` block | `82 05 85 82 8f…` | **5** |
 
 *(fixtures: `preview_rollforward.hex` vs `blocks/block-0.hex`)*
+
+**It is specified after all (found 2026-09-29).** Both numberings are
+written down as CDDL in `ouroboros-consensus`, in a directory nothing in
+`ouroboros-network` points to:
+[`node-to-node/chainsync/header.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/node-to-node/chainsync/header.cddl)
+(the `ns8` era sum, Byron = 0 … Dijkstra = 7, with Byron's boundary/regular
+index *inside* its payload) and
+[`node-to-node/blockfetch/block.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/node-to-node/blockfetch/block.cddl)
+(`byron.block / [2, shelley.block] / … / [8, dijkstra.block]`). The table
+below matches them exactly. We list this as a findability gap, not a spec
+gap, in [`network-specs.md` §3](network-specs.md#3-the-gaps-needed-but-specified-nowhere-or-wrongly).
 
 **The mechanism (resolved 2026-07-24, from the consensus source).** The
 *block* envelope is the HardFork combinator's *disk* encoding, sent verbatim
@@ -338,7 +365,9 @@ collateral is consumed instead (§12). *Fixture:*
 
 **Indefinite-length segments occur in the wild:** real Preview blocks exist
 whose `tx_bodies` array is indefinite-length (`0x9f…0xff`) — a decoder
-assuming definite-length silently miscounts. *Fixture:*
+assuming definite-length silently miscounts. (Explained by the consensus
+[`base.cddl`](https://github.com/IntersectMBO/ouroboros-consensus/blob/73fa2da6a42c273ae723a8830eb7159ab2b6b073/ouroboros-consensus-cardano/cddl/base.cddl): `seq<x>` is definite up to 23 elements and
+indefinite beyond.) *Fixture:*
 `preview_block_indefinite_txbodies.hex`.
 
 ## 12. Transaction bodies (Shelley family, upward-compatible)
@@ -442,6 +471,9 @@ citations: [`lib/cardamom/ledger/byron/body.ex`](../lib/cardamom/ledger/byron/bo
 11. **tx-submission is server-driven** (§6) — and has no removal message; and
     a silent observer may simply not be *sent* much (peers gossip to nodes
     they expect to propagate).
+12. **Tx ids and txs are era-wrapped too** (§6) — `[eraIdx, hash]` and
+    `[eraIdx, #6.24(bytes)]`, per the consensus CDDLs; a bare-hash codec
+    (ours, today) is wrong.
 
 ## 16. Fixture index (conformance vectors)
 
